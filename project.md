@@ -53,9 +53,10 @@ incoming_input
 
 | Choice | Rationale |
 |--------|-----------|
-| **Rejected:** Fetch AI | Too pre-built; insufficient control |
-| **Rejected:** Pre-built SDKs (OpenAI Agent SDK, LangGraph, CrewAI) | Same — want ownership of routing and demos |
+| **Rejected:** Pre-built SDKs (OpenAI Agent SDK, LangGraph, CrewAI) | Want ownership of routing and demos |
 | **Chosen:** Plain Python + custom MCP endpoints | Flexibility + **Qualcomm** track compatibility |
+
+**Fetch AI:** We **do care** about this sponsor / hackathon track — read their requirements, decide if we submit against it, and whether any slice of the product should use or reference their stack. That is separate from defaulting the core agent to **custom Python + MCP** for control and judge narrative.
 
 **Open question:** Standalone API layer for agent endpoints vs. monolith for hackathon speed (team TBD).
 
@@ -112,6 +113,11 @@ incoming_input
 - **Integration:** real-time **TTS** output from agent
 - Called via **MCP tool** when routing logic selects the conversation path
 
+### Priority 4 — Fetch AI
+
+- **We care about this track:** align submission and demo story with Fetch AI’s requirements where it doesn’t block Browser Use / Qualcomm / 11 Labs priorities.
+- **Action:** confirm official criteria and whether a minimal Fetch AI integration or a parallel “agent marketplace” narrative is worth the time budget.
+
 ### Wildcard — Best Interactive AI
 
 - Project **qualifies:** interactive by nature (voice + browser agent)
@@ -154,6 +160,6 @@ incoming_input
 
 - Whiteboard **MVP vs Phase 1** boundaries; lock embed spike for live session.
 - Confirm **“fully software based”** with Browser Use organisers.
-- Finalise track list: Qualcomm, Browser Use, ElevenLabs; wildcard Best Interactive AI.
+- Finalise track list: Qualcomm, Browser Use, ElevenLabs, **Fetch AI**; wildcard Best Interactive AI.
 - **Nikhil:** Browser Use experience / live embed spike; remote laptop access if needed; **GPU/RAM** check for local model + headless Browser Use.
 - **xd:** TBD.
