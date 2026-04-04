@@ -108,7 +108,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   const imagine: AppConfig["imagine"] = {
     apiKey: source.INFERENCE_CLOUD_API_KEY?.trim() || "",
     endpoint: source.INFERENCE_CLOUD_ENDPOINT?.trim() || "https://aisuite.cirrascale.com/apis/v2",
-    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-70B",
+    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-8B",
     maxTokens: parseInteger(source.INFERENCE_CLOUD_MAX_TOKENS, 1024),
     maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
     mockMode: parseBoolean(source.AGENT_MOCK_MODE, false),
