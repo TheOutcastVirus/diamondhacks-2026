@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import type { AgentTurnRequest, PromptField, ReminderCadence } from "./contracts";
+import type { AgentTurnRequest, PromptField, ReminderCadence, ReminderUpdateInput } from "./contracts";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { TranscriptEventBus } from "./transcript-bus";
@@ -56,6 +56,42 @@ const TOOL_DEFINITIONS = [
           timezone: { type: "string", description: "IANA timezone name (e.g. 'America/New_York')" },
         },
         required: ["title", "instructions", "cron", "cadence", "scheduleLabel", "timezone"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_reminder",
+      description:
+        "Update an existing reminder. Use to pause, resume, rename, edit the schedule, change the timezone, or change reminder instructions.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Reminder id to update" },
+          title: { type: "string", description: "Updated reminder title" },
+          instructions: { type: "string", description: "Updated reminder instructions" },
+          cron: { type: "string", description: "Updated 5-field cron expression" },
+          cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Updated recurrence type" },
+          scheduleLabel: { type: "string", description: "Updated human-readable schedule description" },
+          timezone: { type: "string", description: "Updated IANA timezone name" },
+          status: { type: "string", enum: ["active", "paused", "draft"], description: "Reminder status" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_reminder",
+      description: "Delete an existing reminder by id.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Reminder id to delete" },
+        },
+        required: ["id"],
       },
     },
   },
@@ -309,6 +345,39 @@ When you want to speak a response aloud (for voice interactions), use the speak 
             scheduleLabel: String(args.scheduleLabel ?? ""),
             timezone: String(args.timezone ?? "UTC"),
           });
+          break;
+        }
+
+        case "update_reminder": {
+          const update: Record<string, unknown> = {};
+          if (typeof args.title === "string") {
+            update.title = args.title;
+          }
+          if (typeof args.instructions === "string") {
+            update.instructions = args.instructions;
+          }
+          if (typeof args.cron === "string") {
+            update.cron = args.cron;
+          }
+          if (args.cadence === "daily" || args.cadence === "weekly" || args.cadence === "custom") {
+            update.cadence = args.cadence;
+          }
+          if (typeof args.scheduleLabel === "string") {
+            update.scheduleLabel = args.scheduleLabel;
+          }
+          if (typeof args.timezone === "string") {
+            update.timezone = args.timezone;
+          }
+          if (args.status === "active" || args.status === "paused" || args.status === "draft") {
+            update.status = args.status;
+          }
+
+          result = this.database.updateReminder(String(args.id ?? ""), update as ReminderUpdateInput);
+          break;
+        }
+
+        case "delete_reminder": {
+          result = { deleted: this.database.deleteReminder(String(args.id ?? "")) };
           break;
         }
 

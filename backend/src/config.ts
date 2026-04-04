@@ -7,6 +7,9 @@ export type AppConfig = {
   port: number;
   databasePath: string;
   allowedOrigins: string[];
+  reminders: {
+    enabled: boolean;
+  };
   browserUse: {
     apiKey?: string;
     baseUrl: string;
@@ -123,9 +126,12 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   return {
     appName: source.APP_NAME?.trim() || "Gazabot Backend",
     host: source.HOST?.trim() || "127.0.0.1",
-    port: parseInteger(source.PORT, 8000),
+    port: parseInteger(source.PORT, 3000),
     databasePath: resolveDatabasePath(source.DATABASE_PATH),
     allowedOrigins: parseOrigins(source.ALLOWED_ORIGINS),
+    reminders: {
+      enabled: parseBoolean(source.REMINDER_SCHEDULER_ENABLED, true),
+    },
     browserUse,
     agent: {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
