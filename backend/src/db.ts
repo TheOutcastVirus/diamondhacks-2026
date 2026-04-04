@@ -11,6 +11,7 @@ import type {
   TranscriptKind,
   TranscriptRole,
   ToolStatus,
+  UserMemoryEntry,
 } from "./contracts";
 import { computeNextRun } from "./cron";
 
@@ -254,6 +255,12 @@ export class GazabotDatabase {
         detail TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         status TEXT CHECK (status IS NULL OR status IN ('pending', 'completed', 'failed'))
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS user_memory (
+        title TEXT PRIMARY KEY NOT NULL,
+        content TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       ) STRICT;
     `);
   }
@@ -530,5 +537,28 @@ export class GazabotDatabase {
       .all(session.id) as BrowserActionRow[];
 
     return serializeBrowserContext(session, actionRows.map(serializeBrowserAction));
+  }
+
+  listMemoryTitles(): string[] {
+    const rows = this.database
+      .query("SELECT title FROM user_memory ORDER BY title ASC")
+      .all() as Array<{ title: string }>;
+    return rows.map((r) => r.title);
+  }
+
+  readMemory(title: string): UserMemoryEntry | null {
+    const row = this.database
+      .query("SELECT title, content, updated_at FROM user_memory WHERE title = ?1")
+      .get(title) as { title: string; content: string; updated_at: string } | null;
+    if (!row) return null;
+    return { title: row.title, content: row.content, updatedAt: row.updated_at };
+  }
+
+  writeMemory(title: string, content: string): UserMemoryEntry {
+    const updatedAt = nowIso();
+    this.database
+      .query("INSERT OR REPLACE INTO user_memory (title, content, updated_at) VALUES (?1, ?2, ?3)")
+      .run(title.trim(), content.trim(), updatedAt);
+    return { title: title.trim(), content: content.trim(), updatedAt };
   }
 }

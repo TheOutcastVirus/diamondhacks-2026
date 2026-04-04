@@ -100,6 +100,36 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "read_memory",
+      description: "Fetch the full content of a stored memory entry by its title. Use when you need details about a topic listed in the system prompt's memory index.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "The memory title to retrieve" },
+        },
+        required: ["title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_memory",
+      description:
+        "Store or update a memory entry about the user or household. Use a short descriptive title (e.g. 'user_name', 'health_notes', 'dietary_restrictions', 'communication_preferences') and put the full details in content. Call this whenever you learn something worth remembering.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Short descriptive key for this memory" },
+          content: { type: "string", description: "Full details to store" },
+        },
+        required: ["title", "content"],
+      },
+    },
+  },
 ] as const;
 
 export class AgentHarness {
@@ -136,8 +166,14 @@ export class AgentHarness {
 
   private buildMessages(request: AgentTurnRequest): ChatMessage[] {
     const reminders = this.database.listReminders();
+    const memoryTitles = this.database.listMemoryTitles();
     const allEntries = this.database.listTranscriptEntries();
     const history = allEntries.slice(-this.config.imagine.maxHistoryEntries);
+
+    const memoryIndex =
+      memoryTitles.length === 0
+        ? "No stored memory."
+        : memoryTitles.map((t) => `- ${t}`).join("\n");
 
     const reminderSummary =
       reminders.length === 0
@@ -154,9 +190,13 @@ export class AgentHarness {
 
 Current date and time: ${new Date().toISOString()}
 
+Stored memory topics (call read_memory to get full details):
+${memoryIndex}
+
 Active reminders:
 ${reminderSummary}
 
+When you learn something worth remembering about the user or household, call write_memory to store it.
 When you want to speak a response aloud (for voice interactions), use the speak tool with the text you want vocalized. You can speak AND also return a text response.${forceNote}`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
@@ -251,6 +291,16 @@ When you want to speak a response aloud (for voice interactions), use the speak 
           const text = String(args.text ?? "");
           await this.invokeTts(text);
           result = { spoken: true };
+          break;
+        }
+
+        case "read_memory": {
+          result = this.database.readMemory(String(args.title ?? "")) ?? { error: "Memory entry not found" };
+          break;
+        }
+
+        case "write_memory": {
+          result = this.database.writeMemory(String(args.title ?? ""), String(args.content ?? ""));
           break;
         }
 

@@ -82,6 +82,12 @@ export type AgentTurnResponse =
       status: "queued";
     };
 
+export type UserMemoryEntry = {
+  title: string;
+  content: string;
+  updatedAt: string;
+};
+
 export type ApiErrorPayload = {
   message: string;
   details?: unknown;
