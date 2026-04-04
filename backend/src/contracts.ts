@@ -88,6 +88,29 @@ export type UserMemoryEntry = {
   updatedAt: string;
 };
 
+export type PromptFieldType = "string" | "int" | "float" | "boolean" | "password";
+
+export type PromptField = {
+  name: string;
+  label: string;
+  type: PromptFieldType;
+  required: boolean;
+  placeholder?: string;
+};
+
+export type PromptStatus = "pending" | "completed" | "cancelled";
+
+export type UserPrompt = {
+  id: string;
+  title: string;
+  description?: string;
+  fields: PromptField[];
+  status: PromptStatus;
+  createdAt: string;
+  response?: Record<string, unknown>;
+  respondedAt?: string;
+};
+
 export type ApiErrorPayload = {
   message: string;
   details?: unknown;

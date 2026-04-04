@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import type { AgentTurnRequest, ReminderCadence } from "./contracts";
+import type { AgentTurnRequest, PromptField, ReminderCadence } from "./contracts";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { TranscriptEventBus } from "./transcript-bus";
@@ -130,7 +130,64 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "request_user_input",
+      description:
+        'Send a structured form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, personal info). The form appears on the frontend and the response is fed back to you automatically. fields_json must be a valid JSON array string, e.g.: [{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}]',
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Form title shown to the user" },
+          description: { type: "string", description: "Explanation of why this information is needed" },
+          fields_json: {
+            type: "string",
+            description: 'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|int|float|boolean|password","required":true|false}',
+          },
+        },
+        required: ["title", "fields_json"],
+      },
+    },
+  },
 ] as const;
+
+// Some model deployments output tool calls as plain JSON text instead of using the
+// tool_calls field. This parser detects and normalizes that pattern.
+function parseTextToolCall(content: string): ToolCall | null {
+  const trimmed = content.trim().replace(/<\|eom_id\|>.*$/s, "").trim();
+  if (!trimmed.startsWith("{")) return null;
+
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const name = typeof parsed.name === "string" ? parsed.name : null;
+    if (!name) return null;
+
+    const argsSource = parsed.arguments ?? parsed.parameters ?? parsed.args ?? {};
+    let argsStr: string;
+
+    if (typeof argsSource === "string") {
+      argsStr = argsSource;
+    } else {
+      // Normalize any string-encoded sub-fields (model sometimes encodes arrays as strings)
+      const normalized = { ...(argsSource as Record<string, unknown>) };
+      for (const [k, v] of Object.entries(normalized)) {
+        if (typeof v === "string") {
+          try {
+            normalized[k] = JSON.parse(v);
+          } catch {
+            // leave as-is
+          }
+        }
+      }
+      argsStr = JSON.stringify(normalized);
+    }
+
+    return { id: `text-tool-${Date.now()}`, type: "function", function: { name, arguments: argsStr } };
+  } catch {
+    return null;
+  }
+}
 
 export class AgentHarness {
   constructor(
@@ -304,6 +361,26 @@ When you want to speak a response aloud (for voice interactions), use the speak 
           break;
         }
 
+        case "request_user_input": {
+          let fields: PromptField[] = [];
+          try {
+            const rawFields = args.fields_json ?? args.fields ?? "[]";
+            const parsed = JSON.parse(typeof rawFields === "string" ? rawFields : JSON.stringify(rawFields));
+            fields = Array.isArray(parsed) ? (parsed as PromptField[]) : [];
+          } catch {
+            fields = [];
+          }
+          const promptInput: { title: string; fields: PromptField[]; description?: string } = {
+            title: String(args.title ?? ""),
+            fields,
+          };
+          if (args.description) promptInput.description = String(args.description);
+          const prompt = this.database.createPrompt(promptInput);
+          this.transcriptBus.publishPrompt(prompt);
+          result = { promptId: prompt.id, status: "pending", message: "Form sent to user." };
+          break;
+        }
+
         default: {
           result = { error: `Unknown tool: ${name}` };
           break;
@@ -399,22 +476,37 @@ When you want to speak a response aloud (for voice interactions), use the speak 
       const choice = response.choices[0];
       if (!choice) break;
 
-      if (choice.finish_reason === "tool_calls" && choice.message.tool_calls?.length) {
-        messages.push(choice.message);
+      // Prefer structured tool_calls; fall back to text-encoded tool call (some model deployments)
+      const toolCalls: ToolCall[] =
+        choice.finish_reason === "tool_calls" && choice.message.tool_calls?.length
+          ? choice.message.tool_calls
+          : (() => {
+              const fallback = parseTextToolCall(choice.message.content ?? "");
+              return fallback ? [fallback] : [];
+            })();
 
-        for (const toolCall of choice.message.tool_calls) {
+      if (toolCalls.length > 0) {
+        messages.push({ ...choice.message, tool_calls: toolCalls });
+
+        let promptSent = false;
+        for (const toolCall of toolCalls) {
           const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
           if (bt) browserTask = bt;
+          if (toolCall.function.name === "request_user_input") promptSent = true;
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
             content: JSON.stringify(result),
           });
         }
+        // Stop looping once a user input form has been sent — further iterations would duplicate it
+        if (promptSent) {
+          return { kind: "text", text: "I've sent you a form to fill out. Please complete it and I'll continue." };
+        }
         continue;
       }
 
-      const text = choice.message.content ?? "";
+      const text = (choice.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
 
       if (browserTask) {
         return { kind: "browser_task", ...browserTask };

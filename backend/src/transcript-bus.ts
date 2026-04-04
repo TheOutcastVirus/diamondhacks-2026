@@ -1,6 +1,6 @@
-import type { TranscriptEntry } from "./contracts";
+import type { TranscriptEntry, UserPrompt } from "./contracts";
 
-type TranscriptEventType = "transcript" | "tool" | "tts";
+type TranscriptEventType = "transcript" | "tool" | "tts" | "prompt";
 
 function encodeSseFrame(event: string, payload: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -11,6 +11,17 @@ export class TranscriptEventBus {
 
   publish(event: TranscriptEventType, payload: TranscriptEntry): void {
     const frame = encodeSseFrame(event, payload as unknown as Record<string, unknown>);
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber.enqueue(frame);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
+    }
+  }
+
+  publishPrompt(prompt: UserPrompt): void {
+    const frame = encodeSseFrame("prompt", prompt as unknown as Record<string, unknown>);
     for (const subscriber of this.subscribers) {
       try {
         subscriber.enqueue(frame);

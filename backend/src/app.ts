@@ -233,6 +233,15 @@ export class GazabotApp {
         return jsonResponse(request, this.config, await this.handleTts(request));
       }
 
+      if (request.method === "GET" && url.pathname === "/api/prompts") {
+        return jsonResponse(request, this.config, { prompts: this.database.listPendingPrompts() });
+      }
+
+      if (request.method === "POST" && url.pathname.startsWith("/api/prompts/") && url.pathname.endsWith("/respond")) {
+        const id = url.pathname.slice("/api/prompts/".length, -"/respond".length);
+        return jsonResponse(request, this.config, await this.handlePromptRespond(request, id));
+      }
+
       return errorResponse(request, this.config, 404, "Route not found.");
     } catch (error) {
       if (error instanceof Error) {
@@ -240,10 +249,15 @@ export class GazabotApp {
           return errorResponse(request, this.config, 422, "Invalid request.", error.message);
         }
 
+        if ((error as Error & { notFound?: boolean }).notFound) {
+          return errorResponse(request, this.config, 404, error.message);
+        }
+
         if (
           error.message === "Message is required." ||
           error.message === "Invalid cron expression." ||
-          error.message.startsWith("Unknown timezone:")
+          error.message.startsWith("Unknown timezone:") ||
+          error.message.startsWith("Prompt already ")
         ) {
           return errorResponse(request, this.config, 400, error.message);
         }
@@ -362,6 +376,37 @@ export class GazabotApp {
     }
 
     return { spoken: false, text };
+  }
+
+  private async handlePromptRespond(request: Request, promptId: string): Promise<unknown> {
+    const prompt = this.database.getPrompt(promptId);
+    if (!prompt) {
+      throw Object.assign(new Error(`Prompt not found: ${promptId}`), { notFound: true });
+    }
+    if (prompt.status !== "pending") {
+      throw new Error(`Prompt already ${prompt.status}.`);
+    }
+
+    const body = asRecord(await parseJsonBody(request));
+    const response = body.response;
+    if (typeof response !== "object" || response === null || Array.isArray(response)) {
+      throw new Error("Invalid field: response");
+    }
+
+    const completed = this.database.respondToPrompt(promptId, response as Record<string, unknown>);
+
+    const responseText = `User submitted form "${completed.title}": ${JSON.stringify(completed.response)}`;
+    const responseEntry = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "resident",
+      text: responseText,
+      toolName: "user-prompt",
+      toolStatus: "completed",
+      metadata: { promptId: completed.id, response: completed.response },
+    });
+    this.transcriptBus.publish("tool", responseEntry);
+
+    return { prompt: completed };
   }
 }
 

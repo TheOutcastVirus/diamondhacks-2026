@@ -5,6 +5,8 @@ import type {
   BrowserActionStatus,
   BrowserContext,
   BrowserStatus,
+  PromptField,
+  PromptStatus,
   Reminder,
   ReminderCreateInput,
   TranscriptEntry,
@@ -12,6 +14,7 @@ import type {
   TranscriptRole,
   ToolStatus,
   UserMemoryEntry,
+  UserPrompt,
 } from "./contracts";
 import { computeNextRun } from "./cron";
 
@@ -261,6 +264,17 @@ export class GazabotDatabase {
         title TEXT PRIMARY KEY NOT NULL,
         content TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS user_prompts (
+        id TEXT PRIMARY KEY NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        fields_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'cancelled')),
+        response_json TEXT,
+        created_at TEXT NOT NULL,
+        responded_at TEXT
       ) STRICT;
     `);
   }
@@ -560,5 +574,60 @@ export class GazabotDatabase {
       .query("INSERT OR REPLACE INTO user_memory (title, content, updated_at) VALUES (?1, ?2, ?3)")
       .run(title.trim(), content.trim(), updatedAt);
     return { title: title.trim(), content: content.trim(), updatedAt };
+  }
+
+  createPrompt(input: { title: string; description?: string; fields: PromptField[] }): UserPrompt {
+    const id = prefixedId("p");
+    const createdAt = nowIso();
+    this.database
+      .query(
+        `INSERT INTO user_prompts (id, title, description, fields_json, status, response_json, created_at, responded_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)`,
+      )
+      .run(id, input.title, input.description ?? null, JSON.stringify(input.fields), createdAt);
+    const prompt: UserPrompt = { id, title: input.title, fields: input.fields, status: "pending", createdAt };
+    if (input.description) prompt.description = input.description;
+    return prompt;
+  }
+
+  listPendingPrompts(): UserPrompt[] {
+    type Row = { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null };
+    const rows = this.database
+      .query("SELECT * FROM user_prompts WHERE status = 'pending' ORDER BY created_at ASC")
+      .all() as Row[];
+    return rows.map((r) => this.serializePrompt(r));
+  }
+
+  getPrompt(id: string): UserPrompt | null {
+    type Row = { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null };
+    const row = this.database.query("SELECT * FROM user_prompts WHERE id = ?1").get(id) as Row | null;
+    if (!row) return null;
+    return this.serializePrompt(row);
+  }
+
+  respondToPrompt(id: string, response: Record<string, unknown>): UserPrompt {
+    const respondedAt = nowIso();
+    this.database
+      .query(
+        `UPDATE user_prompts SET status = 'completed', response_json = ?2, responded_at = ?3 WHERE id = ?1`,
+      )
+      .run(id, JSON.stringify(response), respondedAt);
+    const updated = this.getPrompt(id);
+    if (!updated) throw new Error(`Prompt not found: ${id}`);
+    return updated;
+  }
+
+  private serializePrompt(row: { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null }): UserPrompt {
+    const prompt: UserPrompt = {
+      id: row.id,
+      title: row.title,
+      fields: JSON.parse(row.fields_json) as PromptField[],
+      status: row.status,
+      createdAt: row.created_at,
+    };
+    if (row.description) prompt.description = row.description;
+    if (row.response_json) prompt.response = JSON.parse(row.response_json) as Record<string, unknown>;
+    if (row.responded_at) prompt.respondedAt = row.responded_at;
+    return prompt;
   }
 }
