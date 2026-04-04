@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { createEventStream, get } from '../api';
   import type { ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
+  import VoiceInput from '../components/VoiceInput.svelte';
 
   type StreamState = 'connecting' | 'live' | 'offline' | 'error';
   type FilterMode = 'all' | 'message' | 'tool';
@@ -317,6 +318,11 @@
       </article>
     </section>
 
+    <section class="panel panel-voice">
+      <p class="panel-label">Voice</p>
+      <VoiceInput />
+    </section>
+
     <section class="panel panel-note">
       <p class="panel-label">Notes</p>
       <ul class="note-list">
@@ -506,6 +512,17 @@
     background: color-mix(in srgb, var(--color-panel-muted) 55%, transparent);
     border-radius: 0;
     padding: 0.45rem 0.6rem;
+  }
+
+  section.panel-voice {
+    border-radius: 0;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-panel-muted);
+    padding: 1.25rem 1rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
   }
 
   section.callout,

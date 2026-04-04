@@ -9,7 +9,9 @@ const endpointMap: Record<EndpointKey, string> = {
   memory: '/api/memory',
 };
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
+const defaultDevApiBaseUrl = import.meta.env.DEV ? 'http://127.0.0.1:8000' : '';
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+const apiBaseUrl = (configuredApiBaseUrl || defaultDevApiBaseUrl).replace(/\/$/, '');
 
 type QueryValue = string | number | boolean | null | undefined;
 type RequestOptions = Omit<RequestInit, 'body' | 'method'> & {
@@ -25,7 +27,7 @@ function resolvePath(endpoint: EndpointKey | string) {
   return endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
 }
 
-function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
+export function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
   const path = resolvePath(endpoint);
   const url = new URL(`${apiBaseUrl}${path}`, window.location.origin);
 
@@ -108,6 +110,16 @@ export function patch<T>(
 
 export function del<T>(endpoint: EndpointKey | string, options?: Omit<RequestOptions, 'body'>) {
   return request<T>('DELETE', endpoint, options);
+}
+
+export async function postAudio(endpoint: EndpointKey | string, blob: Blob): Promise<ArrayBuffer> {
+  const form = new FormData();
+  form.append('audio', blob, 'recording.webm');
+  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  if (!response.ok) {
+    throw new ApiError(`Audio request failed`, response.status, null);
+  }
+  return response.arrayBuffer();
 }
 
 export function createEventStream(

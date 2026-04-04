@@ -14,6 +14,8 @@ import { AgentHarness, type AgentTurnResult } from "./agent";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
 import { ReminderScheduler } from "./reminder-scheduler";
+import { SttService } from "./stt";
+import { TtsService } from "./tts";
 import { TranscriptEventBus } from "./transcript-bus";
 
 
@@ -374,6 +376,10 @@ export class GazabotApp {
 
   private readonly unsubscribeReminderChanges: () => void;
 
+  private readonly sttService: SttService;
+
+  private readonly ttsService: TtsService;
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
@@ -389,6 +395,8 @@ export class GazabotApp {
       this.reminderScheduler.refresh();
     });
     this.reminderScheduler.start();
+    this.sttService = new SttService(config);
+    this.ttsService = new TtsService(config);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -471,6 +479,10 @@ export class GazabotApp {
         return jsonResponse(request, this.config, await this.handleTts(request));
       }
 
+      if (request.method === "POST" && url.pathname === "/api/agent/voice-turn") {
+        return this.handleVoiceTurn(request);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/prompts") {
         const status = parsePromptStatus(url.searchParams.get("status"));
         return jsonResponse(request, this.config, { prompts: this.database.listPrompts(status) });
@@ -550,11 +562,20 @@ export class GazabotApp {
           return errorResponse(request, this.config, 400, error.message);
         }
 
+        if (error.message.includes("INFERENCE_CLOUD_API_KEY is not configured")) {
+          return errorResponse(request, this.config, 503, error.message);
+        }
+
+        if (error.message.startsWith("Imagine API error")) {
+          return errorResponse(request, this.config, 502, error.message);
+        }
+
         if (error.message === "Reminder not found." || error.message === "Memory entry not found.") {
           return errorResponse(request, this.config, 404, error.message);
         }
       }
 
+      console.error("[app] Unhandled error:", error);
       return errorResponse(request, this.config, 500, "Internal server error.");
     }
   }
@@ -631,6 +652,59 @@ export class GazabotApp {
     });
 
     return eventStreamResponse(request, this.config, stream);
+  }
+
+  private async handleVoiceTurn(request: Request): Promise<Response> {
+    let formData: Awaited<ReturnType<Request["formData"]>>;
+    try {
+      formData = await request.formData();
+    } catch {
+      return errorResponse(request, this.config, 422, "Expected multipart/form-data.");
+    }
+
+    const audioField = formData.get("audio");
+    if (!audioField || !(audioField instanceof File)) {
+      return errorResponse(request, this.config, 422, "Missing audio field.");
+    }
+
+    const transcript = await this.sttService.transcribe(audioField);
+    if (!transcript.trim()) {
+      return errorResponse(request, this.config, 422, "No speech detected.");
+    }
+
+    const userEntry = this.database.createTranscriptEntry({
+      kind: "message",
+      role: "resident",
+      text: transcript,
+    });
+    this.transcriptBus.publish("transcript", userEntry);
+
+    const result: AgentTurnResult = await this.agentHarness.collectTurn({
+      message: transcript,
+      source: "voice",
+    });
+
+    let replyText: string;
+    if (result.kind === "browser_task") {
+      replyText = "I'm on it - I'll handle that for you now.";
+    } else {
+      replyText = result.text;
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: replyText,
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+    }
+
+    const audioOut = await this.ttsService.synthesize(replyText);
+
+    return new Response(audioOut, {
+      headers: {
+        "Content-Type": "audio/mpeg",
+        ...corsHeaders(request, this.config),
+      },
+    });
   }
 
   private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {

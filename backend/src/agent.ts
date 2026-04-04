@@ -305,7 +305,12 @@ export class AgentHarness {
       ? "\n\nIMPORTANT: The user has explicitly requested this be handled via browser automation."
       : "";
 
-    const systemPrompt = `You are Gazabot, a helpful AI assistant for a household. You help manage reminders, browse the web, answer questions, and assist with daily tasks. Be concise and friendly.
+    const voiceNote =
+      request.source === "voice"
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically, so do NOT call the speak tool. Keep your response to 1-3 sentences."
+        : "\n\nUse the speak tool ONCE if you want to vocalize a reply.";
+
+    const systemPrompt = `You are Gazabot, a senior care assistant. You help with reminders, web tasks, and daily questions. Be warm, concise, and friendly.
 
 Current date and time: ${new Date().toISOString()}
 
@@ -317,7 +322,15 @@ ${reminderSummary}
 
 When you learn something worth remembering about the user or household, call write_memory to store it.
 When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
-When you want to speak a response aloud (for voice interactions), use the speak tool with the text you want vocalized. You can speak AND also return a text response.${forceNote}`;
+
+TOOL USE RULES - follow exactly:
+- Only call a tool if the user EXPLICITLY requests that action.
+- For greetings, questions, or conversation: respond in plain text, call NO tools.
+- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
+- Use create_reminder ONLY if the user asks to set or schedule a reminder.
+- Use list_reminders ONLY if the user asks to see their reminders.
+- Never call more than one tool per turn unless strictly necessary.
+- Never repeat a tool call.${voiceNote}${forceNote}`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -575,41 +588,27 @@ When you want to speak a response aloud (for voice interactions), use the speak 
     }
   }
 
-  private async collectTurnMock(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    const browserHints = ["browser", "search", "look up", "lookup", "find", "open", "visit", "order", "book", "buy"];
-    const normalized = request.message.toLowerCase();
-    const isBrowser = request.forceBrowser === true || browserHints.some((h) => normalized.includes(h));
+  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
+    if (request.forceBrowser) {
+      const { browserTask } = await this.executeTool(
+        {
+          id: "forced_browser_task",
+          type: "function",
+          function: {
+            name: "run_browser_task",
+            arguments: JSON.stringify({ task: request.message }),
+          },
+        },
+        request.profileId,
+      );
 
-    if (isBrowser) {
-      const session = this.database.beginBrowserTask(request.message, request.profileId);
-      const queuedEntry = this.database.createTranscriptEntry({
-        kind: "tool",
-        role: "system",
-        text: `Queued browser task: ${request.message}`,
-        toolName: "browser-use",
-        toolStatus: "started",
-        metadata: { browserSessionId: session.id },
-      });
-      this.transcriptBus.publish("tool", queuedEntry);
-
-      const taskRequest: { browserSessionId: string; task: string; profileId?: string } = {
-        browserSessionId: session.id,
-        task: request.message,
-      };
-      if (request.profileId) {
-        taskRequest.profileId = request.profileId;
+      if (browserTask) {
+        return { kind: "browser_task", ...browserTask };
       }
-      void this.browserUseService.runBrowserTask(taskRequest);
-
-      return { kind: "browser_task", browserSessionId: session.id, previewUrl: session.previewUrl };
     }
 
-    return { kind: "text", text: "Agent has not been built yet" };
-  }
-
-  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    if (this.config.imagine.mockMode) {
-      return this.collectTurnMock(request);
+    if (!this.config.imagine.apiKey.trim()) {
+      throw new Error("INFERENCE_CLOUD_API_KEY is not configured. Set it in backend/.env.");
     }
 
     const messages = this.buildMessages(request);

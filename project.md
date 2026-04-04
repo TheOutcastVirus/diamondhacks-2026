@@ -30,7 +30,7 @@ bun run dev
 ```
 
 - **Health check:** [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health) should return `{"status":"ok"}`.
-- **Config:** Optional `backend/.env` (or a `.env` at the **repo root** — see `backend/src/config.ts`). Copy `backend/.env.example` as a starting point. Defaults allow **mock Browser Use** (`BROWSER_USE_MOCK_MODE=true`) without a cloud key for local UI work.
+- **Config:** Optional `backend/.env` (or a `.env` at the **repo root** — see `backend/src/config.ts`). Copy `backend/.env.example` as a starting point. **`INFERENCE_CLOUD_API_KEY`** and **`BROWSER_USE_API_KEY`** are required for agent and browser automation; without them the API returns clear errors at runtime.
 - **CORS:** By default the API allows the Vite dev origin `http://localhost:5173` and `http://127.0.0.1:5173`.
 
 ### Frontend (Svelte + Vite)
@@ -42,7 +42,7 @@ cd frontend
 npm install
 ```
 
-Point the UI at the API (Vite does **not** proxy `/api` in this repo). Create `frontend/.env` or `frontend/.env.local`:
+Point the UI at the API (Vite does **not** proxy `/api` in this repo). Create `frontend/.env` or `frontend/.env.local` if you need to override the local default:
 
 ```bash
 echo 'VITE_API_BASE_URL=http://127.0.0.1:8000' > .env.local
@@ -62,7 +62,7 @@ npm run dev
 | Step | Command / URL |
 |------|----------------|
 | 1 | `cd backend && bun install && bun run dev` |
-| 2 | Set `VITE_API_BASE_URL=http://127.0.0.1:8000` in `frontend/.env.local` |
+| 2 | Optional: set `VITE_API_BASE_URL=http://127.0.0.1:8000` in `frontend/.env.local` |
 | 3 | `cd frontend && npm install && npm run dev` |
 | 4 | Open the dashboard at `http://localhost:5173` |
 
