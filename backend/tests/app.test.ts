@@ -216,6 +216,65 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("stores prompt responses and plain notes in the same memory surface", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      database.writeMemory("care_notes", "Resident prefers tea after dinner.");
+      const prompt = database.createPrompt({
+        title: "Medical intake",
+        description: "Collect current health details.",
+        memoryKey: "medical_profile",
+        fields: [
+          { name: "allergies", label: "Allergies", type: "text", required: true },
+          { name: "uses_walker", label: "Uses walker", type: "boolean", required: false },
+        ],
+      });
+
+      const respondResponse = await app.fetch(
+        new Request(`http://localhost/api/prompts/${prompt.id}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            response: {
+              allergies: "Peanuts",
+              uses_walker: true,
+            },
+          }),
+        }),
+      );
+
+      expect(respondResponse.status).toBe(200);
+      const respondPayload = (await respondResponse.json()) as {
+        prompt: Record<string, unknown>;
+        memoryEntry: Record<string, unknown>;
+      };
+      expect(respondPayload.prompt.status).toBe("completed");
+      expect(respondPayload.memoryEntry.title).toBe("medical_profile");
+      expect(respondPayload.memoryEntry.kind).toBe("structured");
+
+      const memoryResponse = await app.fetch(new Request("http://localhost/api/memory"));
+      expect(memoryResponse.status).toBe(200);
+      const memoryPayload = (await memoryResponse.json()) as { entries: Array<Record<string, unknown>> };
+      expect(memoryPayload.entries).toHaveLength(2);
+      expect(memoryPayload.entries.some((entry) => entry.title === "care_notes" && entry.kind === "text")).toBe(true);
+      expect(memoryPayload.entries.some((entry) => entry.title === "medical_profile" && entry.kind === "structured")).toBe(true);
+
+      const profileResponse = await app.fetch(new Request("http://localhost/api/memory/medical_profile"));
+      expect(profileResponse.status).toBe(200);
+      const profilePayload = (await profileResponse.json()) as { entry: Record<string, unknown> };
+      expect(profilePayload.entry.kind).toBe("structured");
+      expect(profilePayload.entry.data).toEqual({
+        allergies: "Peanuts",
+        uses_walker: true,
+      });
+      expect(profilePayload.entry.schema).toHaveLength(2);
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
   test("runs simultaneous due reminders sequentially and records them in transcript history", async () => {
     const { app, database } = createTestApp();
 

@@ -5,6 +5,8 @@ const endpointMap: Record<EndpointKey, string> = {
   browser: '/api/browser',
   transcript: '/api/transcript',
   transcriptStream: '/api/transcript/stream',
+  prompts: '/api/prompts',
+  memory: '/api/memory',
 };
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');

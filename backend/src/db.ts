@@ -5,6 +5,7 @@ import type {
   BrowserActionStatus,
   BrowserContext,
   BrowserStatus,
+  MemoryKind,
   PromptField,
   PromptStatus,
   Reminder,
@@ -69,6 +70,28 @@ type BrowserActionRow = {
   status: BrowserActionStatus | null;
 };
 
+type UserPromptRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  memory_key: string;
+  memory_label: string;
+  fields_json: string;
+  status: PromptStatus;
+  response_json: string | null;
+  created_at: string;
+  responded_at: string | null;
+};
+
+type UserMemoryRow = {
+  title: string;
+  content: string;
+  kind: MemoryKind | null;
+  schema_json: string | null;
+  data_json: string | null;
+  updated_at: string;
+};
+
 export type BrowserTaskSession = {
   id: string;
   previewUrl: string | null;
@@ -100,17 +123,32 @@ function prefixedId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
 }
 
-function parseMetadata(value: string | null): Record<string, unknown> | undefined {
+function slugifyKey(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || `memory_${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | undefined {
   if (!value) {
     return undefined;
   }
 
   try {
     const parsed = JSON.parse(value);
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
   } catch {
     return undefined;
   }
+}
+
+function parseMetadata(value: string | null): Record<string, unknown> | undefined {
+  return parseJsonObject(value);
 }
 
 function serializeReminder(row: ReminderRow): Reminder {
@@ -198,6 +236,46 @@ function serializeBrowserContext(session: BrowserSessionRow | null, actions: Bro
   }
 
   return context;
+}
+
+function serializePrompt(row: UserPromptRow): UserPrompt {
+  const memoryKey = String((row as { memory_key?: string | null }).memory_key ?? "").trim() || slugifyKey(row.title);
+  const memoryLabel = String((row as { memory_label?: string | null }).memory_label ?? "").trim() || row.title;
+  const prompt: UserPrompt = {
+    id: row.id,
+    title: row.title,
+    fields: JSON.parse(row.fields_json) as PromptField[],
+    memoryKey,
+    memoryLabel,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+  if (row.description) {
+    prompt.description = row.description;
+  }
+  if (row.response_json) {
+    prompt.response = JSON.parse(row.response_json) as Record<string, unknown>;
+  }
+  if (row.responded_at) {
+    prompt.respondedAt = row.responded_at;
+  }
+  return prompt;
+}
+
+function serializeMemoryEntry(row: UserMemoryRow): UserMemoryEntry {
+  const entry: UserMemoryEntry = {
+    title: row.title,
+    content: row.content,
+    updatedAt: row.updated_at,
+    kind: row.kind === "structured" ? "structured" : "text",
+  };
+  if (row.schema_json) {
+    entry.schema = JSON.parse(row.schema_json) as PromptField[];
+  }
+  if (row.data_json) {
+    entry.data = JSON.parse(row.data_json) as Record<string, unknown>;
+  }
+  return entry;
 }
 
 function nextRunForReminder(input: {
@@ -290,6 +368,9 @@ export class GazabotDatabase {
       CREATE TABLE IF NOT EXISTS user_memory (
         title TEXT PRIMARY KEY NOT NULL,
         content TEXT NOT NULL,
+        kind TEXT CHECK (kind IS NULL OR kind IN ('text', 'structured')),
+        schema_json TEXT,
+        data_json TEXT,
         updated_at TEXT NOT NULL
       ) STRICT;
 
@@ -297,13 +378,33 @@ export class GazabotDatabase {
         id TEXT PRIMARY KEY NOT NULL,
         title TEXT NOT NULL,
         description TEXT,
+        memory_key TEXT,
+        memory_label TEXT,
         fields_json TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'cancelled')),
         response_json TEXT,
         created_at TEXT NOT NULL,
         responded_at TEXT
       ) STRICT;
+
     `);
+
+    this.ensureColumn("user_memory", "kind", "TEXT");
+    this.ensureColumn("user_memory", "schema_json", "TEXT");
+    this.ensureColumn("user_memory", "data_json", "TEXT");
+    this.ensureColumn("user_prompts", "memory_key", "TEXT");
+    this.ensureColumn("user_prompts", "memory_label", "TEXT");
+  }
+
+  private ensureColumn(tableName: string, columnName: string, definition: string): void {
+    const columns = this.database
+      .query(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    if (columns.some((column) => column.name === columnName)) {
+      return;
+    }
+
+    this.database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition};`);
   }
 
   listReminders(): Reminder[] {
@@ -730,52 +831,105 @@ export class GazabotDatabase {
     return rows.map((r) => r.title);
   }
 
+  listMemoryEntries(): UserMemoryEntry[] {
+    const rows = this.database
+      .query("SELECT * FROM user_memory ORDER BY updated_at DESC, title ASC")
+      .all() as UserMemoryRow[];
+    return rows.map(serializeMemoryEntry);
+  }
+
   readMemory(title: string): UserMemoryEntry | null {
     const row = this.database
-      .query("SELECT title, content, updated_at FROM user_memory WHERE title = ?1")
-      .get(title) as { title: string; content: string; updated_at: string } | null;
+      .query("SELECT * FROM user_memory WHERE title = ?1")
+      .get(title) as UserMemoryRow | null;
     if (!row) return null;
-    return { title: row.title, content: row.content, updatedAt: row.updated_at };
+    return serializeMemoryEntry(row);
   }
 
-  writeMemory(title: string, content: string): UserMemoryEntry {
+  writeMemory(
+    title: string,
+    content: string,
+    options?: { schema?: PromptField[]; data?: Record<string, unknown> },
+  ): UserMemoryEntry {
     const updatedAt = nowIso();
-    this.database
-      .query("INSERT OR REPLACE INTO user_memory (title, content, updated_at) VALUES (?1, ?2, ?3)")
-      .run(title.trim(), content.trim(), updatedAt);
-    return { title: title.trim(), content: content.trim(), updatedAt };
-  }
-
-  createPrompt(input: { title: string; description?: string; fields: PromptField[] }): UserPrompt {
-    const id = prefixedId("p");
-    const createdAt = nowIso();
+    const normalizedTitle = title.trim();
+    const schemaJson = options?.schema ? JSON.stringify(options.schema) : null;
+    const dataJson = options?.data ? JSON.stringify(options.data) : null;
+    const kind: MemoryKind = options?.data ? "structured" : "text";
     this.database
       .query(
-        `INSERT INTO user_prompts (id, title, description, fields_json, status, response_json, created_at, responded_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)`,
+        `
+          INSERT OR REPLACE INTO user_memory (title, content, kind, schema_json, data_json, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        `,
       )
-      .run(id, input.title, input.description ?? null, JSON.stringify(input.fields), createdAt);
-    const prompt: UserPrompt = { id, title: input.title, fields: input.fields, status: "pending", createdAt };
+      .run(normalizedTitle, content.trim(), kind, schemaJson, dataJson, updatedAt);
+    return {
+      title: normalizedTitle,
+      content: content.trim(),
+      updatedAt,
+      kind,
+      ...(options?.schema !== undefined && { schema: options.schema }),
+      ...(options?.data !== undefined && { data: options.data }),
+    };
+  }
+
+  createPrompt(input: {
+    title: string;
+    description?: string;
+    fields: PromptField[];
+    memoryKey?: string;
+    memoryLabel?: string;
+  }): UserPrompt {
+    const id = prefixedId("p");
+    const createdAt = nowIso();
+    const memoryKey = slugifyKey(input.memoryKey ?? input.title);
+    const memoryLabel = input.memoryLabel?.trim() || input.title.trim();
+    this.database
+      .query(
+        `INSERT INTO user_prompts (
+           id, title, description, memory_key, memory_label, fields_json, status, response_json, created_at, responded_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, NULL)`,
+      )
+      .run(id, input.title, input.description ?? null, memoryKey, memoryLabel, JSON.stringify(input.fields), createdAt);
+    const prompt: UserPrompt = {
+      id,
+      title: input.title,
+      fields: input.fields,
+      memoryKey,
+      memoryLabel,
+      status: "pending",
+      createdAt,
+    };
     if (input.description) prompt.description = input.description;
     return prompt;
   }
 
-  listPendingPrompts(): UserPrompt[] {
-    type Row = { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null };
-    const rows = this.database
-      .query("SELECT * FROM user_prompts WHERE status = 'pending' ORDER BY created_at ASC")
-      .all() as Row[];
-    return rows.map((r) => this.serializePrompt(r));
+  listPrompts(status: PromptStatus | "all" = "pending"): UserPrompt[] {
+    const rows =
+      status === "all"
+        ? (this.database
+            .query("SELECT * FROM user_prompts ORDER BY created_at DESC")
+            .all() as UserPromptRow[])
+        : (this.database
+            .query("SELECT * FROM user_prompts WHERE status = ?1 ORDER BY created_at ASC")
+            .all(status) as UserPromptRow[]);
+    return rows.map(serializePrompt);
   }
 
   getPrompt(id: string): UserPrompt | null {
-    type Row = { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null };
-    const row = this.database.query("SELECT * FROM user_prompts WHERE id = ?1").get(id) as Row | null;
+    const row = this.database.query("SELECT * FROM user_prompts WHERE id = ?1").get(id) as UserPromptRow | null;
     if (!row) return null;
-    return this.serializePrompt(row);
+    return serializePrompt(row);
   }
 
-  respondToPrompt(id: string, response: Record<string, unknown>): UserPrompt {
+  respondToPrompt(id: string, response: Record<string, unknown>): { prompt: UserPrompt; memoryEntry: UserMemoryEntry } {
+    const prompt = this.getPrompt(id);
+    if (!prompt) {
+      throw new Error(`Prompt not found: ${id}`);
+    }
+
     const respondedAt = nowIso();
     this.database
       .query(
@@ -784,21 +938,15 @@ export class GazabotDatabase {
       .run(id, JSON.stringify(response), respondedAt);
     const updated = this.getPrompt(id);
     if (!updated) throw new Error(`Prompt not found: ${id}`);
-    return updated;
-  }
-
-  private serializePrompt(row: { id: string; title: string; description: string | null; fields_json: string; status: PromptStatus; response_json: string | null; created_at: string; responded_at: string | null }): UserPrompt {
-    const prompt: UserPrompt = {
-      id: row.id,
-      title: row.title,
-      fields: JSON.parse(row.fields_json) as PromptField[],
-      status: row.status,
-      createdAt: row.created_at,
-    };
-    if (row.description) prompt.description = row.description;
-    if (row.response_json) prompt.response = JSON.parse(row.response_json) as Record<string, unknown>;
-    if (row.responded_at) prompt.respondedAt = row.responded_at;
-    return prompt;
+    const memoryEntry = this.writeMemory(
+      updated.memoryKey,
+      JSON.stringify(response, null, 2),
+      {
+        schema: updated.fields,
+        data: response,
+      },
+    );
+    return { prompt: updated, memoryEntry };
   }
 
   private notifyReminderListeners(): void {

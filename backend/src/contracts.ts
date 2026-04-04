@@ -92,13 +92,31 @@ export type AgentTurnResponse =
       status: "queued";
     };
 
+export type MemoryKind = "text" | "structured";
+
 export type UserMemoryEntry = {
   title: string;
   content: string;
   updatedAt: string;
+  kind: MemoryKind;
+  schema?: PromptField[];
+  data?: Record<string, unknown>;
 };
 
-export type PromptFieldType = "string" | "int" | "float" | "boolean" | "password";
+export type PromptFieldType =
+  | "string"
+  | "text"
+  | "int"
+  | "float"
+  | "boolean"
+  | "password"
+  | "date"
+  | "select";
+
+export type PromptFieldOption = {
+  label: string;
+  value: string;
+};
 
 export type PromptField = {
   name: string;
@@ -106,6 +124,9 @@ export type PromptField = {
   type: PromptFieldType;
   required: boolean;
   placeholder?: string;
+  description?: string;
+  options?: PromptFieldOption[];
+  defaultValue?: string | number | boolean | null;
 };
 
 export type PromptStatus = "pending" | "completed" | "cancelled";
@@ -115,6 +136,8 @@ export type UserPrompt = {
   title: string;
   description?: string;
   fields: PromptField[];
+  memoryKey: string;
+  memoryLabel: string;
   status: PromptStatus;
   createdAt: string;
   response?: Record<string, unknown>;

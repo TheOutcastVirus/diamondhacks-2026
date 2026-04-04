@@ -1,5 +1,10 @@
 import type { AppConfig } from "./config";
-import type { AgentTurnRequest, PromptField, ReminderCadence, ReminderUpdateInput } from "./contracts";
+import type {
+  AgentTurnRequest,
+  PromptField,
+  ReminderCadence,
+  ReminderUpdateInput,
+} from "./contracts";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { TranscriptEventBus } from "./transcript-bus";
@@ -140,7 +145,8 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "read_memory",
-      description: "Fetch the full content of a stored memory entry by its title. Use when you need details about a topic listed in the system prompt's memory index.",
+      description:
+        "Fetch the full content of a stored memory entry by its title. Some entries are plain text and some are structured JSON-backed records, but they are all accessed through this same tool.",
       parameters: {
         type: "object",
         properties: {
@@ -155,14 +161,24 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "write_memory",
       description:
-        "Store or update a memory entry about the user or household. Use a short descriptive title (e.g. 'user_name', 'health_notes', 'dietary_restrictions', 'communication_preferences') and put the full details in content. Call this whenever you learn something worth remembering.",
+        "Store or update a memory entry about the user or household. Use a short descriptive title (e.g. 'user_name', 'health_notes', 'dietary_restrictions', 'communication_preferences'). For normal notes, write plain text in content. For machine-editable memory, provide content_json with a JSON object string and optionally fields_json describing the schema.",
       parameters: {
         type: "object",
         properties: {
           title: { type: "string", description: "Short descriptive key for this memory" },
           content: { type: "string", description: "Full details to store" },
+          content_json: {
+            type: "string",
+            description:
+              'Optional JSON object string for machine-editable memory, e.g. {"preferred_name":"Pat","allergies":["peanuts"]}',
+          },
+          fields_json: {
+            type: "string",
+            description:
+              'Optional JSON array string describing the schema when content_json is used. Same field format as request_user_input.',
+          },
         },
-        required: ["title", "content"],
+        required: ["title"],
       },
     },
   },
@@ -171,15 +187,25 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "request_user_input",
       description:
-        'Send a structured form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, personal info). The form appears on the frontend and the response is fed back to you automatically. fields_json must be a valid JSON array string, e.g.: [{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}]',
+        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details). The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string, e.g.: [{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}]',
       parameters: {
         type: "object",
         properties: {
           title: { type: "string", description: "Form title shown to the user" },
           description: { type: "string", description: "Explanation of why this information is needed" },
+          memory_key: {
+            type: "string",
+            description:
+              "Stable structured memory key where the response should be stored, e.g. 'medical_profile' or 'shopping_preferences'",
+          },
+          memory_label: {
+            type: "string",
+            description: "Human-friendly label for the saved memory record",
+          },
           fields_json: {
             type: "string",
-            description: 'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|int|float|boolean|password","required":true|false}',
+            description:
+              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select","required":true|false}',
           },
         },
         required: ["title", "fields_json"],
@@ -290,6 +316,7 @@ Active reminders:
 ${reminderSummary}
 
 When you learn something worth remembering about the user or household, call write_memory to store it.
+When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
 When you want to speak a response aloud (for voice interactions), use the speak tool with the text you want vocalized. You can speak AND also return a text response.${forceNote}`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
@@ -426,7 +453,43 @@ When you want to speak a response aloud (for voice interactions), use the speak 
         }
 
         case "write_memory": {
-          result = this.database.writeMemory(String(args.title ?? ""), String(args.content ?? ""));
+          let data: Record<string, unknown> | undefined;
+          let fields: PromptField[] | undefined;
+
+          if (args.content_json !== undefined || args.data !== undefined) {
+            try {
+              const rawData = args.content_json ?? args.data ?? "{}";
+              const parsed = JSON.parse(typeof rawData === "string" ? rawData : JSON.stringify(rawData));
+              if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+                data = parsed as Record<string, unknown>;
+              }
+            } catch {
+              data = undefined;
+            }
+          }
+
+          if (args.fields_json !== undefined || args.fields !== undefined) {
+            try {
+              const rawFields = args.fields_json ?? args.fields ?? "[]";
+              const parsed = JSON.parse(typeof rawFields === "string" ? rawFields : JSON.stringify(rawFields));
+              if (Array.isArray(parsed)) {
+                fields = parsed as PromptField[];
+              }
+            } catch {
+              fields = undefined;
+            }
+          }
+
+          const content =
+            typeof args.content === "string"
+              ? args.content
+              : data
+                ? JSON.stringify(data, null, 2)
+                : "";
+          result = this.database.writeMemory(String(args.title ?? ""), content, {
+            ...(fields !== undefined && { schema: fields }),
+            ...(data !== undefined && { data }),
+          });
           break;
         }
 
@@ -439,11 +502,23 @@ When you want to speak a response aloud (for voice interactions), use the speak 
           } catch {
             fields = [];
           }
-          const promptInput: { title: string; fields: PromptField[]; description?: string } = {
+          const promptInput: {
+            title: string;
+            fields: PromptField[];
+            description?: string;
+            memoryKey?: string;
+            memoryLabel?: string;
+          } = {
             title: String(args.title ?? ""),
             fields,
           };
           if (args.description) promptInput.description = String(args.description);
+          if (typeof args.memory_key === "string") {
+            promptInput.memoryKey = args.memory_key;
+          }
+          if (typeof args.memory_label === "string") {
+            promptInput.memoryLabel = args.memory_label;
+          }
           const prompt = this.database.createPrompt(promptInput);
           this.transcriptBus.publishPrompt(prompt);
           result = { promptId: prompt.id, status: "pending", message: "Form sent to user." };
