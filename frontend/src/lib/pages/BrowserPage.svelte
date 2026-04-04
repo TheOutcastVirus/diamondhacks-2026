@@ -616,14 +616,19 @@
     }
   }
 
-  @media (max-width: 640px) {
-    form.prompt-form {
+  @media (max-width: 720px) {
+    form.prompt-form,
+    div.button-row {
       flex-direction: column;
       align-items: stretch;
     }
 
     button.run-btn {
       align-self: flex-end;
+    }
+
+    button.ghost {
+      width: 100%;
     }
   }
 </style>
