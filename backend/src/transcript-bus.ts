@@ -1,6 +1,6 @@
 import type { TranscriptEntry } from "./contracts";
 
-type TranscriptEventType = "transcript" | "tool";
+type TranscriptEventType = "transcript" | "tool" | "tts";
 
 function encodeSseFrame(event: string, payload: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -11,6 +11,17 @@ export class TranscriptEventBus {
 
   publish(event: TranscriptEventType, payload: TranscriptEntry): void {
     const frame = encodeSseFrame(event, payload as unknown as Record<string, unknown>);
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber.enqueue(frame);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
+    }
+  }
+
+  publishTts(text: string): void {
+    const frame = encodeSseFrame("tts", { text });
     for (const subscriber of this.subscribers) {
       try {
         subscriber.enqueue(frame);

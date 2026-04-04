@@ -22,6 +22,17 @@ export type AppConfig = {
   agent: {
     chunkDelayMs: number;
   };
+  imagine: {
+    apiKey: string;
+    endpoint: string;
+    model: string;
+    maxTokens: number;
+    maxHistoryEntries: number;
+    mockMode: boolean;
+  };
+  tts: {
+    endpoint?: string;
+  };
 };
 
 type EnvSource = Record<string, string | undefined>;
@@ -94,6 +105,21 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     browserUse.proxyCountryCode = proxyCountryCode;
   }
 
+  const imagine: AppConfig["imagine"] = {
+    apiKey: source.INFERENCE_CLOUD_API_KEY?.trim() || "",
+    endpoint: source.INFERENCE_CLOUD_ENDPOINT?.trim() || "https://aisuite.cirrascale.com/apis/v2",
+    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-70B",
+    maxTokens: parseInteger(source.INFERENCE_CLOUD_MAX_TOKENS, 1024),
+    maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
+    mockMode: parseBoolean(source.AGENT_MOCK_MODE, false),
+  };
+
+  const tts: AppConfig["tts"] = {};
+  const ttsEndpoint = source.TTS_ENDPOINT?.trim();
+  if (ttsEndpoint) {
+    tts.endpoint = ttsEndpoint;
+  }
+
   return {
     appName: source.APP_NAME?.trim() || "Gazabot Backend",
     host: source.HOST?.trim() || "127.0.0.1",
@@ -104,5 +130,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     agent: {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
     },
+    imagine,
+    tts,
   };
 }

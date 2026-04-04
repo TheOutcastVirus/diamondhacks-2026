@@ -17,6 +17,7 @@ function createTestApp() {
     APP_NAME: "Gazabot Backend Test",
     DATABASE_PATH: join(directory, "test.sqlite"),
     BROWSER_USE_MOCK_MODE: "true",
+    AGENT_MOCK_MODE: "true",
     AGENT_CHUNK_DELAY_MS: "5",
   });
   const database = new GazabotDatabase(config.databasePath);

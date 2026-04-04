@@ -7,25 +7,11 @@ import type {
   ReminderCreateInput,
   TranscriptRole,
 } from "./contracts";
-import { AgentHarness } from "./agent";
+import { AgentHarness, type AgentTurnResult } from "./agent";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
 
-const BROWSER_HINTS = [
-  "browser",
-  "search",
-  "look up",
-  "lookup",
-  "find",
-  "open",
-  "visit",
-  "check the website",
-  "order",
-  "book",
-  "schedule",
-  "buy",
-] as const;
 
 function corsHeaders(request: Request, config: AppConfig): Record<string, string> {
   const origin = request.headers.get("origin");
@@ -178,14 +164,6 @@ function roleForSource(source: AgentTurnRequest["source"]): TranscriptRole {
   return "resident";
 }
 
-function needsBrowser(message: string, forceBrowser?: boolean): boolean {
-  if (forceBrowser !== undefined) {
-    return forceBrowser;
-  }
-
-  const normalized = message.toLowerCase();
-  return BROWSER_HINTS.some((hint) => normalized.includes(hint));
-}
 
 function encodeSseFrame(event: string, payload: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -202,8 +180,8 @@ export class GazabotApp {
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
   ) {
-    this.agentHarness = new AgentHarness(config.agent.chunkDelayMs);
     this.browserUseService = new BrowserUseService(config, database, this.transcriptBus);
+    this.agentHarness = new AgentHarness(config, database, this.browserUseService, this.transcriptBus);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -251,6 +229,10 @@ export class GazabotApp {
         return this.handleAgentStream(request);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/tts") {
+        return jsonResponse(request, this.config, await this.handleTts(request));
+      }
+
       return errorResponse(request, this.config, 404, "Route not found.");
     } catch (error) {
       if (error instanceof Error) {
@@ -284,46 +266,27 @@ export class GazabotApp {
     });
     this.transcriptBus.publish("transcript", userEntry);
 
-    if (needsBrowser(payload.message, payload.forceBrowser)) {
-      const browserSession = this.database.beginBrowserTask(payload.message, payload.profileId);
-      const queued = this.database.createTranscriptEntry({
-        kind: "tool",
-        role: "system",
-        text: `Queued browser task: ${payload.message}`,
-        toolName: "browser-use",
-        toolStatus: "started",
-        metadata: { browserSessionId: browserSession.id },
-      });
-      this.transcriptBus.publish("tool", queued);
+    const result: AgentTurnResult = await this.agentHarness.collectTurn(payload);
 
-      const browserTaskRequest: { browserSessionId: string; task: string; profileId?: string } = {
-        browserSessionId: browserSession.id,
-        task: payload.message,
-      };
-      if (payload.profileId) {
-        browserTaskRequest.profileId = payload.profileId;
-      }
-      void this.browserUseService.runBrowserTask(browserTaskRequest);
-
+    if (result.kind === "browser_task") {
       return {
         route: "browser_task",
-        browserSessionId: browserSession.id,
-        previewUrl: browserSession.previewUrl,
+        browserSessionId: result.browserSessionId,
+        previewUrl: result.previewUrl,
         status: "queued",
       };
     }
 
-    const reply = await this.agentHarness.collectPrompt(payload.message);
     const robotEntry = this.database.createTranscriptEntry({
       kind: "message",
       role: "robot",
-      text: reply,
+      text: result.text,
     });
     this.transcriptBus.publish("transcript", robotEntry);
 
     return {
       route: "conversation",
-      reply,
+      reply: result.text,
     };
   }
 
@@ -347,7 +310,7 @@ export class GazabotApp {
 
           try {
             controller.enqueue(encodeSseFrame("ready", { source: payload.source }));
-            const reader = this.agentHarness.streamPrompt(payload.message).getReader();
+            const reader = this.agentHarness.streamTurn(payload).getReader();
             while (true) {
               const { done, value } = await reader.read();
               if (done) {
@@ -376,6 +339,29 @@ export class GazabotApp {
     });
 
     return eventStreamResponse(request, this.config, stream);
+  }
+
+  private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {
+    const body = asRecord(await parseJsonBody(request));
+    const text = requireString(body, "text");
+
+    this.transcriptBus.publishTts(text);
+
+    const endpoint = this.config.tts.endpoint;
+    if (endpoint) {
+      try {
+        await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        return { spoken: true, text };
+      } catch {
+        // TTS service unavailable — fall through
+      }
+    }
+
+    return { spoken: false, text };
   }
 }
 
