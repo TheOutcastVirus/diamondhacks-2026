@@ -32,7 +32,26 @@ function withFetchStub(stub: (url: string, init?: RequestInit) => Promise<Respon
   };
 }
 
-function createTestApp() {
+async function removePathWithRetries(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = error && typeof error === "object" ? (error as { code?: string }).code : undefined;
+      if (code !== "EBUSY" || attempt === 4) {
+        if (code === "EBUSY") {
+          return;
+        }
+        throw error;
+      }
+
+      await Bun.sleep(25);
+    }
+  }
+}
+
+function createTestApp(overrides: Record<string, string> = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gazabot-backend-"));
   cleanupPaths.push(directory);
 
@@ -43,6 +62,9 @@ function createTestApp() {
     BROWSER_USE_API_KEY: "test-browser-key",
     AGENT_CHUNK_DELAY_MS: "5",
     BROWSER_USE_POLL_INTERVAL_MS: "5",
+    REMINDER_SCHEDULER_ENABLED: "false",
+    REMINDER_POLL_INTERVAL_MS: "25",
+    ...overrides,
   });
   const database = new GazabotDatabase(config.databasePath);
   const app = createApp(config, database);
@@ -50,17 +72,17 @@ function createTestApp() {
   return { app, database };
 }
 
-afterEach(() => {
+afterEach(async () => {
   while (cleanupPaths.length > 0) {
     const path = cleanupPaths.pop();
     if (path) {
-      rmSync(path, { recursive: true, force: true });
+      await removePathWithRetries(path);
     }
   }
 });
 
 describe("Gazabot Bun backend", () => {
-  test("supports reminder round trip", async () => {
+  test("supports reminder create, update, pause, and delete flow", async () => {
     const { app, database } = createTestApp();
 
     try {
@@ -89,10 +111,62 @@ describe("Gazabot Bun backend", () => {
       expect(created.scheduleLabel).toBe("Every day at 15:00");
       expect(created.nextRun).toBeString();
 
+      const reminderId = String(created.id);
+
+      const updateResponse = await app.fetch(
+        new Request(`http://localhost/api/reminders/${reminderId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Evening hydration reminder",
+            instructions: "Prompt for water after dinner.",
+            cadence: "weekly",
+            cron: "30 19 * * 2",
+            scheduleLabel: "Every Tuesday at 19:30",
+            timezone: "America/New_York",
+          }),
+        }),
+      );
+
+      expect(updateResponse.status).toBe(200);
+      const updated = (await updateResponse.json()) as Record<string, unknown>;
+      expect(updated.title).toBe("Evening hydration reminder");
+      expect(updated.instructions).toBe("Prompt for water after dinner.");
+      expect(updated.scheduleLabel).toBe("Every Tuesday at 19:30");
+      expect(updated.timezone).toBe("America/New_York");
+      expect(updated.nextRun).toBeString();
+
+      const pauseResponse = await app.fetch(
+        new Request(`http://localhost/api/reminders/${reminderId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status: "paused",
+          }),
+        }),
+      );
+
+      expect(pauseResponse.status).toBe(200);
+      const paused = (await pauseResponse.json()) as Record<string, unknown>;
+      expect(paused.status).toBe("paused");
+      expect(paused.nextRun).toBeNull();
+
       const listResponse = await app.fetch(new Request("http://localhost/api/reminders"));
       const listed = (await listResponse.json()) as { reminders: unknown[] };
       expect(listed.reminders).toHaveLength(1);
+
+      const deleteResponse = await app.fetch(
+        new Request(`http://localhost/api/reminders/${reminderId}`, {
+          method: "DELETE",
+        }),
+      );
+      expect(deleteResponse.status).toBe(204);
+
+      const emptyAgainResponse = await app.fetch(new Request("http://localhost/api/reminders"));
+      expect(emptyAgainResponse.status).toBe(200);
+      expect(await emptyAgainResponse.json()).toEqual({ reminders: [] });
     } finally {
+      app.close();
       database.close();
     }
   });
@@ -143,6 +217,7 @@ describe("Gazabot Bun backend", () => {
         expect(transcript.entries[1]?.role).toBe("robot");
         expect(transcript.entries[1]?.text).toBe("Noted for later.");
       } finally {
+        app.close();
         database.close();
       }
     } finally {
@@ -243,6 +318,97 @@ describe("Gazabot Bun backend", () => {
         expect(String(browserPayload.browser.summary)).toContain("Pharmacy hours");
         expect(stopRequests).toBe(0);
       } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("runs simultaneous due reminders sequentially and records them in transcript history", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Reminder handled.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const firstCreateResponse = await app.fetch(
+          new Request("http://localhost/api/reminders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: "Medication check-in",
+              instructions: "Ask whether the resident has taken their afternoon medication.",
+              cadence: "custom",
+              cron: "* * * * *",
+              scheduleLabel: "Every minute",
+              timezone: "America/Los_Angeles",
+            }),
+          }),
+        );
+
+        expect(firstCreateResponse.status).toBe(200);
+        const firstCreated = (await firstCreateResponse.json()) as Record<string, unknown>;
+
+        const secondCreateResponse = await app.fetch(
+          new Request("http://localhost/api/reminders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: "Hydration prompt",
+              instructions: "Ask the resident to drink a glass of water.",
+              cadence: "custom",
+              cron: "* * * * *",
+              scheduleLabel: "Every minute",
+              timezone: "America/Los_Angeles",
+            }),
+          }),
+        );
+
+        expect(secondCreateResponse.status).toBe(200);
+        const secondCreated = (await secondCreateResponse.json()) as Record<string, unknown>;
+        const initialNextRun = String(firstCreated.nextRun);
+        expect(String(secondCreated.nextRun)).toBe(initialNextRun);
+
+        const executedCount = await app.runReminderSchedulerOnce(new Date(initialNextRun));
+        expect(executedCount).toBe(2);
+
+        const transcriptResponse = await app.fetch(new Request("http://localhost/api/transcript"));
+        expect(transcriptResponse.status).toBe(200);
+        const transcript = (await transcriptResponse.json()) as { entries: Array<Record<string, unknown>> };
+
+        expect(
+          transcript.entries.some((entry) => String(entry.text).includes("Reminder fired: Medication check-in")),
+        ).toBe(true);
+        expect(
+          transcript.entries.some((entry) => String(entry.text).includes("Reminder fired: Hydration prompt")),
+        ).toBe(true);
+        expect(transcript.entries.some((entry) => entry.role === "robot")).toBe(true);
+        expect(
+          transcript.entries.filter((entry) => entry.toolName === "reminder-scheduler"),
+        ).toHaveLength(4);
+        expect(transcript.entries.filter((entry) => entry.text === "Reminder handled.")).toHaveLength(2);
+
+        const remindersResponse = await app.fetch(new Request("http://localhost/api/reminders"));
+        expect(remindersResponse.status).toBe(200);
+        const reminders = (await remindersResponse.json()) as { reminders: Array<Record<string, unknown>> };
+        expect(reminders.reminders).toHaveLength(2);
+        expect(reminders.reminders.every((reminder) => String(reminder.nextRun) !== initialNextRun)).toBe(true);
+      } finally {
+        app.close();
         database.close();
       }
     } finally {
@@ -308,6 +474,7 @@ describe("Gazabot Bun backend", () => {
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Example opened.");
       } finally {
+        app.close();
         database.close();
       }
     } finally {
@@ -418,6 +585,7 @@ describe("Gazabot Bun backend", () => {
         expect(sessionPollCount).toBeGreaterThan(1);
         expect(stopRequests).toBe(0);
       } finally {
+        app.close();
         database.close();
       }
     } finally {

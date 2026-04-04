@@ -5,11 +5,13 @@ import type {
   ApiErrorPayload,
   BrowserContext,
   ReminderCreateInput,
+  ReminderUpdateInput,
   TranscriptRole,
 } from "./contracts";
 import { AgentHarness, type AgentTurnResult } from "./agent";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
+import { ReminderScheduler } from "./reminder-scheduler";
 import { TranscriptEventBus } from "./transcript-bus";
 
 
@@ -20,7 +22,7 @@ function corsHeaders(request: Request, config: AppConfig): Record<string, string
   return {
     "Access-Control-Allow-Origin": allowedOrigin,
     Vary: "Origin",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Accept",
   };
 }
@@ -129,6 +131,47 @@ function parseReminderCreateInput(payload: unknown): ReminderCreateInput {
   };
 }
 
+function parseReminderUpdateInput(payload: unknown): ReminderUpdateInput {
+  const record = asRecord(payload);
+  const update: ReminderUpdateInput = {};
+
+  if ("title" in record) {
+    update.title = requireString(record, "title");
+  }
+  if ("instructions" in record) {
+    update.instructions = requireString(record, "instructions");
+  }
+  if ("cadence" in record) {
+    const cadence = requireString(record, "cadence");
+    if (cadence !== "daily" && cadence !== "weekly" && cadence !== "custom") {
+      throw new Error("Invalid field: cadence");
+    }
+    update.cadence = cadence;
+  }
+  if ("cron" in record) {
+    update.cron = requireString(record, "cron");
+  }
+  if ("scheduleLabel" in record) {
+    update.scheduleLabel = requireString(record, "scheduleLabel");
+  }
+  if ("timezone" in record) {
+    update.timezone = requireString(record, "timezone");
+  }
+  if ("status" in record) {
+    const status = requireString(record, "status");
+    if (status !== "active" && status !== "paused" && status !== "draft") {
+      throw new Error("Invalid field: status");
+    }
+    update.status = status;
+  }
+
+  if (Object.keys(update).length === 0) {
+    throw new Error("Invalid request.");
+  }
+
+  return update;
+}
+
 function parseAgentTurnRequest(payload: unknown): AgentTurnRequest {
   const record = asRecord(payload);
   const source = optionalString(record, "source") ?? "dashboard";
@@ -176,12 +219,25 @@ export class GazabotApp {
 
   private readonly browserUseService: BrowserUseService;
 
+  private readonly reminderScheduler: ReminderScheduler;
+
+  private readonly unsubscribeReminderChanges: () => void;
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
   ) {
     this.browserUseService = new BrowserUseService(config, database, this.transcriptBus);
     this.agentHarness = new AgentHarness(config, database, this.browserUseService, this.transcriptBus);
+    this.reminderScheduler = new ReminderScheduler(
+      config,
+      database,
+      ({ reminder, dueAt, prompt }) => this.executeReminderTurn(reminder, dueAt, prompt),
+    );
+    this.unsubscribeReminderChanges = this.database.subscribeReminderChanges(() => {
+      this.reminderScheduler.refresh();
+    });
+    this.reminderScheduler.start();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -193,6 +249,7 @@ export class GazabotApp {
     }
 
     const url = new URL(request.url);
+    const reminderMatch = /^\/api\/reminders\/([^/]+)$/.exec(url.pathname);
 
     try {
       if (request.method === "GET" && url.pathname === "/health") {
@@ -206,6 +263,35 @@ export class GazabotApp {
       if (request.method === "POST" && url.pathname === "/api/reminders") {
         const payload = parseReminderCreateInput(await parseJsonBody(request));
         return jsonResponse(request, this.config, this.database.createReminder(payload));
+      }
+
+      if (reminderMatch) {
+        const reminderId = decodeURIComponent(reminderMatch[1] ?? "");
+
+        if (request.method === "GET") {
+          const reminder = this.database.getReminderById(reminderId);
+          if (!reminder) {
+            return errorResponse(request, this.config, 404, "Reminder not found.");
+          }
+          return jsonResponse(request, this.config, reminder);
+        }
+
+        if (request.method === "PATCH") {
+          const payload = parseReminderUpdateInput(await parseJsonBody(request));
+          return jsonResponse(request, this.config, this.database.updateReminder(reminderId, payload));
+        }
+
+        if (request.method === "DELETE") {
+          const deleted = this.database.deleteReminder(reminderId);
+          if (!deleted) {
+            return errorResponse(request, this.config, 404, "Reminder not found.");
+          }
+
+          return new Response(null, {
+            status: 204,
+            headers: corsHeaders(request, this.config),
+          });
+        }
       }
 
       if (request.method === "GET" && url.pathname === "/api/transcript") {
@@ -255,6 +341,10 @@ export class GazabotApp {
         if (error.message.startsWith("Imagine API error")) {
           return errorResponse(request, this.config, 502, error.message);
         }
+
+        if (error.message === "Reminder not found.") {
+          return errorResponse(request, this.config, 404, error.message);
+        }
       }
 
       console.error("[app] Unhandled error:", error);
@@ -268,14 +358,7 @@ export class GazabotApp {
       throw new Error("Message is required.");
     }
 
-    const userEntry = this.database.createTranscriptEntry({
-      kind: "message",
-      role: roleForSource(payload.source),
-      text: payload.message,
-    });
-    this.transcriptBus.publish("transcript", userEntry);
-
-    const result: AgentTurnResult = await this.agentHarness.collectTurn(payload);
+    const result: AgentTurnResult = await this.executeRecordedTurn(payload, roleForSource(payload.source));
 
     if (result.kind === "browser_task") {
       return {
@@ -285,13 +368,6 @@ export class GazabotApp {
         status: "queued",
       };
     }
-
-    const robotEntry = this.database.createTranscriptEntry({
-      kind: "message",
-      role: "robot",
-      text: result.text,
-    });
-    this.transcriptBus.publish("transcript", robotEntry);
 
     return {
       route: "conversation",
@@ -371,6 +447,111 @@ export class GazabotApp {
     }
 
     return { spoken: false, text };
+  }
+
+  async runReminderSchedulerOnce(now = new Date()): Promise<number> {
+    return this.reminderScheduler.runOnce(now);
+  }
+
+  close(): void {
+    this.unsubscribeReminderChanges();
+    this.reminderScheduler.stop();
+  }
+
+  private async executeRecordedTurn(
+    payload: AgentTurnRequest,
+    transcriptRole: TranscriptRole,
+    transcriptText = payload.message,
+    metadata?: Record<string, unknown>,
+  ): Promise<AgentTurnResult> {
+    const entryInput: {
+      kind: "message";
+      role: TranscriptRole;
+      text: string;
+      metadata?: Record<string, unknown>;
+    } = {
+      kind: "message",
+      role: transcriptRole,
+      text: transcriptText,
+    };
+    if (metadata) {
+      entryInput.metadata = metadata;
+    }
+
+    const userEntry = this.database.createTranscriptEntry(entryInput);
+    this.transcriptBus.publish("transcript", userEntry);
+
+    const result = await this.agentHarness.collectTurn(payload);
+    if (result.kind === "text") {
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: result.text,
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+    }
+
+    return result;
+  }
+
+  private async executeReminderTurn(
+    reminder: { id: string; title: string; instructions: string },
+    dueAt: string,
+    prompt: string,
+  ): Promise<void> {
+    const started = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "system",
+      text: `Triggered reminder: ${reminder.title}`,
+      toolName: "reminder-scheduler",
+      toolStatus: "started",
+      metadata: { reminderId: reminder.id, dueAt },
+    });
+    this.transcriptBus.publish("tool", started);
+    console.log(`[reminder] Triggered ${reminder.id} "${reminder.title}" at ${dueAt}`);
+
+    try {
+      const result = await this.executeRecordedTurn(
+        {
+          message: prompt,
+          source: "voice",
+        },
+        "system",
+        `Reminder fired: ${reminder.title}. ${reminder.instructions}`,
+        { reminderId: reminder.id, dueAt, reminderTitle: reminder.title },
+      );
+
+      const completed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text:
+          result.kind === "browser_task"
+            ? `Reminder dispatched a browser task: ${reminder.title}`
+            : `Reminder completed: ${reminder.title}`,
+        toolName: "reminder-scheduler",
+        toolStatus: "completed",
+        metadata: {
+          reminderId: reminder.id,
+          dueAt,
+          resultKind: result.kind,
+        },
+      });
+      this.transcriptBus.publish("tool", completed);
+      console.log(`[reminder] Completed ${reminder.id} "${reminder.title}"`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Reminder failed: ${reminder.title}. ${message}`,
+        toolName: "reminder-scheduler",
+        toolStatus: "failed",
+        metadata: { reminderId: reminder.id, dueAt },
+      });
+      this.transcriptBus.publish("tool", failed);
+      console.error(`[reminder] Failed ${reminder.id} "${reminder.title}": ${message}`);
+      throw error;
+    }
   }
 }
 
