@@ -29,6 +29,16 @@ export type ReminderCreateInput = {
   timezone: string;
 };
 
+export type ReminderUpdateInput = {
+  title?: string;
+  instructions?: string;
+  cadence?: ReminderCadence;
+  cron?: string;
+  scheduleLabel?: string;
+  timezone?: string;
+  status?: ReminderStatus;
+};
+
 export type TranscriptEntry = {
   id: string;
   timestamp: string;

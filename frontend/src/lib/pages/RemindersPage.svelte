@@ -1,7 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { get, post } from '../api';
+  import { del, get, patch, post } from '../api';
   import type { Reminder, ReminderCadence, ReminderStatus } from '../types';
+
+  type ReminderEditorState = {
+    title: string;
+    instructions: string;
+    cadence: ReminderCadence;
+    weekday: string;
+    time: string;
+    timezone: string;
+    customCron: string;
+    customScheduleLabel: string;
+    status: ReminderStatus;
+  };
+
+  type FeedbackState = {
+    tone: 'error' | 'success';
+    text: string;
+  };
 
   const weekdayOptions = [
     { value: '0', label: 'Sunday' },
@@ -40,6 +57,8 @@
     },
   ];
 
+  const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
   let reminders: Reminder[] = [];
   let isLoading = true;
   let isSubmitting = false;
@@ -47,16 +66,109 @@
   let submitError = '';
   let submitSuccess = '';
 
-  let title = '';
-  let instructions = '';
-  let cadence: ReminderCadence = 'weekly';
-  let weekday = '5';
-  let time = '10:00';
-  let timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  let createState = createEmptyEditorState();
+  let editingId = '';
+  let editState: ReminderEditorState | null = null;
+  let rowBusy: Record<string, boolean> = {};
+  let rowFeedback: Record<string, FeedbackState | undefined> = {};
+
+  function createEmptyEditorState(): ReminderEditorState {
+    return {
+      title: '',
+      instructions: '',
+      cadence: 'weekly',
+      weekday: '5',
+      time: '10:00',
+      timezone: detectedTimezone,
+      customCron: '',
+      customScheduleLabel: '',
+      status: 'active',
+    };
+  }
+
+  function padTimePart(value: string) {
+    return String(Number.parseInt(value, 10) || 0).padStart(2, '0');
+  }
+
+  function parseDailyCron(cronExpression: string) {
+    const parts = cronExpression.trim().split(/\s+/);
+    if (parts.length !== 5 || parts[2] !== '*' || parts[3] !== '*' || parts[4] !== '*') {
+      return null;
+    }
+
+    const minute = Number(parts[0]);
+    const hour = Number(parts[1]);
+    if (!Number.isInteger(minute) || !Number.isInteger(hour)) {
+      return null;
+    }
+
+    return {
+      cadence: 'daily' as ReminderCadence,
+      weekday: '1',
+      time: `${padTimePart(String(hour))}:${padTimePart(String(minute))}`,
+    };
+  }
+
+  function parseWeeklyCron(cronExpression: string) {
+    const parts = cronExpression.trim().split(/\s+/);
+    if (parts.length !== 5 || parts[2] !== '*' || parts[3] !== '*') {
+      return null;
+    }
+
+    const minute = Number(parts[0]);
+    const hour = Number(parts[1]);
+    const weekday = parts[4] ?? '';
+    if (!Number.isInteger(minute) || !Number.isInteger(hour) || !/^[0-7]$/.test(weekday)) {
+      return null;
+    }
+
+    return {
+      cadence: 'weekly' as ReminderCadence,
+      weekday: weekday === '7' ? '0' : weekday,
+      time: `${padTimePart(String(hour))}:${padTimePart(String(minute))}`,
+    };
+  }
+
+  function createEditorStateFromReminder(reminder: Reminder): ReminderEditorState {
+    const fromDaily = parseDailyCron(reminder.cron);
+    const fromWeekly = parseWeeklyCron(reminder.cron);
+    const parsed =
+      reminder.cadence === 'daily'
+        ? fromDaily
+        : reminder.cadence === 'weekly'
+          ? fromWeekly
+          : fromDaily ?? fromWeekly;
+
+    if (parsed) {
+      return {
+        title: reminder.title,
+        instructions: reminder.instructions,
+        cadence: parsed.cadence,
+        weekday: parsed.weekday,
+        time: parsed.time,
+        timezone: reminder.timezone ?? detectedTimezone,
+        customCron: reminder.cron,
+        customScheduleLabel: reminder.scheduleLabel,
+        status: reminder.status,
+      };
+    }
+
+    return {
+      title: reminder.title,
+      instructions: reminder.instructions,
+      cadence: 'custom',
+      weekday: '5',
+      time: '10:00',
+      timezone: reminder.timezone ?? detectedTimezone,
+      customCron: reminder.cron,
+      customScheduleLabel: reminder.scheduleLabel,
+      status: reminder.status,
+    };
+  }
 
   function formatDate(value: string | null) {
     if (!value) {
-      return 'No next run supplied';
+      return 'No next run scheduled';
     }
 
     const parsed = new Date(value);
@@ -68,26 +180,44 @@
         }).format(parsed);
   }
 
-  function getCronFromForm() {
-    const [hours = '0', minutes = '0'] = time.split(':');
+  function getCronFromEditor(editor: ReminderEditorState) {
+    if (editor.cadence === 'custom') {
+      return editor.customCron.trim() || null;
+    }
 
-    if (cadence === 'daily') {
+    const [hours = '0', minutes = '0'] = editor.time.split(':');
+
+    if (editor.cadence === 'daily') {
       return `${Number(minutes)} ${Number(hours)} * * *`;
     }
 
-    if (cadence === 'weekly') {
-      return `${Number(minutes)} ${Number(hours)} * * ${weekday}`;
-    }
-
+    return `${Number(minutes)} ${Number(hours)} * * ${editor.weekday}`;
   }
 
-  function getScheduleLabel() {
-    if (cadence === 'daily') {
-      return `Every day at ${time}`;
+  function getScheduleLabelFromEditor(editor: ReminderEditorState) {
+    if (editor.cadence === 'custom') {
+      return editor.customScheduleLabel.trim() || editor.customCron.trim();
     }
 
-    const weekdayLabel = weekdayOptions.find((option) => option.value === weekday)?.label ?? 'Friday';
-    return `Every ${weekdayLabel} at ${time}`;
+    if (editor.cadence === 'daily') {
+      return `Every day at ${editor.time}`;
+    }
+
+    const weekdayLabel = weekdayOptions.find((option) => option.value === editor.weekday)?.label ?? 'Friday';
+    return `Every ${weekdayLabel} at ${editor.time}`;
+  }
+
+  function validateEditor(editor: ReminderEditorState) {
+    const resolvedCron = getCronFromEditor(editor);
+    if (!editor.title.trim() || !editor.instructions.trim() || !editor.timezone.trim() || !resolvedCron) {
+      return 'Title, description, timezone, and a valid schedule are required.';
+    }
+
+    if (editor.cadence === 'custom' && !getScheduleLabelFromEditor(editor)) {
+      return 'Custom reminders need a cron expression or schedule label.';
+    }
+
+    return '';
   }
 
   function normalizeStatus(value: unknown): ReminderStatus {
@@ -99,12 +229,17 @@
       return value;
     }
 
-    const parts = cronExpression.split(/\s+/);
-    if (parts.length >= 5 && parts[2] === '*' && parts[3] === '*') {
-      return parts[4] === '*' ? 'daily' : 'weekly';
+    const daily = parseDailyCron(cronExpression);
+    if (daily) {
+      return daily.cadence;
     }
 
-    return 'weekly';
+    const weekly = parseWeeklyCron(cronExpression);
+    if (weekly) {
+      return weekly.cadence;
+    }
+
+    return 'custom';
   }
 
   function normalizeReminder(raw: unknown, index: number): Reminder {
@@ -121,7 +256,7 @@
       nextRun: value.nextRun ? String(value.nextRun) : null,
       status: normalizeStatus(value.status),
       owner: value.owner ? String(value.owner) : 'Gazabot agent',
-      timezone: value.timezone ? String(value.timezone) : timezone,
+      timezone: value.timezone ? String(value.timezone) : detectedTimezone,
     };
   }
 
@@ -134,6 +269,28 @@
         : [];
 
     return list.map((item, index) => normalizeReminder(item, index));
+  }
+
+  function updateReminderInList(updated: Reminder) {
+    reminders = reminders.map((reminder) => (reminder.id === updated.id ? updated : reminder));
+  }
+
+  function setRowBusy(reminderId: string, value: boolean) {
+    rowBusy = { ...rowBusy, [reminderId]: value };
+  }
+
+  function setRowFeedback(reminderId: string, tone: FeedbackState['tone'], text: string) {
+    rowFeedback = { ...rowFeedback, [reminderId]: { tone, text } };
+  }
+
+  function clearRowFeedback(reminderId: string) {
+    if (!(reminderId in rowFeedback)) {
+      return;
+    }
+
+    const next = { ...rowFeedback };
+    delete next[reminderId];
+    rowFeedback = next;
   }
 
   async function loadReminders() {
@@ -152,11 +309,17 @@
   }
 
   function applyPreset(preset: (typeof presets)[number]) {
-    title = preset.title;
-    instructions = preset.instructions;
-    cadence = preset.cadence;
-    weekday = preset.weekday;
-    time = preset.time;
+    createState = {
+      ...createState,
+      title: preset.title,
+      instructions: preset.instructions,
+      cadence: preset.cadence,
+      weekday: preset.weekday,
+      time: preset.time,
+      customCron: '',
+      customScheduleLabel: '',
+      status: 'active',
+    };
     submitSuccess = '';
     submitError = '';
   }
@@ -166,33 +329,30 @@
     submitError = '';
     submitSuccess = '';
 
-    const resolvedCron = getCronFromForm();
+    const validationError = validateEditor(createState);
+    const resolvedCron = getCronFromEditor(createState);
 
-    if (!title.trim() || !instructions.trim() || !resolvedCron) {
-      submitError = 'Title, instructions, and a valid schedule are required.';
+    if (validationError || !resolvedCron) {
+      submitError = validationError || 'Title, description, timezone, and a valid schedule are required.';
       isSubmitting = false;
       return;
     }
 
     const payload = {
-      title: title.trim(),
-      instructions: instructions.trim(),
-      cadence,
+      title: createState.title.trim(),
+      instructions: createState.instructions.trim(),
+      cadence: createState.cadence,
       cron: resolvedCron,
-      scheduleLabel: getScheduleLabel(),
-      timezone,
+      scheduleLabel: getScheduleLabelFromEditor(createState),
+      timezone: createState.timezone.trim(),
     };
 
     try {
       const created = await post<unknown>('reminders', payload);
       const normalized = normalizeReminder(created, reminders.length);
       reminders = [normalized, ...reminders];
-      submitSuccess = 'Reminder queued successfully.';
-      title = '';
-      instructions = '';
-      cadence = 'weekly';
-      weekday = '5';
-      time = '10:00';
+      submitSuccess = 'Reminder saved.';
+      createState = createEmptyEditorState();
     } catch (error) {
       submitError = error instanceof Error ? error.message : 'Unable to create reminder.';
     } finally {
@@ -200,11 +360,109 @@
     }
   }
 
+  function startEditing(reminder: Reminder) {
+    editingId = reminder.id;
+    editState = createEditorStateFromReminder(reminder);
+    clearRowFeedback(reminder.id);
+  }
+
+  function cancelEditing() {
+    editingId = '';
+    editState = null;
+  }
+
+  async function saveReminder(reminderId: string) {
+    if (!editState || editingId !== reminderId) {
+      return;
+    }
+
+    const validationError = validateEditor(editState);
+    const resolvedCron = getCronFromEditor(editState);
+    if (validationError || !resolvedCron) {
+      setRowFeedback(reminderId, 'error', validationError || 'A valid schedule is required.');
+      return;
+    }
+
+    clearRowFeedback(reminderId);
+    setRowBusy(reminderId, true);
+
+    try {
+      const updated = await patch<unknown>(`reminders/${encodeURIComponent(reminderId)}`, {
+        title: editState.title.trim(),
+        instructions: editState.instructions.trim(),
+        cadence: editState.cadence,
+        cron: resolvedCron,
+        scheduleLabel: getScheduleLabelFromEditor(editState),
+        timezone: editState.timezone.trim(),
+        status: editState.status,
+      });
+      updateReminderInList(normalizeReminder(updated, 0));
+      setRowFeedback(reminderId, 'success', 'Reminder updated.');
+      cancelEditing();
+    } catch (error) {
+      setRowFeedback(reminderId, 'error', error instanceof Error ? error.message : 'Unable to update reminder.');
+    } finally {
+      setRowBusy(reminderId, false);
+    }
+  }
+
+  async function toggleReminder(reminder: Reminder) {
+    clearRowFeedback(reminder.id);
+    setRowBusy(reminder.id, true);
+
+    try {
+      const nextStatus: ReminderStatus = reminder.status === 'paused' ? 'active' : 'paused';
+      const updated = await patch<unknown>(`reminders/${encodeURIComponent(reminder.id)}`, {
+        status: nextStatus,
+      });
+      updateReminderInList(normalizeReminder(updated, 0));
+      setRowFeedback(reminder.id, 'success', nextStatus === 'paused' ? 'Reminder paused.' : 'Reminder resumed.');
+
+      if (editingId === reminder.id && editState) {
+        editState = { ...editState, status: nextStatus };
+      }
+    } catch (error) {
+      setRowFeedback(reminder.id, 'error', error instanceof Error ? error.message : 'Unable to update reminder.');
+    } finally {
+      setRowBusy(reminder.id, false);
+    }
+  }
+
+  async function removeReminder(reminder: Reminder) {
+    const confirmed = window.confirm(`Delete "${reminder.title}"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    clearRowFeedback(reminder.id);
+    setRowBusy(reminder.id, true);
+
+    try {
+      await del(`reminders/${encodeURIComponent(reminder.id)}`);
+      reminders = reminders.filter((item) => item.id !== reminder.id);
+      if (editingId === reminder.id) {
+        cancelEditing();
+      }
+    } catch (error) {
+      setRowFeedback(reminder.id, 'error', error instanceof Error ? error.message : 'Unable to delete reminder.');
+      setRowBusy(reminder.id, false);
+      return;
+    }
+
+    const nextBusy = { ...rowBusy };
+    delete nextBusy[reminder.id];
+    rowBusy = nextBusy;
+
+    const nextFeedback = { ...rowFeedback };
+    delete nextFeedback[reminder.id];
+    rowFeedback = nextFeedback;
+  }
+
   onMount(() => {
     loadReminders();
   });
 
-  $: resolvedCron = getCronFromForm();
+  $: createPreview = getScheduleLabelFromEditor(createState) || 'Choose a schedule';
   $: activeCount = reminders.filter((reminder) => reminder.status === 'active').length;
   $: pausedCount = reminders.filter((reminder) => reminder.status === 'paused').length;
 </script>
@@ -228,14 +486,14 @@
     <form class="reminder-form" on:submit|preventDefault={createReminder}>
       <label class="field">
         <span class="field-label">Reminder title</span>
-        <input class="field-input" bind:value={title} placeholder="Order medication refill" />
+        <input class="field-input" bind:value={createState.title} placeholder="Order medication refill" />
       </label>
 
       <label class="field">
-        <span class="field-label">Instructions for the robot</span>
+        <span class="field-label">Description for the robot</span>
         <textarea
           class="field-input field-textarea"
-          bind:value={instructions}
+          bind:value={createState.instructions}
           placeholder="Place the order, check for coverage issues, then notify the guardian."
         ></textarea>
       </label>
@@ -243,40 +501,55 @@
       <div class="form-row">
         <label class="field">
           <span class="field-label">Repeat</span>
-          <select class="field-input" bind:value={cadence}>
+          <select class="field-input" bind:value={createState.cadence}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
+            <option value="custom">Custom cron</option>
           </select>
         </label>
 
         <label class="field">
           <span class="field-label">Time zone</span>
-          <input class="field-input" bind:value={timezone} />
+          <input class="field-input" bind:value={createState.timezone} />
         </label>
       </div>
 
-      <div class="form-row">
-        {#if cadence === 'weekly'}
+      {#if createState.cadence === 'custom'}
+        <div class="form-row">
           <label class="field">
-            <span class="field-label">Day</span>
-            <select class="field-input" bind:value={weekday}>
-              {#each weekdayOptions as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
+            <span class="field-label">Cron schedule</span>
+            <input class="field-input" bind:value={createState.customCron} placeholder="0 9 * * 1-5" />
           </label>
-        {/if}
 
-        <label class="field">
-          <span class="field-label">Time</span>
-          <input class="field-input" bind:value={time} type="time" />
-        </label>
-      </div>
+          <label class="field">
+            <span class="field-label">Schedule label</span>
+            <input class="field-input" bind:value={createState.customScheduleLabel} placeholder="Weekdays at 09:00" />
+          </label>
+        </div>
+      {:else}
+        <div class="form-row">
+          {#if createState.cadence === 'weekly'}
+            <label class="field">
+              <span class="field-label">Day</span>
+              <select class="field-input" bind:value={createState.weekday}>
+                {#each weekdayOptions as option}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+
+          <label class="field">
+            <span class="field-label">Time</span>
+            <input class="field-input" bind:value={createState.time} type="time" />
+          </label>
+        </div>
+      {/if}
 
       <section class="callout">
         <p class="panel-label">Preview</p>
-        <h3 class="callout-heading">{getScheduleLabel()}</h3>
-        <p class="panel-copy">{timezone}</p>
+        <h3 class="callout-heading">{createPreview}</h3>
+        <p class="panel-copy">{createState.timezone}</p>
       </section>
 
       {#if submitError}
@@ -332,25 +605,138 @@
                 <p class="panel-label">{reminder.owner ?? 'Gazabot agent'}</p>
                 <h3 class="list-heading">{reminder.title}</h3>
               </div>
-              <span class={`status-pill status-${reminder.status}`}>{reminder.status}</span>
+
+              <div class="control-rail">
+                <span class={`status-pill status-${reminder.status}`}>{reminder.status}</span>
+                <button
+                  class="mini-action"
+                  type="button"
+                  disabled={rowBusy[reminder.id]}
+                  on:click={() => startEditing(reminder)}
+                >
+                  Edit
+                </button>
+                <button
+                  class="mini-action"
+                  type="button"
+                  disabled={rowBusy[reminder.id]}
+                  on:click={() => toggleReminder(reminder)}
+                >
+                  {reminder.status === 'paused' ? 'Resume' : 'Pause'}
+                </button>
+                <button
+                  class="mini-action mini-danger"
+                  type="button"
+                  disabled={rowBusy[reminder.id]}
+                  on:click={() => removeReminder(reminder)}
+                >
+                  Delete
+                </button>
+              </div>
             </div>
 
-            <p class="panel-copy">{reminder.instructions}</p>
+            {#if editingId === reminder.id && editState}
+              <form class="editor-grid" on:submit|preventDefault={() => saveReminder(reminder.id)}>
+                <label class="field">
+                  <span class="field-label">Title</span>
+                  <input class="field-input" bind:value={editState.title} />
+                </label>
 
-            <dl class="detail-grid">
-              <div>
-                <dt class="detail-term">Repeat</dt>
-                <dd class="detail-value">{reminder.scheduleLabel}</dd>
-              </div>
-              <div>
-                <dt class="detail-term">Next run</dt>
-                <dd class="detail-value">{formatDate(reminder.nextRun)}</dd>
-              </div>
-              <div>
-                <dt class="detail-term">Timezone</dt>
-                <dd class="detail-value">{reminder.timezone ?? timezone}</dd>
-              </div>
-            </dl>
+                <label class="field field-span">
+                  <span class="field-label">Description</span>
+                  <textarea class="field-input field-textarea" bind:value={editState.instructions}></textarea>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">Repeat</span>
+                  <select class="field-input" bind:value={editState.cadence}>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="custom">Custom cron</option>
+                  </select>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">Status</span>
+                  <select class="field-input" bind:value={editState.status}>
+                    <option value="active">Active</option>
+                    <option value="paused">Paused</option>
+                    <option value="draft">Draft</option>
+                  </select>
+                </label>
+
+                <label class="field field-span">
+                  <span class="field-label">Time zone</span>
+                  <input class="field-input" bind:value={editState.timezone} />
+                </label>
+
+                {#if editState.cadence === 'custom'}
+                  <label class="field">
+                    <span class="field-label">Cron schedule</span>
+                    <input class="field-input" bind:value={editState.customCron} />
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Schedule label</span>
+                    <input class="field-input" bind:value={editState.customScheduleLabel} />
+                  </label>
+                {:else}
+                  {#if editState.cadence === 'weekly'}
+                    <label class="field">
+                      <span class="field-label">Day</span>
+                      <select class="field-input" bind:value={editState.weekday}>
+                        {#each weekdayOptions as option}
+                          <option value={option.value}>{option.label}</option>
+                        {/each}
+                      </select>
+                    </label>
+                  {/if}
+
+                  <label class="field">
+                    <span class="field-label">Time</span>
+                    <input class="field-input" bind:value={editState.time} type="time" />
+                  </label>
+                {/if}
+
+                <section class="callout field-span">
+                  <p class="panel-label">Updated schedule</p>
+                  <h3 class="callout-heading">{getScheduleLabelFromEditor(editState) || 'Choose a schedule'}</h3>
+                  <p class="panel-copy">{editState.timezone}</p>
+                </section>
+
+                <div class="editor-actions field-span">
+                  <button class="action" type="submit" disabled={rowBusy[reminder.id]}>
+                    {rowBusy[reminder.id] ? 'Saving...' : 'Save changes'}
+                  </button>
+                  <button class="ghost" type="button" disabled={rowBusy[reminder.id]} on:click={cancelEditing}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            {:else}
+              <p class="panel-copy">{reminder.instructions}</p>
+
+              <dl class="detail-grid">
+                <div>
+                  <dt class="detail-term">Repeat</dt>
+                  <dd class="detail-value">{reminder.scheduleLabel}</dd>
+                </div>
+                <div>
+                  <dt class="detail-term">Next run</dt>
+                  <dd class="detail-value">{formatDate(reminder.nextRun)}</dd>
+                </div>
+                <div>
+                  <dt class="detail-term">Timezone</dt>
+                  <dd class="detail-value">{reminder.timezone ?? detectedTimezone}</dd>
+                </div>
+              </dl>
+            {/if}
+
+            {#if rowFeedback[reminder.id]}
+              <p class={`feedback ${rowFeedback[reminder.id]?.tone === 'error' ? 'feedback-error' : 'feedback-success'}`}>
+                {rowFeedback[reminder.id]?.text}
+              </p>
+            {/if}
           </article>
         {/each}
       </div>
@@ -422,22 +808,37 @@
     background: color-mix(in srgb, var(--color-accent) 12%, var(--color-panel-muted));
   }
 
-  form.reminder-form {
+  form.reminder-form,
+  form.editor-grid {
     display: flex;
     flex-direction: column;
     gap: 1rem;
   }
 
-  div.form-row {
+  form.editor-grid {
+    border-top: var(--border-width) solid var(--color-line);
+    padding-top: 1rem;
+  }
+
+  div.form-row,
+  form.editor-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1rem;
   }
 
-  label.field {
+  label.field,
+  div.editor-actions {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
+  }
+
+  label.field-span,
+  section.field-span,
+  div.field-span,
+  div.editor-actions.field-span {
+    grid-column: 1 / -1;
   }
 
   span.field-label,
@@ -485,7 +886,8 @@
   }
 
   button.action,
-  button.ghost {
+  button.ghost,
+  button.mini-action {
     font: inherit;
     cursor: pointer;
     border-radius: 0;
@@ -506,20 +908,34 @@
   button.action:hover,
   button.action:focus-visible,
   button.ghost:hover,
-  button.ghost:focus-visible {
+  button.ghost:focus-visible,
+  button.mini-action:hover,
+  button.mini-action:focus-visible {
     transform: translateY(-1px);
   }
 
-  button.action:disabled {
+  button.action:disabled,
+  button.ghost:disabled,
+  button.mini-action:disabled {
     cursor: progress;
     opacity: 0.7;
     transform: none;
   }
 
-  button.ghost {
+  button.ghost,
+  button.mini-action {
     border: var(--border-width) solid var(--color-line);
     background: transparent;
     color: var(--color-ink-strong);
+  }
+
+  button.mini-action {
+    padding: 0.55rem 0.8rem;
+  }
+
+  button.mini-danger {
+    color: var(--color-danger);
+    border-color: color-mix(in srgb, var(--color-danger) 35%, var(--color-line));
   }
 
   section.metrics {
@@ -559,10 +975,29 @@
   }
 
   div.list-head,
-  dl.detail-grid {
+  dl.detail-grid,
+  div.control-rail,
+  div.editor-actions {
     display: flex;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 0.75rem;
+  }
+
+  div.control-rail {
+    flex: 0 0 auto;
+    align-items: stretch;
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+    align-self: flex-start;
+  }
+
+  div.editor-actions {
+    justify-content: flex-start;
+    flex-direction: row;
+  }
+
+  div.control-rail > * {
+    flex: 0 0 auto;
   }
 
   dl.detail-grid {
@@ -577,13 +1012,17 @@
 
   span.status-pill {
     border-radius: 0;
-    padding: 0.45rem 0.75rem;
-    font-size: 0.8rem;
+    padding: 0.55rem 0.8rem;
+    font: inherit;
+    line-height: 1;
     text-transform: capitalize;
     background: var(--color-panel);
     border: var(--border-width) solid var(--color-line);
     color: var(--color-ink-strong);
-    height: fit-content;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
   }
 
   span.status-active {
@@ -627,17 +1066,24 @@
 
   @media (max-width: 720px) {
     header.panel-header,
-    div.list-head {
+    div.list-head,
+    div.editor-actions {
+      flex-direction: column;
+    }
+
+    div.control-rail {
       flex-direction: column;
     }
 
     div.form-row,
-    section.metrics {
+    section.metrics,
+    form.editor-grid {
       grid-template-columns: 1fr;
     }
 
     button.action,
-    button.ghost {
+    button.ghost,
+    button.mini-action {
       width: 100%;
     }
   }

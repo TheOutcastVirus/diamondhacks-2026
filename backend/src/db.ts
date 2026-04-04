@@ -7,6 +7,7 @@ import type {
   BrowserStatus,
   Reminder,
   ReminderCreateInput,
+  ReminderUpdateInput,
   TranscriptEntry,
   TranscriptKind,
   TranscriptRole,
@@ -67,6 +68,11 @@ type BrowserActionRow = {
 export type BrowserTaskSession = {
   id: string;
   previewUrl: string | null;
+};
+
+export type ClaimedReminder = {
+  reminder: Reminder;
+  dueAt: string;
 };
 
 const IDLE_BROWSER_CONTEXT: BrowserContext = {
@@ -190,8 +196,22 @@ function serializeBrowserContext(session: BrowserSessionRow | null, actions: Bro
   return context;
 }
 
+function nextRunForReminder(input: {
+  cron: string;
+  timezone: string;
+  status: Reminder["status"];
+}): string | null {
+  if (input.status !== "active") {
+    return null;
+  }
+
+  return computeNextRun(input.cron, input.timezone);
+}
+
 export class GazabotDatabase {
   private readonly database: Database;
+
+  private readonly reminderListeners = new Set<() => void>();
 
   constructor(path: string) {
     this.database = new Database(path, { create: true, strict: true });
@@ -202,6 +222,13 @@ export class GazabotDatabase {
 
   close(): void {
     this.database.close(false);
+  }
+
+  subscribeReminderChanges(listener: () => void): () => void {
+    this.reminderListeners.add(listener);
+    return () => {
+      this.reminderListeners.delete(listener);
+    };
   }
 
   private initialize(): void {
@@ -263,6 +290,11 @@ export class GazabotDatabase {
     return rows.map(serializeReminder);
   }
 
+  getReminderById(id: string): Reminder | null {
+    const row = this.database.query("SELECT * FROM reminders WHERE id = ?1").get(id) as ReminderRow | null;
+    return row ? serializeReminder(row) : null;
+  }
+
   createReminder(input: ReminderCreateInput): Reminder {
     const row: ReminderRow = {
       id: prefixedId("r"),
@@ -271,7 +303,11 @@ export class GazabotDatabase {
       cadence: input.cadence,
       cron: input.cron.trim(),
       schedule_label: input.scheduleLabel.trim(),
-      next_run: computeNextRun(input.cron, input.timezone),
+      next_run: nextRunForReminder({
+        cron: input.cron.trim(),
+        timezone: input.timezone.trim(),
+        status: "active",
+      }),
       status: "active",
       owner: "Gazabot agent",
       timezone: input.timezone.trim(),
@@ -300,7 +336,141 @@ export class GazabotDatabase {
         row.created_at,
       );
 
-    return serializeReminder(row);
+    const reminder = serializeReminder(row);
+    this.notifyReminderListeners();
+    return reminder;
+  }
+
+  getNextReminderDueAt(): string | null {
+    const row = this.database
+      .query(
+        `
+          SELECT next_run
+          FROM reminders
+          WHERE status = 'active'
+            AND next_run IS NOT NULL
+          ORDER BY next_run ASC, created_at ASC
+          LIMIT 1
+        `,
+      )
+      .get() as { next_run: string | null } | null;
+
+    return row?.next_run ?? null;
+  }
+
+  claimDueReminders(now = new Date()): ClaimedReminder[] {
+    const nowIso = now.toISOString();
+    const claimTransaction = this.database.transaction((currentIso: string, currentDate: Date) => {
+      const dueRows = this.database
+        .query(
+          `
+            SELECT * FROM reminders
+            WHERE status = 'active'
+              AND next_run IS NOT NULL
+              AND next_run <= ?1
+            ORDER BY next_run ASC, created_at ASC
+          `,
+        )
+        .all(currentIso) as ReminderRow[];
+
+      const claimed: ClaimedReminder[] = [];
+      for (const row of dueRows) {
+        const dueAt = row.next_run ?? currentIso;
+        const dueDate = new Date(dueAt);
+        const baseDate =
+          Number.isNaN(dueDate.valueOf()) || dueDate <= currentDate ? currentDate : dueDate;
+        const nextRun = computeNextRun(row.cron, row.timezone, baseDate);
+
+        this.database
+          .query(
+            `
+              UPDATE reminders
+              SET next_run = ?2
+              WHERE id = ?1
+            `,
+          )
+          .run(row.id, nextRun);
+
+        claimed.push({
+          dueAt,
+          reminder: serializeReminder({
+            ...row,
+            next_run: nextRun,
+          }),
+        });
+      }
+
+      return claimed;
+    });
+
+    return claimTransaction(nowIso, now);
+  }
+
+  updateReminder(id: string, input: ReminderUpdateInput): Reminder {
+    const existing = this.database.query("SELECT * FROM reminders WHERE id = ?1").get(id) as ReminderRow | null;
+    if (!existing) {
+      throw new Error("Reminder not found.");
+    }
+
+    const title = input.title === undefined ? existing.title : input.title.trim();
+    const instructions = input.instructions === undefined ? existing.instructions : input.instructions.trim();
+    const cadence = input.cadence ?? existing.cadence;
+    const cron = input.cron === undefined ? existing.cron : input.cron.trim();
+    const scheduleLabel = input.scheduleLabel === undefined ? existing.schedule_label : input.scheduleLabel.trim();
+    const timezone = input.timezone === undefined ? existing.timezone : input.timezone.trim();
+    const status = input.status ?? existing.status;
+
+    const row: ReminderRow = {
+      ...existing,
+      title,
+      instructions,
+      cadence,
+      cron,
+      schedule_label: scheduleLabel,
+      next_run: nextRunForReminder({ cron, timezone, status }),
+      status,
+      timezone,
+    };
+
+    this.database
+      .query(
+        `
+          UPDATE reminders
+          SET title = ?2,
+              instructions = ?3,
+              cadence = ?4,
+              cron = ?5,
+              schedule_label = ?6,
+              next_run = ?7,
+              status = ?8,
+              timezone = ?9
+          WHERE id = ?1
+        `,
+      )
+      .run(
+        row.id,
+        row.title,
+        row.instructions,
+        row.cadence,
+        row.cron,
+        row.schedule_label,
+        row.next_run,
+        row.status,
+        row.timezone,
+      );
+
+    const reminder = serializeReminder(row);
+    this.notifyReminderListeners();
+    return reminder;
+  }
+
+  deleteReminder(id: string): boolean {
+    const result = this.database.query("DELETE FROM reminders WHERE id = ?1").run(id);
+    const deleted = Number(result.changes) > 0;
+    if (deleted) {
+      this.notifyReminderListeners();
+    }
+    return deleted;
   }
 
   listTranscriptEntries(): TranscriptEntry[] {
@@ -530,5 +700,11 @@ export class GazabotDatabase {
       .all(session.id) as BrowserActionRow[];
 
     return serializeBrowserContext(session, actionRows.map(serializeBrowserAction));
+  }
+
+  private notifyReminderListeners(): void {
+    for (const listener of this.reminderListeners) {
+      listener();
+    }
   }
 }
