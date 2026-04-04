@@ -1,9 +1,12 @@
-build/*
-install/*
-log/*
+*/build/*
+*/install/*
+*/log/*
 .venv/
 backend/data/
 __pycache__/
 .pytest_cache/
 .vscode/*
+node_modules
+*/node_modules/
+bun.lock
 .env
