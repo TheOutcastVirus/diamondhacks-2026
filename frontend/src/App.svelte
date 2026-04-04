@@ -1,89 +1,146 @@
-<script>
-  import svelteLogo from './assets/svelte.svg'
-  import viteLogo from './assets/vite.svg'
-  import heroImg from './assets/hero.png'
-  import Counter from './lib/Counter.svelte'
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import BrowserPage from './lib/pages/BrowserPage.svelte';
+  import RemindersPage from './lib/pages/RemindersPage.svelte';
+  import TranscriptionPage from './lib/pages/TranscriptionPage.svelte';
+  import type { PageDefinition, PageId, ThemeMode } from './lib/types';
+
+  const pages: PageDefinition[] = [
+    {
+      id: 'reminders',
+      label: 'Reminders',
+      eyebrow: 'Reminders',
+      title: 'Reminders',
+      description: 'View, add, and update reminders.',
+      metricLabel: 'List',
+    },
+    {
+      id: 'transcription',
+      label: 'Transcription',
+      eyebrow: 'Transcript',
+      title: 'Transcription',
+      description: 'Live conversation and actions.',
+      metricLabel: 'Live',
+    },
+    {
+      id: 'browser',
+      label: 'Browser',
+      eyebrow: 'Browser',
+      title: 'Browser',
+      description: 'Current page, task, and recent actions.',
+      metricLabel: 'Session',
+    },
+  ];
+
+  const routeLookup = new Map<PageId, PageDefinition>(pages.map((page) => [page.id, page]));
+  const themeOptions: ThemeMode[] = ['light', 'dark'];
+
+  let currentPageId: PageId = 'reminders';
+  let themeMode: ThemeMode = 'light';
+
+  function parseRoute(hash: string): PageId {
+    const candidate = hash.replace(/^#\/?/, '').trim() as PageId;
+    return routeLookup.has(candidate) ? candidate : 'reminders';
+  }
+
+  function applyTheme(mode: ThemeMode) {
+    themeMode = mode;
+    document.documentElement.dataset.theme = mode;
+    window.localStorage.setItem('gazabot-theme', mode);
+  }
+
+  function syncRoute() {
+    currentPageId = parseRoute(window.location.hash);
+  }
+
+  function navigate(pageId: PageId) {
+    if (window.location.hash === `#/${pageId}`) {
+      currentPageId = pageId;
+      return;
+    }
+
+    window.location.hash = `/${pageId}`;
+  }
+
+  function toggleTheme() {
+    const currentIndex = themeOptions.indexOf(themeMode);
+    const nextMode = themeOptions[(currentIndex + 1) % themeOptions.length];
+    applyTheme(nextMode);
+  }
+
+  onMount(() => {
+    syncRoute();
+
+    const storedTheme = window.localStorage.getItem('gazabot-theme') as ThemeMode | null;
+    if (storedTheme === 'light' || storedTheme === 'dark') {
+      applyTheme(storedTheme);
+    } else {
+      applyTheme(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    }
+
+    const handleHashChange = () => syncRoute();
+    window.addEventListener('hashchange', handleHashChange);
+
+    if (!window.location.hash) {
+      window.location.hash = '/reminders';
+    }
+
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+    };
+  });
+
+  $: currentPage = routeLookup.get(currentPageId) ?? pages[0];
+  $: themeLabel = themeMode === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
 </script>
 
-<section id="center">
-  <div class="hero">
-    <img src={heroImg} class="base" width="170" height="179" alt="" />
-    <img src={svelteLogo} class="framework" alt="Svelte logo" />
-    <img src={viteLogo} class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/App.svelte</code> and save to test <code>HMR</code></p>
-  </div>
-  <Counter />
-</section>
+<svelte:head>
+  <title>Gazabot Guardian Console</title>
+  <meta
+    name="description"
+    content="Guardian-facing control surface for monitoring reminders, transcription, and browser activity on Gazabot."
+  />
+</svelte:head>
 
-<div class="ticks"></div>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand-block">
+      <p class="eyebrow">Guardian</p>
+      <h1 class="brand-heading">Gazabot</h1>
+    </div>
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true">
-      <use href="/icons.svg#documentation-icon"></use>
-    </svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank" rel="noreferrer">
-          <img class="logo" src={viteLogo} alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://svelte.dev/" target="_blank" rel="noreferrer">
-          <img class="button-icon" src={svelteLogo} alt="" />
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true">
-      <use href="/icons.svg#social-icon"></use>
-    </svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li>
-        <a href="https://github.com/vitejs/vite" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#github-icon"></use>
-          </svg>
-          GitHub
-        </a>
-      </li>
-      <li>
-        <a href="https://chat.vite.dev/" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#discord-icon"></use>
-          </svg>
-          Discord
-        </a>
-      </li>
-      <li>
-        <a href="https://x.com/vite_js" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#x-icon"></use>
-          </svg>
-          X.com
-        </a>
-      </li>
-      <li>
-        <a href="https://bsky.app/profile/vite.dev" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#bluesky-icon"></use>
-          </svg>
-          Bluesky
-        </a>
-      </li>
-    </ul>
-  </div>
-</section>
+    <nav class="navigation" aria-label="Primary">
+      {#each pages as page}
+        <button
+          class:active={page.id === currentPageId}
+          class="nav-link"
+          type="button"
+          on:click={() => navigate(page.id)}
+        >
+          <span class="nav-label">{page.label}</span>
+        </button>
+      {/each}
+    </nav>
 
-<div class="ticks"></div>
-<section id="spacer"></section>
+    <button class="toggle" type="button" on:click={toggleTheme} aria-label={themeLabel}>
+      {themeMode === 'light' ? 'Dark mode' : 'Light mode'}
+    </button>
+  </aside>
+
+  <main class="workspace">
+    <header class="page-header">
+      <div class="page-title">
+        <p class="eyebrow">{currentPage.eyebrow}</p>
+        <h1 class="heading">{currentPage.title}</h1>
+      </div>
+    </header>
+
+    {#if currentPageId === 'reminders'}
+      <RemindersPage />
+    {:else if currentPageId === 'transcription'}
+      <TranscriptionPage />
+    {:else}
+      <BrowserPage />
+    {/if}
+  </main>
+</div>
