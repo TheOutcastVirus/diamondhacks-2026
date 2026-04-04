@@ -52,7 +52,7 @@ data: {"text":"Agent has not been built yet","done":true}
 ## Bun service example
 
 ```ts
-const response = await fetch("http://127.0.0.1:8000/api/agent/stream", {
+const response = await fetch("http://127.0.0.1:3000/api/agent/stream", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
