@@ -438,7 +438,7 @@
     setRowBusy(reminder.id, true);
 
     try {
-      await del(`reminders/${encodeURIComponent(reminder.id)}`);
+      await del(`/api/reminders/${encodeURIComponent(reminder.id)}`);
       reminders = reminders.filter((item) => item.id !== reminder.id);
       if (editingId === reminder.id) {
         cancelEditing();

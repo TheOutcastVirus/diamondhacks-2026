@@ -207,7 +207,7 @@
     try {
       const response = formValues[prompt.id] ?? {};
       const payload = await post<{ memoryEntry?: UserMemoryEntry }>(
-        `prompts/${encodeURIComponent(prompt.id)}/respond`,
+        `/api/prompts/${encodeURIComponent(prompt.id)}/respond`,
         { response },
       );
       if (payload.memoryEntry?.title) {
