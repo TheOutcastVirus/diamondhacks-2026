@@ -1,1 +1,0 @@
-"""Gazabot backend application package."""

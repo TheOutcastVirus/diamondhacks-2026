@@ -16,21 +16,21 @@ Run **two terminals**: API first, then the Vite dev server.
 
 ### Prerequisites
 
-- **Backend:** Python **3.11+** and [**uv**](https://github.com/astral-sh/uv) (recommended) or another way to install deps from `backend/pyproject.toml`.
+- **Backend:** [**Bun**](https://bun.sh) (matches `backend/package.json` scripts). **Node.js** (LTS) works if you prefer `npm install` and adjust scripts locally.
 - **Frontend:** **Node.js** (LTS) with **npm**, or **Bun** if you use the repo’s `bun.lock`.
 
-### Backend (FastAPI)
+### Backend (TypeScript + Bun)
 
 From the **repository root**:
 
 ```bash
 cd backend
-uv sync
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+bun install
+bun run dev
 ```
 
 - **Health check:** [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health) should return `{"status":"ok"}`.
-- **Config:** Optional `backend/.env` (or a `.env` at the **repo root** — see `backend/app/config.py`). Defaults allow **mock Browser Use** (`BROWSER_USE_MOCK_MODE=true`) without a cloud key for local UI work.
+- **Config:** Optional `backend/.env` (or a `.env` at the **repo root** — see `backend/src/config.ts`). Copy `backend/.env.example` as a starting point. Defaults allow **mock Browser Use** (`BROWSER_USE_MOCK_MODE=true`) without a cloud key for local UI work.
 - **CORS:** By default the API allows the Vite dev origin `http://localhost:5173` and `http://127.0.0.1:5173`.
 
 ### Frontend (Svelte + Vite)
@@ -61,7 +61,7 @@ npm run dev
 
 | Step | Command / URL |
 |------|----------------|
-| 1 | `cd backend && uv sync && uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` |
+| 1 | `cd backend && bun install && bun run dev` |
 | 2 | Set `VITE_API_BASE_URL=http://127.0.0.1:8000` in `frontend/.env.local` |
 | 3 | `cd frontend && npm install && npm run dev` |
 | 4 | Open the dashboard at `http://localhost:5173` |
@@ -86,7 +86,7 @@ npm run dev
 
 - **Local model:** Llama 3.1B (~3.1B parameters)
 - **MCP layer:** Handles all tool routing on top of the base model
-- **Agent framework:** Plain Python with custom endpoints — no pre-built agent SDKs
+- **HTTP API:** TypeScript on **Bun** (`backend/src/`) — custom routes, no pre-built agent SDKs in the server
 
 ### Routing logic
 
@@ -112,9 +112,9 @@ incoming_input
 | Choice | Rationale |
 |--------|-----------|
 | **Rejected:** Pre-built SDKs (OpenAI Agent SDK, LangGraph, CrewAI) | Want ownership of routing and demos |
-| **Chosen:** Plain Python + custom MCP endpoints | Flexibility + **Qualcomm** track compatibility |
+| **Chosen:** Custom HTTP API + MCP-style tool routing (robot / services) | Flexibility + **Qualcomm** track compatibility |
 
-**Fetch AI:** We **do care** about this sponsor / hackathon track — read their requirements, decide if we submit against it, and whether any slice of the product should use or reference their stack. That is separate from defaulting the core agent to **custom Python + MCP** for control and judge narrative.
+**Fetch AI:** We **do care** about this sponsor / hackathon track — read their requirements, decide if we submit against it, and whether any slice of the product should use or reference their stack. That is separate from how we implement the **dashboard API and agent harness** in TypeScript for hackathon speed.
 
 **Open question:** Standalone API layer for agent endpoints vs. monolith for hackathon speed (team TBD).
 
