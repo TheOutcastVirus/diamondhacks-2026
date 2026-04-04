@@ -32,6 +32,13 @@
         }).format(parsed);
   }
 
+  function formatActionKind(value: string) {
+    return value
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   function normalizeActions(payload: unknown) {
     if (!Array.isArray(payload)) {
       return [];
@@ -203,15 +210,21 @@
       {:else if browserContext.recentActions.length === 0}
         <p class="panel-copy">No recent actions yet.</p>
       {:else}
-        <div class="stack">
+        <div class="action-list">
           {#each browserContext.recentActions as action}
             <article class="action-card">
-              <div class="action-head">
-                <strong class="action-kind">{action.kind}</strong>
-                <span class={`status status-${action.status ?? 'pending'}`}>{action.status ?? 'pending'}</span>
+              <div class="action-rail" aria-hidden="true"></div>
+              <div class="action-body">
+                <div class="action-head">
+                  <div class="action-meta">
+                    <p class="action-label">Browser event</p>
+                    <strong class="action-kind">{formatActionKind(action.kind)}</strong>
+                  </div>
+                  <span class={`status status-${action.status ?? 'pending'}`}>{action.status ?? 'pending'}</span>
+                </div>
+                <p class="panel-copy action-detail">{action.detail}</p>
+                <time class="timestamp" datetime={action.timestamp}>{formatTimestamp(action.timestamp)}</time>
               </div>
-              <p class="panel-copy">{action.detail}</p>
-              <time class="timestamp" datetime={action.timestamp}>{formatTimestamp(action.timestamp)}</time>
             </article>
           {/each}
         </div>
@@ -243,8 +256,7 @@
   }
 
   header.panel-header,
-  div.button-row,
-  div.action-head {
+  div.button-row {
     display: flex;
     justify-content: space-between;
     gap: 1rem;
@@ -269,8 +281,7 @@
 
   section.callout,
   section.panel-muted,
-  article.metric-card,
-  article.action-card {
+  article.metric-card {
     border-radius: 0;
     border: var(--border-width) solid var(--color-line);
     background: var(--color-panel-muted);
@@ -381,16 +392,75 @@
     word-break: break-word;
   }
 
-  div.stack {
+  div.action-list {
     display: flex;
     flex-direction: column;
     gap: 0.85rem;
   }
 
   article.action-card {
+    display: grid;
+    grid-template-columns: 0.7rem minmax(0, 1fr);
+    gap: 0.95rem;
+    align-items: stretch;
+    border: var(--border-width) solid var(--color-line);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-panel) 88%, white), var(--color-panel-muted));
+    padding: 1rem;
+  }
+
+  div.action-rail {
+    background: linear-gradient(180deg, var(--color-accent), color-mix(in srgb, var(--color-accent) 24%, transparent));
+    min-height: 100%;
+  }
+
+  div.action-body,
+  div.action-meta {
     display: flex;
     flex-direction: column;
-    gap: 0.7rem;
+  }
+
+  div.action-body {
+    gap: 0.55rem;
+    min-width: 0;
+  }
+
+  div.action-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 0.85rem;
+  }
+
+  div.action-meta {
+    gap: 0.2rem;
+    min-width: 0;
+  }
+
+  p.action-label {
+    margin: 0;
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+  }
+
+  strong.action-kind {
+    font-size: 1rem;
+    line-height: 1.25;
+    text-transform: capitalize;
+    overflow-wrap: anywhere;
+  }
+
+  p.action-detail {
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+
+  time.timestamp {
+    display: block;
+    color: var(--color-ink-soft);
+    font-size: 0.86rem;
   }
 
   ul.note-list {
@@ -424,14 +494,24 @@
 
   @media (max-width: 720px) {
     header.panel-header,
-    div.button-row,
-    div.action-head {
+    div.button-row {
       flex-direction: column;
       align-items: flex-start;
     }
 
     section.overview-grid {
       grid-template-columns: 1fr;
+    }
+
+    article.action-card {
+      grid-template-columns: 0.45rem minmax(0, 1fr);
+      gap: 0.75rem;
+      padding: 0.9rem;
+    }
+
+    div.action-head {
+      flex-direction: column;
+      align-items: flex-start;
     }
 
     button.ghost {
