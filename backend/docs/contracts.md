@@ -123,7 +123,7 @@ Response:
   "browser": {
     "url": "https://example.com",
     "title": "Example Domain",
-    "summary": "Mock browser run completed for: Find the nearest pharmacy hours in the browser.",
+    "summary": "Pharmacy hours: 9am–5pm weekdays.",
     "status": "idle",
     "lastUpdated": "2026-04-04T19:00:00.000Z",
     "activeTask": "Find the nearest pharmacy hours in the browser.",
@@ -133,7 +133,7 @@ Response:
       {
         "id": "a_123",
         "kind": "navigate",
-        "detail": "Opened a placeholder page while Browser Use mock mode simulates the run.",
+        "detail": "Sent task to Browser Use Cloud.",
         "timestamp": "2026-04-04T19:00:00.000Z",
         "status": "completed"
       }

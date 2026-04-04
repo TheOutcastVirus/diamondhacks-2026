@@ -16,6 +16,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeCloudStatus(status: string | undefined): string {
+  return String(status ?? "").trim().toLowerCase();
+}
+
+function isTerminalCloudStatus(status: string | undefined): boolean {
+  const normalized = normalizeCloudStatus(status);
+  return normalized === "completed" || normalized === "failed" || normalized === "stopped";
+}
+
 function extractSummary(output: unknown): string {
   if (typeof output === "string" && output.trim().length > 0) {
     return output.trim();
@@ -62,85 +71,61 @@ export class BrowserUseService {
     task: string;
     profileId?: string;
   }): Promise<void> {
-    if (this.config.browserUse.mockMode || !this.config.browserUse.apiKey) {
-      await this.runMockTask(input);
+    const profileLabel = input.profileId ?? this.config.browserUse.profileId ?? "(default)";
+    console.log(
+      `[browser-use] Queued browser task — localSession=${input.browserSessionId}, profileId=${profileLabel}, model=${this.config.browserUse.model}, task=${JSON.stringify(input.task)}`,
+    );
+
+    if (!this.config.browserUse.apiKey?.trim()) {
+      console.warn(
+        `[browser-use] Not sending to Browser Use Cloud (missing BROWSER_USE_API_KEY) — localSession=${input.browserSessionId}`,
+      );
+      this.recordBrowserTaskFailure(
+        input,
+        "BROWSER_USE_API_KEY is not configured. Set it in backend/.env.",
+        "I couldn't start browser automation. Configure BROWSER_USE_API_KEY in backend/.env.",
+      );
       return;
     }
 
+    console.log(
+      `[browser-use] Sending to ${this.config.browserUse.baseUrl} — localSession=${input.browserSessionId}`,
+    );
     await this.runRemoteTask(input);
   }
 
-  private async runMockTask(input: {
-    browserSessionId: string;
-    task: string;
-  }): Promise<void> {
-    const started = this.database.createTranscriptEntry({
-      kind: "tool",
-      role: "system",
-      text: `Started mock browser task: ${input.task}`,
-      toolName: "browser-use",
-      toolStatus: "started",
-      metadata: { mode: "mock" },
-    });
-    this.database.appendBrowserAction({
-      browserSessionId: input.browserSessionId,
-      kind: "dispatch",
-      detail: "Mock Browser Use session started.",
-      status: "pending",
-    });
-    this.transcriptBus.publish("tool", started);
-
-    await sleep(250);
+  private recordBrowserTaskFailure(
+    input: { browserSessionId: string; task: string },
+    message: string,
+    robotUserMessage = "I couldn't complete that browser task. Check the guardian console for details.",
+  ): void {
     this.database.updateBrowserSession({
       browserSessionId: input.browserSessionId,
-      status: "navigating",
-      summary: "Navigating through the requested website in mock mode.",
+      status: "blocked",
+      summary: message,
       activeTask: input.task,
-      currentUrl: "https://example.com",
-      title: "Example Domain",
-      tabLabel: "Example",
-      domSnippet: "<main><h1>Example Domain</h1></main>",
     });
     this.database.appendBrowserAction({
       browserSessionId: input.browserSessionId,
-      kind: "navigate",
-      detail: "Opened a placeholder page while Browser Use mock mode simulates the run.",
-      status: "completed",
+      kind: "error",
+      detail: message,
+      status: "failed",
     });
 
-    await sleep(250);
-    const summary = `Mock browser run completed for: ${input.task}`;
-    this.database.updateBrowserSession({
-      browserSessionId: input.browserSessionId,
-      status: "idle",
-      summary,
-      activeTask: input.task,
-      currentUrl: "https://example.com",
-      title: "Example Domain",
-      tabLabel: "Example",
-      domSnippet: "<main><h1>Example Domain</h1><p>Mock Browser Use completed.</p></main>",
-    });
-    this.database.appendBrowserAction({
-      browserSessionId: input.browserSessionId,
-      kind: "summary",
-      detail: summary,
-      status: "completed",
-    });
-
-    const completed = this.database.createTranscriptEntry({
+    const failed = this.database.createTranscriptEntry({
       kind: "tool",
       role: "system",
-      text: summary,
+      text: message,
       toolName: "browser-use",
-      toolStatus: "completed",
-      metadata: { mode: "mock" },
+      toolStatus: "failed",
+      metadata: { task: input.task },
     });
     const robot = this.database.createTranscriptEntry({
       kind: "message",
       role: "robot",
-      text: summary,
+      text: robotUserMessage,
     });
-    this.transcriptBus.publish("tool", completed);
+    this.transcriptBus.publish("tool", failed);
     this.transcriptBus.publish("transcript", robot);
   }
 
@@ -191,12 +176,18 @@ export class BrowserUseService {
       this.database.updateBrowserSession(initialUpdate);
 
       const finalSession = await this.pollRemoteSession(initialSession.id);
+      const cloudStatus = normalizeCloudStatus(finalSession.status);
+      const failed = cloudStatus === "failed" || cloudStatus === "stopped";
       const summary = extractSummary(finalSession.output);
+      const resolvedSummary =
+        summary === "Browser task completed." && failed
+          ? `Browser task ${cloudStatus || "failed"} in Browser Use Cloud.`
+          : summary;
 
       const finalUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
-        status: "idle",
-        summary,
+        status: failed ? "blocked" : "idle",
+        summary: resolvedSummary,
         activeTask: input.task,
         remoteSessionId: finalSession.id,
         title: finalSession.title ?? "Browser Use session",
@@ -213,16 +204,16 @@ export class BrowserUseService {
       this.database.appendBrowserAction({
         browserSessionId: input.browserSessionId,
         kind: "summary",
-        detail: summary,
-        status: "completed",
+        detail: resolvedSummary,
+        status: failed ? "failed" : "completed",
       });
 
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
         role: "system",
-        text: summary,
+        text: resolvedSummary,
         toolName: "browser-use",
-        toolStatus: "completed",
+        toolStatus: failed ? "failed" : "completed",
         metadata: {
           sessionId: finalSession.id,
           liveUrl: finalSession.liveUrl ?? undefined,
@@ -231,43 +222,15 @@ export class BrowserUseService {
       const robot = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",
-        text: summary,
+        text: resolvedSummary,
       });
       this.transcriptBus.publish("tool", completed);
       this.transcriptBus.publish("transcript", robot);
-
-      await this.stopRemoteSession(finalSession.id);
     } catch (error) {
+      console.error("[browser-use] Remote task failed:", error);
       const message =
         error instanceof Error ? `Browser task failed: ${error.message}` : "Browser task failed.";
-      this.database.updateBrowserSession({
-        browserSessionId: input.browserSessionId,
-        status: "blocked",
-        summary: message,
-        activeTask: input.task,
-      });
-      this.database.appendBrowserAction({
-        browserSessionId: input.browserSessionId,
-        kind: "error",
-        detail: message,
-        status: "failed",
-      });
-
-      const failed = this.database.createTranscriptEntry({
-        kind: "tool",
-        role: "system",
-        text: message,
-        toolName: "browser-use",
-        toolStatus: "failed",
-        metadata: { task: input.task },
-      });
-      const robot = this.database.createTranscriptEntry({
-        kind: "message",
-        role: "robot",
-        text: "I couldn't complete that browser task. Check the guardian console for details.",
-      });
-      this.transcriptBus.publish("tool", failed);
-      this.transcriptBus.publish("transcript", robot);
+      this.recordBrowserTaskFailure(input, message);
     }
   }
 
@@ -287,6 +250,9 @@ export class BrowserUseService {
       body.proxyCountryCode = this.config.browserUse.proxyCountryCode;
     }
 
+    const url = `${this.config.browserUse.baseUrl}/sessions`;
+    console.log(`[browser-use] POST ${url} body=${JSON.stringify(body)}`);
+
     return this.browserUseRequest("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -297,13 +263,7 @@ export class BrowserUseService {
   private async pollRemoteSession(sessionId: string): Promise<BrowserUseSessionResponse> {
     for (let attempt = 0; attempt < this.config.browserUse.maxPollAttempts; attempt += 1) {
       const session = await this.browserUseRequest(`/sessions/${sessionId}`, { method: "GET" });
-      const status = String(session.status ?? "");
-      if (
-        session.output !== undefined ||
-        status === "completed" ||
-        status === "failed" ||
-        status === "stopped"
-      ) {
+      if (isTerminalCloudStatus(session.status)) {
         return session;
       }
 
@@ -311,14 +271,6 @@ export class BrowserUseService {
     }
 
     throw new Error("Browser Use task timed out while polling the session.");
-  }
-
-  private async stopRemoteSession(sessionId: string): Promise<void> {
-    try {
-      await this.browserUseRequest(`/sessions/${sessionId}/stop`, { method: "POST" });
-    } catch {
-      // Best-effort stop for profile persistence.
-    }
   }
 
   private async browserUseRequest(path: string, init: RequestInit): Promise<BrowserUseSessionResponse> {

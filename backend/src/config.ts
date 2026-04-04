@@ -11,7 +11,6 @@ export type AppConfig = {
     apiKey?: string;
     baseUrl: string;
     model: string;
-    mockMode: boolean;
     profileId?: string;
     keepAlive: boolean;
     idleStopSeconds: number;
@@ -28,7 +27,6 @@ export type AppConfig = {
     model: string;
     maxTokens: number;
     maxHistoryEntries: number;
-    mockMode: boolean;
   };
   tts: {
     endpoint?: string;
@@ -36,6 +34,25 @@ export type AppConfig = {
 };
 
 type EnvSource = Record<string, string | undefined>;
+
+const DEFAULT_BROWSER_USE_MODEL = "bu-max";
+
+const SUPPORTED_BROWSER_USE_MODELS = new Set([
+  "gemini-3-flash",
+  "claude-sonnet-4.6",
+  "claude-opus-4.6",
+  "gpt-5.4-mini",
+  "bu-mini",
+  "bu-max",
+  "bu-ultra",
+]);
+
+const LEGACY_BROWSER_USE_MODEL_ALIASES = new Map<string, string>([
+  ["gemini-3.1", "bu-max"],
+  ["gemini-3.1-flash", "bu-max"],
+  ["bu-medium", "bu-max"],
+  ["bu-meduim", "bu-max"],
+]);
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (!value) {
@@ -81,11 +98,32 @@ function resolveDatabasePath(rawPath: string | undefined): string {
   return resolved;
 }
 
+function resolveBrowserUseModel(value: string | undefined): string {
+  const configured = value?.trim();
+  if (!configured) {
+    return DEFAULT_BROWSER_USE_MODEL;
+  }
+
+  if (SUPPORTED_BROWSER_USE_MODELS.has(configured)) {
+    return configured;
+  }
+
+  const aliasedModel = LEGACY_BROWSER_USE_MODEL_ALIASES.get(configured);
+  if (aliasedModel) {
+    console.warn(`[config] Translating legacy BROWSER_USE_MODEL=${configured} to ${aliasedModel}.`);
+    return aliasedModel;
+  }
+
+  console.warn(
+    `[config] Unsupported BROWSER_USE_MODEL=${configured}; falling back to ${DEFAULT_BROWSER_USE_MODEL}.`,
+  );
+  return DEFAULT_BROWSER_USE_MODEL;
+}
+
 export function loadConfig(source: EnvSource = process.env): AppConfig {
   const browserUse: AppConfig["browserUse"] = {
     baseUrl: source.BROWSER_USE_BASE_URL?.trim() || "https://api.browser-use.com/api/v3",
-    model: source.BROWSER_USE_MODEL?.trim() || "bu-mini",
-    mockMode: parseBoolean(source.BROWSER_USE_MOCK_MODE, true),
+    model: resolveBrowserUseModel(source.BROWSER_USE_MODEL),
     keepAlive: parseBoolean(source.BROWSER_USE_KEEP_ALIVE, true),
     idleStopSeconds: parseInteger(source.BROWSER_USE_IDLE_STOP_SECONDS, 900),
     pollIntervalMs: parseInteger(source.BROWSER_USE_POLL_INTERVAL_MS, 2000),
@@ -108,10 +146,9 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   const imagine: AppConfig["imagine"] = {
     apiKey: source.INFERENCE_CLOUD_API_KEY?.trim() || "",
     endpoint: source.INFERENCE_CLOUD_ENDPOINT?.trim() || "https://aisuite.cirrascale.com/apis/v2",
-    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-70B",
+    model: "Llama-3.1-8B",
     maxTokens: parseInteger(source.INFERENCE_CLOUD_MAX_TOKENS, 1024),
     maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
-    mockMode: parseBoolean(source.AGENT_MOCK_MODE, false),
   };
 
   const tts: AppConfig["tts"] = {};
@@ -123,7 +160,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   return {
     appName: source.APP_NAME?.trim() || "Gazabot Backend",
     host: source.HOST?.trim() || "127.0.0.1",
-    port: parseInteger(source.PORT, 3000),
+    port: parseInteger(source.PORT, 8000),
     databasePath: resolveDatabasePath(source.DATABASE_PATH),
     allowedOrigins: parseOrigins(source.ALLOWED_ORIGINS),
     browserUse,

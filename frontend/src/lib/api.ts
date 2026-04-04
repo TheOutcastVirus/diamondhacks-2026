@@ -7,7 +7,9 @@ const endpointMap: Record<EndpointKey, string> = {
   transcriptStream: '/api/transcript/stream',
 };
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
+const defaultDevApiBaseUrl = import.meta.env.DEV ? 'http://127.0.0.1:8000' : '';
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+const apiBaseUrl = (configuredApiBaseUrl || defaultDevApiBaseUrl).replace(/\/$/, '');
 
 type QueryValue = string | number | boolean | null | undefined;
 type RequestOptions = Omit<RequestInit, 'body' | 'method'> & {

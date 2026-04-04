@@ -247,8 +247,17 @@ export class GazabotApp {
         ) {
           return errorResponse(request, this.config, 400, error.message);
         }
+
+        if (error.message.includes("INFERENCE_CLOUD_API_KEY is not configured")) {
+          return errorResponse(request, this.config, 503, error.message);
+        }
+
+        if (error.message.startsWith("Imagine API error")) {
+          return errorResponse(request, this.config, 502, error.message);
+        }
       }
 
+      console.error("[app] Unhandled error:", error);
       return errorResponse(request, this.config, 500, "Internal server error.");
     }
   }

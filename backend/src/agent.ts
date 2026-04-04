@@ -304,41 +304,27 @@ When you want to speak a response aloud (for voice interactions), use the speak 
     }
   }
 
-  private async collectTurnMock(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    const browserHints = ["browser", "search", "look up", "lookup", "find", "open", "visit", "order", "book", "buy"];
-    const normalized = request.message.toLowerCase();
-    const isBrowser = request.forceBrowser === true || browserHints.some((h) => normalized.includes(h));
+  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
+    if (request.forceBrowser) {
+      const { browserTask } = await this.executeTool(
+        {
+          id: "forced_browser_task",
+          type: "function",
+          function: {
+            name: "run_browser_task",
+            arguments: JSON.stringify({ task: request.message }),
+          },
+        },
+        request.profileId,
+      );
 
-    if (isBrowser) {
-      const session = this.database.beginBrowserTask(request.message, request.profileId);
-      const queuedEntry = this.database.createTranscriptEntry({
-        kind: "tool",
-        role: "system",
-        text: `Queued browser task: ${request.message}`,
-        toolName: "browser-use",
-        toolStatus: "started",
-        metadata: { browserSessionId: session.id },
-      });
-      this.transcriptBus.publish("tool", queuedEntry);
-
-      const taskRequest: { browserSessionId: string; task: string; profileId?: string } = {
-        browserSessionId: session.id,
-        task: request.message,
-      };
-      if (request.profileId) {
-        taskRequest.profileId = request.profileId;
+      if (browserTask) {
+        return { kind: "browser_task", ...browserTask };
       }
-      void this.browserUseService.runBrowserTask(taskRequest);
-
-      return { kind: "browser_task", browserSessionId: session.id, previewUrl: session.previewUrl };
     }
 
-    return { kind: "text", text: "Agent has not been built yet" };
-  }
-
-  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    if (this.config.imagine.mockMode) {
-      return this.collectTurnMock(request);
+    if (!this.config.imagine.apiKey.trim()) {
+      throw new Error("INFERENCE_CLOUD_API_KEY is not configured. Set it in backend/.env.");
     }
 
     const messages = this.buildMessages(request);
