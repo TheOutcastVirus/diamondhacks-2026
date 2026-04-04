@@ -25,7 +25,7 @@ function resolvePath(endpoint: EndpointKey | string) {
   return endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
 }
 
-function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
+export function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
   const path = resolvePath(endpoint);
   const url = new URL(`${apiBaseUrl}${path}`, window.location.origin);
 
@@ -108,6 +108,16 @@ export function patch<T>(
 
 export function del<T>(endpoint: EndpointKey | string, options?: Omit<RequestOptions, 'body'>) {
   return request<T>('DELETE', endpoint, options);
+}
+
+export async function postAudio(endpoint: EndpointKey | string, blob: Blob): Promise<ArrayBuffer> {
+  const form = new FormData();
+  form.append('audio', blob, 'recording.webm');
+  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  if (!response.ok) {
+    throw new ApiError(`Audio request failed`, response.status, null);
+  }
+  return response.arrayBuffer();
 }
 
 export function createEventStream(

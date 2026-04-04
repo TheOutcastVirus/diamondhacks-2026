@@ -12,6 +12,8 @@ import { AgentHarness, type AgentTurnResult } from "./agent";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
 import { ReminderScheduler } from "./reminder-scheduler";
+import { SttService } from "./stt";
+import { TtsService } from "./tts";
 import { TranscriptEventBus } from "./transcript-bus";
 
 
@@ -222,6 +224,9 @@ export class GazabotApp {
   private readonly reminderScheduler: ReminderScheduler;
 
   private readonly unsubscribeReminderChanges: () => void;
+  private readonly sttService: SttService;
+
+  private readonly ttsService: TtsService;
 
   constructor(
     private readonly config: AppConfig,
@@ -238,6 +243,8 @@ export class GazabotApp {
       this.reminderScheduler.refresh();
     });
     this.reminderScheduler.start();
+    this.sttService = new SttService(config);
+    this.ttsService = new TtsService(config);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -317,6 +324,10 @@ export class GazabotApp {
 
       if (request.method === "POST" && url.pathname === "/api/tts") {
         return jsonResponse(request, this.config, await this.handleTts(request));
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/agent/voice-turn") {
+        return this.handleVoiceTurn(request);
       }
 
       return errorResponse(request, this.config, 404, "Route not found.");
@@ -424,6 +435,59 @@ export class GazabotApp {
     });
 
     return eventStreamResponse(request, this.config, stream);
+  }
+
+  private async handleVoiceTurn(request: Request): Promise<Response> {
+    let formData: Awaited<ReturnType<Request["formData"]>>;
+    try {
+      formData = await request.formData();
+    } catch {
+      return errorResponse(request, this.config, 422, "Expected multipart/form-data.");
+    }
+
+    const audioField = formData.get("audio");
+    if (!audioField || !(audioField instanceof File)) {
+      return errorResponse(request, this.config, 422, "Missing audio field.");
+    }
+
+    const transcript = await this.sttService.transcribe(audioField);
+    if (!transcript.trim()) {
+      return errorResponse(request, this.config, 422, "No speech detected.");
+    }
+
+    const userEntry = this.database.createTranscriptEntry({
+      kind: "message",
+      role: "resident",
+      text: transcript,
+    });
+    this.transcriptBus.publish("transcript", userEntry);
+
+    const result: AgentTurnResult = await this.agentHarness.collectTurn({
+      message: transcript,
+      source: "voice",
+    });
+
+    let replyText: string;
+    if (result.kind === "browser_task") {
+      replyText = "I'm on it — I'll handle that for you now.";
+    } else {
+      replyText = result.text;
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: replyText,
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+    }
+
+    const audioOut = await this.ttsService.synthesize(replyText);
+
+    return new Response(audioOut, {
+      headers: {
+        "Content-Type": "audio/mpeg",
+        ...corsHeaders(request, this.config),
+      },
+    });
   }
 
   private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {
