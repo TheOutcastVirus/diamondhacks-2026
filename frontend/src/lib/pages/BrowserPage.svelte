@@ -166,7 +166,17 @@
       <p class="panel-copy">Current browser work.</p>
     </section>
 
-    {#if browserContext.screenshotUrl}
+    {#if browserContext.previewUrl}
+      <section class="panel panel-muted">
+        <p class="panel-label">Live preview</p>
+        <iframe
+          class="preview-frame"
+          src={browserContext.previewUrl}
+          title="Live Browser Use session"
+          loading="lazy"
+        ></iframe>
+      </section>
+    {:else if browserContext.screenshotUrl}
       <section class="panel panel-muted">
         <p class="panel-label">Visual preview</p>
         <img class="preview-image" src={browserContext.screenshotUrl} alt="Robot browser preview" />
@@ -350,6 +360,13 @@
     border-radius: 0;
     border: var(--border-width) solid var(--color-line);
     object-fit: cover;
+  }
+
+  iframe.preview-frame {
+    width: 100%;
+    min-height: 24rem;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-input);
   }
 
   pre.snippet {
