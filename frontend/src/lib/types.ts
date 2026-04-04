@@ -1,6 +1,12 @@
 export type ThemeMode = 'light' | 'dark';
-export type PageId = 'reminders' | 'transcription' | 'browser';
-export type EndpointKey = 'reminders' | 'browser' | 'transcript' | 'transcriptStream';
+export type PageId = 'reminders' | 'transcription' | 'browser' | 'requested-info';
+export type EndpointKey =
+  | 'reminders'
+  | 'browser'
+  | 'transcript'
+  | 'transcriptStream'
+  | 'prompts'
+  | 'memory';
 
 export type PageDefinition = {
   id: PageId;
@@ -62,6 +68,58 @@ export type BrowserContext = {
   previewUrl?: string;
   screenshotUrl?: string;
   recentActions: BrowserAction[];
+};
+
+export type PromptFieldType =
+  | 'string'
+  | 'text'
+  | 'int'
+  | 'float'
+  | 'boolean'
+  | 'password'
+  | 'date'
+  | 'select';
+
+export type PromptFieldOption = {
+  label: string;
+  value: string;
+};
+
+export type PromptField = {
+  name: string;
+  label: string;
+  type: PromptFieldType;
+  required: boolean;
+  placeholder?: string;
+  description?: string;
+  options?: PromptFieldOption[];
+  defaultValue?: string | number | boolean | null;
+};
+
+export type PromptStatus = 'pending' | 'completed' | 'cancelled';
+
+export type MemoryKind = 'text' | 'structured';
+
+export type UserMemoryEntry = {
+  title: string;
+  content: string;
+  updatedAt: string;
+  kind: MemoryKind;
+  schema?: PromptField[];
+  data?: Record<string, unknown>;
+};
+
+export type UserPrompt = {
+  id: string;
+  title: string;
+  description?: string;
+  fields: PromptField[];
+  memoryKey: string;
+  memoryLabel: string;
+  status: PromptStatus;
+  createdAt: string;
+  response?: Record<string, unknown>;
+  respondedAt?: string;
 };
 
 export class ApiError extends Error {

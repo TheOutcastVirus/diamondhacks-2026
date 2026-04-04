@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import BrowserPage from './lib/pages/BrowserPage.svelte';
   import RemindersPage from './lib/pages/RemindersPage.svelte';
+  import RequestedInfoPage from './lib/pages/RequestedInfoPage.svelte';
   import TranscriptionPage from './lib/pages/TranscriptionPage.svelte';
   import type { PageDefinition, PageId, ThemeMode } from './lib/types';
 
@@ -29,6 +30,14 @@
       title: 'Browser',
       description: 'Current page, task, and recent actions.',
       metricLabel: 'Session',
+    },
+    {
+      id: 'requested-info',
+      label: 'Requested Info',
+      eyebrow: 'Memory',
+      title: 'Requested Information',
+      description: 'Review active intake forms and unified user memory.',
+      metricLabel: 'Intake',
     },
   ];
 
@@ -139,6 +148,8 @@
       <RemindersPage />
     {:else if currentPageId === 'transcription'}
       <TranscriptionPage />
+    {:else if currentPageId === 'requested-info'}
+      <RequestedInfoPage />
     {:else}
       <BrowserPage />
     {/if}

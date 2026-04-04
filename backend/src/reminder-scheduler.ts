@@ -1,8 +1,14 @@
 import type { AppConfig } from "./config";
+import type { GazabotDatabase } from "./db";
 import type { Reminder } from "./contracts";
-import type { ClaimedReminder, GazabotDatabase } from "./db";
 
-type ReminderExecutor = (input: ClaimedReminder & { prompt: string }) => Promise<void>;
+type ReminderFirePayload = {
+  reminder: Pick<Reminder, "id" | "title" | "instructions">;
+  dueAt: string;
+  prompt: string;
+};
+
+type ReminderCallback = (payload: ReminderFirePayload) => Promise<void>;
 
 export function buildReminderPrompt(reminder: Pick<Reminder, "title" | "instructions">, dueAt: string): string {
   return [
@@ -19,42 +25,49 @@ export class ReminderScheduler {
 
   private timer: ReturnType<typeof setTimeout> | null = null;
 
-  private running = false;
+  private schedulerActive = false;
 
-  private refreshRequested = false;
+  private executing = false;
+
+  private nextDueAt: string | null = null;
 
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
-    private readonly executeReminder: ReminderExecutor,
+    private readonly executeReminder: ReminderCallback,
   ) {}
 
   start(): void {
-    if (!this.config.reminders.enabled) {
+    if (!this.config.reminders.enabled || this.schedulerActive) {
       return;
     }
 
-    this.refresh();
+    this.schedulerActive = true;
+    this.scheduleNextRun();
   }
 
   stop(): void {
+    this.schedulerActive = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.nextDueAt = null;
   }
 
   refresh(): void {
-    if (!this.config.reminders.enabled) {
+    if (!this.config.reminders.enabled || !this.schedulerActive) {
       return;
     }
 
-    if (this.running) {
-      this.refreshRequested = true;
-      return;
+    const next = this.database.getNextReminderDueAt();
+    if (next !== this.nextDueAt) {
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      this.scheduleNextRun();
     }
-
-    this.scheduleNextRun();
   }
 
   async runOnce(now = new Date()): Promise<number> {
@@ -62,19 +75,21 @@ export class ReminderScheduler {
   }
 
   private scheduleNextRun(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-
-    const nextDueAt = this.database.getNextReminderDueAt();
-    if (!nextDueAt) {
+    if (!this.schedulerActive) {
       return;
     }
 
-    const nextDueTime = new Date(nextDueAt);
+    const next = this.database.getNextReminderDueAt();
+    this.nextDueAt = next;
+
+    if (!next) {
+      return;
+    }
+
+    const nextDueTime = new Date(next);
     if (Number.isNaN(nextDueTime.valueOf())) {
-      console.error(`[reminder] Invalid next_run value skipped: ${nextDueAt}`);
+      console.error(`[reminder] Invalid next_run value skipped: ${next}`);
+      this.nextDueAt = null;
       return;
     }
 
@@ -97,12 +112,11 @@ export class ReminderScheduler {
   }
 
   private async runDueReminders(initialNow: Date): Promise<number> {
-    if (this.running) {
-      this.refreshRequested = true;
+    if (this.executing) {
       return 0;
     }
 
-    this.running = true;
+    this.executing = true;
     let totalExecuted = 0;
 
     try {
@@ -114,12 +128,17 @@ export class ReminderScheduler {
           break;
         }
 
-        for (const reminder of claimed) {
-          await this.executeReminder({
-            ...reminder,
-            prompt: buildReminderPrompt(reminder.reminder, reminder.dueAt),
-          });
-          totalExecuted += 1;
+        for (const { reminder, dueAt } of claimed) {
+          try {
+            await this.executeReminder({
+              reminder,
+              dueAt,
+              prompt: buildReminderPrompt(reminder, dueAt),
+            });
+            totalExecuted += 1;
+          } catch (error) {
+            console.error(`[reminder-scheduler] Error firing reminder ${reminder.id}:`, error);
+          }
         }
 
         currentNow = new Date();
@@ -127,8 +146,7 @@ export class ReminderScheduler {
 
       return totalExecuted;
     } finally {
-      this.running = false;
-      this.refreshRequested = false;
+      this.executing = false;
       this.scheduleNextRun();
     }
   }

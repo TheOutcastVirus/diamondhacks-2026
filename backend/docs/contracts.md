@@ -2,25 +2,25 @@
 
 All frontend-facing routes are rooted at `/api` and return JSON unless marked as SSE.
 
+---
+
 ## `GET /health`
 
-Response:
-
 ```json
-{
-  "status": "ok"
-}
+{ "status": "ok" }
 ```
 
-## `GET /api/reminders`
+---
 
-Response:
+## Reminders
+
+### `GET /api/reminders`
 
 ```json
 {
   "reminders": [
     {
-      "id": "r_123",
+      "id": "r_abc123",
       "title": "Hydration reminder",
       "instructions": "Prompt for water.",
       "cron": "0 15 * * *",
@@ -35,10 +35,9 @@ Response:
 }
 ```
 
-## `POST /api/reminders`
+### `POST /api/reminders`
 
 Request:
-
 ```json
 {
   "title": "Hydration reminder",
@@ -50,90 +49,165 @@ Request:
 }
 ```
 
-Response: a single reminder object with the same shape used in `GET /api/reminders`.
+Response: single reminder object (same shape as above).
 
-Validation notes:
+Validation:
+- `cadence` must be `daily`, `weekly`, or `custom`
+- `cron` must be a valid five-field cron expression
+- `timezone` must be a valid IANA timezone name
 
-- `cadence` must be `daily`, `weekly`, or `custom`.
-- `cron` must be a five-field cron expression.
-- `timezone` must be a valid IANA timezone.
+---
 
-## `GET /api/transcript`
+## Transcript
 
-Response:
+### `GET /api/transcript`
 
 ```json
 {
   "entries": [
     {
-      "id": "t_123",
+      "id": "t_abc123",
       "timestamp": "2026-04-04T19:00:00.000Z",
       "kind": "message",
       "role": "guardian",
-      "text": "Please note this for later."
+      "text": "What reminders do I have?"
     },
     {
-      "id": "t_124",
+      "id": "t_abc124",
       "timestamp": "2026-04-04T19:00:01.000Z",
       "kind": "tool",
       "role": "system",
-      "text": "Queued browser task: Find the nearest pharmacy hours in the browser.",
-      "toolName": "browser-use",
-      "toolStatus": "started",
-      "metadata": {
-        "browserSessionId": "bs_123"
-      }
+      "text": "Tool list_reminders completed",
+      "toolName": "list_reminders",
+      "toolStatus": "completed"
     }
   ]
 }
 ```
 
-## `GET /api/transcript/stream` (SSE)
+`kind` values: `message`, `tool`  
+`role` values: `robot`, `resident`, `guardian`, `system`  
+`toolStatus` values: `started`, `completed`, `failed`
+
+### `GET /api/transcript/stream` (SSE)
 
 Response headers:
-
 - `Content-Type: text/event-stream`
 - `Cache-Control: no-cache, no-transform`
 - `X-Accel-Buffering: no`
 
-Event types:
+**Event types:**
 
-- `transcript`
-- `tool`
+| Event | Payload | Description |
+|---|---|---|
+| `transcript` | `TranscriptEntry` | New message from user or robot |
+| `tool` | `TranscriptEntry` | Agent tool call started/completed/failed |
+| `tts` | `{ text: string }` | Text to speak aloud via TTS |
+| `prompt` | `UserPrompt` | Agent sent a form for the user to fill out |
 
-Each event payload is a single transcript entry:
-
-```text
-event: transcript
-data: {"id":"t_123","timestamp":"2026-04-04T19:00:00.000Z","kind":"message","role":"robot","text":"Agent has not been built yet"}
+Example frames:
 ```
+event: transcript
+data: {"id":"t_123","timestamp":"...","kind":"message","role":"robot","text":"You have no active reminders."}
 
-Keepalive comments are sent periodically:
+event: tool
+data: {"id":"t_124","timestamp":"...","kind":"tool","role":"system","text":"Tool list_reminders completed","toolName":"list_reminders","toolStatus":"completed"}
 
-```text
+event: tts
+data: {"text":"You have no active reminders."}
+
+event: prompt
+data: {"id":"p_abc123","title":"Credit Card Details","fields":[{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}],"status":"pending","createdAt":"..."}
+
 : keepalive
 ```
 
-## `GET /api/browser`
+---
 
-Response:
+## Agent
+
+### `POST /api/agent/turn`
+
+Request:
+```json
+{
+  "message": "What reminders do I have?",
+  "source": "resident",
+  "forceBrowser": false,
+  "profileId": "optional-browser-use-profile-id"
+}
+```
+
+`source` must be `voice`, `dashboard`, `resident`, or `guardian`.
+
+Conversation response:
+```json
+{
+  "route": "conversation",
+  "reply": "You have no active reminders."
+}
+```
+
+Browser-task response:
+```json
+{
+  "route": "browser_task",
+  "browserSessionId": "bs_abc123",
+  "previewUrl": null,
+  "status": "queued"
+}
+```
+
+Note: routing is now LLM-driven via tool calling. The agent decides when to use the browser. `forceBrowser: true` overrides this.
+
+### `POST /api/agent/stream` (SSE)
+
+Same request body as `/api/agent/turn`.
+
+Event frames during the stream:
+
+```
+event: ready
+data: {"source":"resident"}
+
+event: chunk
+data: {"delta":"You have ","done":false}
+
+event: chunk
+data: {"delta":"no active reminders.","done":false}
+
+event: done
+data: {"text":"You have no active reminders.","done":true}
+```
+
+On error:
+```
+event: error
+data: {"message":"Agent stream failed."}
+```
+
+---
+
+## Browser
+
+### `GET /api/browser`
 
 ```json
 {
   "browser": {
     "url": "https://example.com",
     "title": "Example Domain",
-    "summary": "Mock browser run completed for: Find the nearest pharmacy hours in the browser.",
+    "summary": "Mock browser run completed.",
     "status": "idle",
     "lastUpdated": "2026-04-04T19:00:00.000Z",
-    "activeTask": "Find the nearest pharmacy hours in the browser.",
+    "activeTask": "Search for latest AI news",
     "tabLabel": "Example",
-    "domSnippet": "<main><h1>Example Domain</h1></main>",
+    "domSnippet": "<main><h1>Example</h1></main>",
     "recentActions": [
       {
-        "id": "a_123",
+        "id": "a_abc123",
         "kind": "navigate",
-        "detail": "Opened a placeholder page while Browser Use mock mode simulates the run.",
+        "detail": "Opened example.com",
         "timestamp": "2026-04-04T19:00:00.000Z",
         "status": "completed"
       }
@@ -142,46 +216,102 @@ Response:
 }
 ```
 
-## `POST /api/agent/turn`
+`status` values: `idle`, `navigating`, `executing`, `blocked`
+
+---
+
+## TTS
+
+### `POST /api/tts`
 
 Request:
+```json
+{ "text": "Hello, how can I help you?" }
+```
+
+Response:
+```json
+{ "spoken": true, "text": "Hello, how can I help you?" }
+```
+
+`spoken: false` if no `TTS_ENDPOINT` is configured. Either way, a `tts` SSE event is emitted on the transcript stream.
+
+---
+
+## User Input Prompts
+
+Used when the agent needs structured input from the user (e.g. payment details, a form). The agent creates a prompt via its `request_user_input` tool; the frontend detects it via the `prompt` SSE event and renders the form.
+
+### `GET /api/prompts`
+
+Returns all pending (unfilled) prompts.
 
 ```json
 {
-  "message": "Please note this for later.",
-  "source": "guardian",
-  "forceBrowser": false,
-  "profileId": "optional-browser-use-profile-id"
+  "prompts": [
+    {
+      "id": "p_abc123",
+      "title": "Credit Card Details",
+      "description": "Needed to complete your order.",
+      "fields": [
+        { "name": "card_number", "label": "Card Number", "type": "string", "required": true },
+        { "name": "cardholder_name", "label": "Name on Card", "type": "string", "required": true },
+        { "name": "expiry", "label": "Expiry (MM/YY)", "type": "string", "required": true, "placeholder": "04/28" },
+        { "name": "cvv", "label": "CVV", "type": "password", "required": true }
+      ],
+      "status": "pending",
+      "createdAt": "2026-04-04T19:00:00.000Z"
+    }
+  ]
 }
 ```
 
-Conversation response:
+### `POST /api/prompts/:id/respond`
 
+Submit the filled form. Keys in `response` must match the `name` fields defined in the prompt.
+
+Request:
 ```json
 {
-  "route": "conversation",
-  "reply": "Agent has not been built yet"
+  "response": {
+    "card_number": "4111111111111111",
+    "cardholder_name": "Alice",
+    "expiry": "04/28",
+    "cvv": "123"
+  }
 }
 ```
 
-Browser-task response:
-
+Response: the completed prompt object.
 ```json
 {
-  "route": "browser_task",
-  "browserSessionId": "bs_123",
-  "previewUrl": null,
-  "status": "queued"
+  "prompt": {
+    "id": "p_abc123",
+    "title": "Credit Card Details",
+    "fields": [...],
+    "status": "completed",
+    "createdAt": "...",
+    "response": { "card_number": "4111111111111111", ... },
+    "respondedAt": "2026-04-04T19:00:05.000Z"
+  }
 }
 ```
 
-Routing notes:
+The response data is recorded as a transcript entry and a `tool` SSE event is emitted. After submitting, send a follow-up message via `/api/agent/turn` to continue the conversation with the collected data in context.
 
-- `source` must be `voice`, `dashboard`, `resident`, or `guardian`.
-- `forceBrowser` overrides keyword routing.
-- Browser tasks are queued asynchronously; state is reflected through `/api/browser` and `/api/transcript`.
+**Field types and recommended HTML inputs:**
 
-## Error envelope
+| `type` | HTML input |
+|---|---|
+| `string` | `<input type="text">` |
+| `password` | `<input type="password">` |
+| `int` | `<input type="number" step="1">` |
+| `float` | `<input type="number" step="any">` |
+| `boolean` | `<input type="checkbox">` |
+
+---
+
+## Error Envelope
 
 All handled errors return:
 
@@ -191,3 +321,5 @@ All handled errors return:
   "details": "Optional validation detail"
 }
 ```
+
+HTTP status codes: `400` bad input, `404` not found, `422` parse/validation error, `500` server error.

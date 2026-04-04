@@ -92,6 +92,58 @@ export type AgentTurnResponse =
       status: "queued";
     };
 
+export type MemoryKind = "text" | "structured";
+
+export type UserMemoryEntry = {
+  title: string;
+  content: string;
+  updatedAt: string;
+  kind: MemoryKind;
+  schema?: PromptField[];
+  data?: Record<string, unknown>;
+};
+
+export type PromptFieldType =
+  | "string"
+  | "text"
+  | "int"
+  | "float"
+  | "boolean"
+  | "password"
+  | "date"
+  | "select";
+
+export type PromptFieldOption = {
+  label: string;
+  value: string;
+};
+
+export type PromptField = {
+  name: string;
+  label: string;
+  type: PromptFieldType;
+  required: boolean;
+  placeholder?: string;
+  description?: string;
+  options?: PromptFieldOption[];
+  defaultValue?: string | number | boolean | null;
+};
+
+export type PromptStatus = "pending" | "completed" | "cancelled";
+
+export type UserPrompt = {
+  id: string;
+  title: string;
+  description?: string;
+  fields: PromptField[];
+  memoryKey: string;
+  memoryLabel: string;
+  status: PromptStatus;
+  createdAt: string;
+  response?: Record<string, unknown>;
+  respondedAt?: string;
+};
+
 export type ApiErrorPayload = {
   message: string;
   details?: unknown;

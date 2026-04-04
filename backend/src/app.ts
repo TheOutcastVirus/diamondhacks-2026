@@ -4,6 +4,8 @@ import type {
   AgentTurnResponse,
   ApiErrorPayload,
   BrowserContext,
+  PromptField,
+  PromptFieldOption,
   ReminderCreateInput,
   ReminderUpdateInput,
   TranscriptRole,
@@ -112,6 +114,155 @@ function optionalBoolean(record: Record<string, unknown>, key: string): boolean 
     throw new Error(`Invalid field: ${key}`);
   }
   return value;
+}
+
+function optionalRecord(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid field: ${key}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizePromptFieldOption(value: unknown, index: number): PromptFieldOption {
+  const record = asRecord(value);
+  return {
+    label: requireString(record, "label"),
+    value: String(record.value ?? record.label ?? `option_${index + 1}`),
+  };
+}
+
+function normalizePromptField(value: unknown): PromptField {
+  const record = asRecord(value);
+  const type = requireString(record, "type");
+  if (
+    type !== "string" &&
+    type !== "text" &&
+    type !== "int" &&
+    type !== "float" &&
+    type !== "boolean" &&
+    type !== "password" &&
+    type !== "date" &&
+    type !== "select"
+  ) {
+    throw new Error("Invalid field: type");
+  }
+
+  const field: PromptField = {
+    name: requireString(record, "name"),
+    label: requireString(record, "label"),
+    type,
+    required: Boolean(record.required),
+  };
+
+  const placeholder = optionalString(record, "placeholder");
+  if (placeholder) {
+    field.placeholder = placeholder;
+  }
+
+  const description = optionalString(record, "description");
+  if (description) {
+    field.description = description;
+  }
+
+  if (Array.isArray(record.options)) {
+    field.options = record.options.map((option, index) => normalizePromptFieldOption(option, index));
+  }
+
+  const defaultValue = record.defaultValue;
+  if (
+    defaultValue === null ||
+    typeof defaultValue === "string" ||
+    typeof defaultValue === "number" ||
+    typeof defaultValue === "boolean"
+  ) {
+    field.defaultValue = defaultValue;
+  }
+
+  return field;
+}
+
+function parsePromptStatus(value: string | null): "pending" | "completed" | "cancelled" | "all" {
+  if (value === "pending" || value === "completed" || value === "cancelled" || value === "all") {
+    return value;
+  }
+  return "pending";
+}
+
+function normalizePromptResponseValue(field: PromptField, value: unknown): unknown {
+  if (value === undefined || value === null || value === "") {
+    if (field.required) {
+      throw new Error(`Invalid field: response.${field.name}`);
+    }
+    return field.type === "boolean" ? false : null;
+  }
+
+  switch (field.type) {
+    case "boolean":
+      if (typeof value === "boolean") return value;
+      if (value === "true") return true;
+      if (value === "false") return false;
+      break;
+    case "int": {
+      const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
+      if (Number.isInteger(parsed)) return parsed;
+      break;
+    }
+    case "float": {
+      const parsed = typeof value === "number" ? value : Number.parseFloat(String(value));
+      if (!Number.isNaN(parsed)) return parsed;
+      break;
+    }
+    case "select": {
+      const normalized = String(value);
+      if (!field.options?.some((option) => option.value === normalized)) {
+        throw new Error(`Invalid field: response.${field.name}`);
+      }
+      return normalized;
+    }
+    default:
+      return String(value);
+  }
+
+  throw new Error(`Invalid field: response.${field.name}`);
+}
+
+function normalizePromptResponse(
+  prompt: { fields: PromptField[] },
+  rawResponse: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {};
+  for (const field of prompt.fields) {
+    normalized[field.name] = normalizePromptResponseValue(field, rawResponse[field.name]);
+  }
+  return normalized;
+}
+
+function parseMemoryWrite(payload: unknown): {
+  content?: string;
+  schema?: PromptField[];
+  data?: Record<string, unknown>;
+} {
+  const record = asRecord(payload);
+  const data = optionalRecord(record, "data");
+  const parsed: { content?: string; schema?: PromptField[]; data?: Record<string, unknown> } = {};
+  const content = optionalString(record, "content");
+  if (content) {
+    parsed.content = content;
+  }
+  if (data) {
+    parsed.data = data;
+  }
+  if (Array.isArray(record.schema)) {
+    parsed.schema = record.schema.map((field) => normalizePromptField(field));
+  }
+  if (!parsed.content && !parsed.data) {
+    throw new Error("Invalid request.");
+  }
+  return parsed;
 }
 
 function parseReminderCreateInput(payload: unknown): ReminderCreateInput {
@@ -232,7 +383,7 @@ export class GazabotApp {
     this.reminderScheduler = new ReminderScheduler(
       config,
       database,
-      ({ reminder, dueAt, prompt }) => this.executeReminderTurn(reminder, dueAt, prompt),
+      ({ reminder, dueAt, prompt }: { reminder: { id: string; title: string; instructions: string }; dueAt: string; prompt: string }) => this.executeReminderTurn(reminder, dueAt, prompt),
     );
     this.unsubscribeReminderChanges = this.database.subscribeReminderChanges(() => {
       this.reminderScheduler.refresh();
@@ -250,6 +401,7 @@ export class GazabotApp {
 
     const url = new URL(request.url);
     const reminderMatch = /^\/api\/reminders\/([^/]+)$/.exec(url.pathname);
+    const memoryMatch = /^\/api\/memory\/([^/]+)$/.exec(url.pathname);
 
     try {
       if (request.method === "GET" && url.pathname === "/health") {
@@ -319,6 +471,65 @@ export class GazabotApp {
         return jsonResponse(request, this.config, await this.handleTts(request));
       }
 
+      if (request.method === "GET" && url.pathname === "/api/prompts") {
+        const status = parsePromptStatus(url.searchParams.get("status"));
+        return jsonResponse(request, this.config, { prompts: this.database.listPrompts(status) });
+      }
+
+      if (request.method === "POST" && url.pathname.startsWith("/api/prompts/") && url.pathname.endsWith("/respond")) {
+        const id = url.pathname.slice("/api/prompts/".length, -"/respond".length);
+        return jsonResponse(request, this.config, await this.handlePromptRespond(request, id));
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/memory") {
+        return jsonResponse(request, this.config, { entries: this.database.listMemoryEntries() });
+      }
+
+      if (memoryMatch) {
+        const title = decodeURIComponent(memoryMatch[1] ?? "");
+        if (request.method === "GET") {
+          const entry = this.database.readMemory(title);
+          if (!entry) {
+            return errorResponse(request, this.config, 404, "Memory entry not found.");
+          }
+          return jsonResponse(request, this.config, { entry });
+        }
+
+        if (request.method === "PATCH") {
+          const payload = parseMemoryWrite(await parseJsonBody(request));
+          return jsonResponse(
+            request,
+            this.config,
+            this.database.writeMemory(
+              title,
+              payload.content ?? JSON.stringify(payload.data ?? {}, null, 2),
+              {
+                ...(payload.schema !== undefined && { schema: payload.schema }),
+                ...(payload.data !== undefined && { data: payload.data }),
+              },
+            ),
+          );
+        }
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/api/memory") {
+        const payloadRecord = asRecord(await parseJsonBody(request));
+        const title = requireString(payloadRecord, "title");
+        const payload = parseMemoryWrite(payloadRecord);
+        return jsonResponse(
+          request,
+          this.config,
+          this.database.writeMemory(
+            title,
+            payload.content ?? JSON.stringify(payload.data ?? {}, null, 2),
+            {
+              ...(payload.schema !== undefined && { schema: payload.schema }),
+              ...(payload.data !== undefined && { data: payload.data }),
+            },
+          ),
+        );
+      }
+
       return errorResponse(request, this.config, 404, "Route not found.");
     } catch (error) {
       if (error instanceof Error) {
@@ -326,15 +537,20 @@ export class GazabotApp {
           return errorResponse(request, this.config, 422, "Invalid request.", error.message);
         }
 
+        if ((error as Error & { notFound?: boolean }).notFound) {
+          return errorResponse(request, this.config, 404, error.message);
+        }
+
         if (
           error.message === "Message is required." ||
           error.message === "Invalid cron expression." ||
-          error.message.startsWith("Unknown timezone:")
+          error.message.startsWith("Unknown timezone:") ||
+          error.message.startsWith("Prompt already ")
         ) {
           return errorResponse(request, this.config, 400, error.message);
         }
 
-        if (error.message === "Reminder not found.") {
+        if (error.message === "Reminder not found." || error.message === "Memory entry not found.") {
           return errorResponse(request, this.config, 404, error.message);
         }
       }
@@ -438,6 +654,43 @@ export class GazabotApp {
     }
 
     return { spoken: false, text };
+  }
+
+  private async handlePromptRespond(request: Request, promptId: string): Promise<unknown> {
+    const prompt = this.database.getPrompt(promptId);
+    if (!prompt) {
+      throw Object.assign(new Error(`Prompt not found: ${promptId}`), { notFound: true });
+    }
+    if (prompt.status !== "pending") {
+      throw new Error(`Prompt already ${prompt.status}.`);
+    }
+
+    const body = asRecord(await parseJsonBody(request));
+    const response = body.response;
+    if (typeof response !== "object" || response === null || Array.isArray(response)) {
+      throw new Error("Invalid field: response");
+    }
+
+    const normalizedResponse = normalizePromptResponse(prompt, response as Record<string, unknown>);
+    const { prompt: completed, memoryEntry } = this.database.respondToPrompt(promptId, normalizedResponse);
+
+    const responseText = `User submitted form "${completed.title}" for ${completed.memoryKey}: ${JSON.stringify(completed.response)}`;
+    const responseEntry = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "resident",
+      text: responseText,
+      toolName: "user-prompt",
+      toolStatus: "completed",
+      metadata: {
+        promptId: completed.id,
+        memoryKey: completed.memoryKey,
+        response: completed.response,
+        memory: memoryEntry,
+      },
+    });
+    this.transcriptBus.publish("tool", responseEntry);
+
+    return { prompt: completed, memoryEntry };
   }
 
   async runReminderSchedulerOnce(now = new Date()): Promise<number> {
