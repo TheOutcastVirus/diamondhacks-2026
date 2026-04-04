@@ -212,44 +212,52 @@
     filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode);
 </script>
 
-<section class="page-grid">
+<section class="page-grid tx-console" aria-label="Live transcript">
   <section class="panel panel-feed">
-    <header class="panel-header">
-      <div>
-        <p class="panel-label">Live</p>
-        <h2 class="section-heading">Transcript</h2>
-      </div>
-
-      <div class="button-row">
-        <button class="ghost" type="button" on:click={connectStream}>Reconnect</button>
-        <button class="ghost" type="button" on:click={disconnectStream}>Pause stream</button>
-      </div>
-    </header>
-
-    <section class="toolbar">
-      <div class="filter-row" role="tablist" aria-label="Transcript filters">
-        <button class:active-filter={filterMode === 'all'} class="chip" type="button" on:click={() => (filterMode = 'all')}>
+    <header class="feed-toolbar">
+      <div class="segmented" role="tablist" aria-label="Transcript filters">
+        <button class:active-filter={filterMode === 'all'} class="seg-btn" type="button" on:click={() => (filterMode = 'all')}>
           All
         </button>
-        <button class:active-filter={filterMode === 'message'} class="chip" type="button" on:click={() => (filterMode = 'message')}>
-          Conversation
+        <button class:active-filter={filterMode === 'message'} class="seg-btn" type="button" on:click={() => (filterMode = 'message')}>
+          Chat
         </button>
-        <button class:active-filter={filterMode === 'tool'} class="chip" type="button" on:click={() => (filterMode = 'tool')}>
+        <button class:active-filter={filterMode === 'tool'} class="seg-btn" type="button" on:click={() => (filterMode = 'tool')}>
           Tools
         </button>
       </div>
 
-      <label class="switcher">
-        <input bind:checked={autoScroll} type="checkbox" />
-        <span>Auto-scroll</span>
-      </label>
-    </section>
+      <div class="toolbar-actions">
+        <label class="switcher">
+          <input bind:checked={autoScroll} type="checkbox" />
+          <span>Follow latest</span>
+        </label>
+        <div class="button-row">
+          <button class="btn-secondary" type="button" on:click={connectStream}>Reconnect</button>
+          <button class="btn-quiet" type="button" on:click={disconnectStream}>Pause</button>
+        </div>
+      </div>
+    </header>
 
     <div class="feed" data-transcript-feed>
       {#if isBootstrapping}
-        <p class="panel-copy">Loading transcript history...</p>
+        <div class="feed-state" role="status">
+          <div class="skeleton-line wide"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line narrow"></div>
+          <p class="feed-state-label">Loading history…</p>
+        </div>
       {:else if filteredEntries.length === 0}
-        <p class="panel-copy">No transcript events yet.</p>
+        <div class="feed-state feed-state-empty">
+          <p class="feed-empty-title">
+            {entries.length === 0 ? 'Quiet channel' : 'Nothing in this view'}
+          </p>
+          <p class="feed-empty-body">
+            {entries.length === 0
+              ? 'Events will appear here as soon as the agent speaks or runs a tool.'
+              : 'Switch to All or another filter to see buffered events.'}
+          </p>
+        </div>
       {:else}
         {#each filteredEntries as entry}
           <article class={`entry entry-${entry.kind}`}>
@@ -282,342 +290,742 @@
     </div>
   </section>
 
-  <section class="panel panel-sidebar">
-    <section class="callout">
-      <p class="panel-label">Status</p>
-      <h2 class="section-heading">Connection</h2>
-      <div class="status-line">
-        <span class={`live-dot live-${streamState}`}></span>
-        <strong class="status-copy">{streamState}</strong>
+  <aside class="panel panel-sidebar">
+    <section class="sidebar-card connection-card">
+      <div class="card-title-row">
+        <p class="sidebar-card-title">Connection</p>
+        <span class={`state-badge state-${streamState}`}>{streamState}</span>
       </div>
-      <p class="panel-copy">
-        {#if lastEventAt}
-          Last event: {formatLongTimestamp(lastEventAt)}
-        {:else}
-          Waiting for the first event from the robot.
-        {/if}
-      </p>
+      <div class="status-row">
+        <span class={`live-dot live-${streamState}`} aria-hidden="true"></span>
+        <p class="status-detail">
+          {#if lastEventAt}
+            Last event · {formatLongTimestamp(lastEventAt)}
+          {:else}
+            Waiting for the first event.
+          {/if}
+        </p>
+      </div>
 
       {#if streamError}
         <p class="feedback feedback-error">{streamError}</p>
       {/if}
     </section>
 
-    <section class="metrics">
-      <article class="metric-card">
+    <section class="metrics" aria-label="Session counts">
+      <article class="metric-card metric-hero">
         <p class="metric-label">Messages</p>
         <strong class="metric-value">{messageCount}</strong>
+        <p class="metric-hint">Total in buffer</p>
       </article>
-      <article class="metric-card">
-        <p class="metric-label">Tool uses</p>
-        <strong class="metric-value">{toolCount}</strong>
+      <article class="metric-card metric-stack">
+        <p class="metric-label">Tool calls</p>
+        <strong class="metric-value metric-value-sm">{toolCount}</strong>
       </article>
-      <article class="metric-card">
-        <p class="metric-label">Visible</p>
-        <strong class="metric-value">{filteredEntries.length}</strong>
+      <article class="metric-card metric-stack">
+        <p class="metric-label">In view</p>
+        <strong class="metric-value metric-value-sm">{filteredEntries.length}</strong>
       </article>
     </section>
 
-    <section class="panel panel-voice">
-      <p class="panel-label">Voice</p>
+    <section class="sidebar-card panel-voice">
+      <p class="sidebar-card-title">Voice input</p>
       <VoiceInput />
     </section>
 
-    <section class="panel panel-note">
-      <p class="panel-label">Notes</p>
+    <section class="sidebar-card panel-note">
+      <p class="sidebar-card-title">Tips</p>
       <ul class="note-list">
-        <li class="note-item">Speech and actions appear together.</li>
-        <li class="note-item">Use filters to narrow the feed.</li>
-        <li class="note-item">Reconnect if the stream drops.</li>
+        <li>Speech and tool runs show up in order.</li>
+        <li>Use Chat / Tools to focus the feed.</li>
+        <li>Reconnect if the live stream stops.</li>
       </ul>
     </section>
-  </section>
+  </aside>
 </section>
 
 <style>
-  section.page-grid {
+  section.page-grid.tx-console {
+    --tx-r: 12px;
+    --tx-r-sm: 8px;
+    --tx-ease: cubic-bezier(0.16, 1, 0.3, 1);
     display: grid;
-    grid-template-columns: minmax(0, 1.25fr) minmax(18rem, 0.75fr);
-    gap: 1.5rem;
+    grid-template-columns: minmax(0, 1.2fr) minmax(17rem, 22rem);
+    gap: 1.25rem;
+    align-items: start;
   }
 
   section.panel {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: 0.875rem;
   }
 
-  header.panel-header,
-  section.toolbar,
-  div.entry-head,
-  div.tool-foot,
-  div.status-line {
+  /* Feed chrome */
+  header.feed-toolbar {
     display: flex;
-    justify-content: space-between;
-    gap: 1rem;
+    flex-wrap: wrap;
     align-items: center;
+    justify-content: space-between;
+    gap: 0.875rem 1rem;
+    padding: 0.35rem 0;
   }
 
-  h2.section-heading {
-    margin: 0;
-    font-family: var(--font-display);
+  div.segmented {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: var(--tx-r-sm);
+    background: var(--color-panel-muted);
+    border: var(--border-width) solid var(--color-line);
+    gap: 2px;
+  }
+
+  button.seg-btn {
+    font: inherit;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    border-radius: calc(var(--tx-r-sm) - 2px);
+    padding: 0.5rem 0.95rem;
+    color: var(--color-ink-soft);
+    background: transparent;
+    transition:
+      background 140ms ease,
+      color 140ms ease;
+  }
+
+  button.seg-btn:hover,
+  button.seg-btn:focus-visible {
     color: var(--color-ink-strong);
-    font-size: clamp(1.45rem, 1.8vw, 1.95rem);
+    background: color-mix(in srgb, var(--color-panel) 80%, transparent);
   }
 
-  div.button-row,
-  div.filter-row,
-  section.metrics {
+  button.seg-btn:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--color-accent) 65%, var(--color-line));
+    outline-offset: 2px;
+  }
+
+  button.seg-btn.active-filter {
+    color: var(--color-ink-strong);
+    background: var(--color-panel);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--color-line-strong) 8%, transparent),
+      0 1px 2px color-mix(in srgb, var(--color-line-strong) 10%, transparent);
+  }
+
+  div.toolbar-actions {
     display: flex;
-    gap: 0.75rem;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1rem;
+  }
+
+  div.button-row {
+    display: flex;
+    gap: 0.5rem;
     flex-wrap: wrap;
   }
 
-  button.ghost,
-  button.chip {
+  button.btn-secondary,
+  button.btn-quiet {
     font: inherit;
+    font-size: 0.8125rem;
+    font-weight: 600;
     cursor: pointer;
-    border-radius: 0;
-    padding: 0.78rem 1rem;
-    border: var(--border-width) solid var(--color-line);
+    border-radius: var(--tx-r-sm);
+    padding: 0.5rem 0.9rem;
     transition:
-      transform 160ms ease,
-      border-color 160ms ease,
-      background 160ms ease;
+      background 140ms ease,
+      border-color 140ms ease,
+      color 140ms ease;
   }
 
-  button.ghost {
-    background: transparent;
+  button.btn-secondary {
+    border: var(--border-width) solid color-mix(in srgb, var(--color-accent) 45%, var(--color-line));
+    background: color-mix(in srgb, var(--color-accent) 10%, var(--color-panel));
     color: var(--color-ink-strong);
   }
 
-  button.chip {
-    background: var(--color-panel-muted);
-    color: var(--color-ink-strong);
-  }
-
-  button.ghost:hover,
-  button.ghost:focus-visible,
-  button.chip:hover,
-  button.chip:focus-visible,
-  button.active-filter {
-    transform: translateY(-1px);
+  button.btn-secondary:hover,
+  button.btn-secondary:focus-visible {
     border-color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 16%, var(--color-panel));
   }
 
-  button.active-filter {
-    background: color-mix(in srgb, var(--color-accent) 14%, var(--color-panel-muted));
+  button.btn-secondary:focus-visible,
+  button.btn-quiet:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  button.btn-secondary:active,
+  button.btn-quiet:active {
+    transform: translateY(1px);
+  }
+
+  button.btn-quiet {
+    border: var(--border-width) solid var(--color-line);
+    background: transparent;
+    color: var(--color-ink-soft);
+  }
+
+  button.btn-quiet:hover,
+  button.btn-quiet:focus-visible {
+    border-color: var(--color-ink-soft);
+    color: var(--color-ink-strong);
   }
 
   label.switcher {
     display: inline-flex;
     align-items: center;
-    gap: 0.65rem;
+    gap: 0.5rem;
+    font-size: 0.8125rem;
     color: var(--color-ink-soft);
+    user-select: none;
   }
 
+  label.switcher input {
+    accent-color: var(--color-accent);
+    width: 1rem;
+    height: 1rem;
+  }
+
+  /* Scroll region — utilitarian “tape” readout */
   div.feed {
-    min-height: 34rem;
-    max-height: 62vh;
+    position: relative;
+    isolation: isolate;
+    min-height: 32rem;
+    max-height: min(62vh, 720px);
     overflow: auto;
-    border-radius: 0;
+    scroll-behavior: smooth;
+    border-radius: var(--tx-r);
     border: var(--border-width) solid var(--color-line);
-    background:
-      linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 5%, transparent), transparent 20%),
-      var(--color-panel-muted);
-    padding: 1rem;
+    background-color: var(--color-bg-strong);
+    background-image:
+      linear-gradient(
+        165deg,
+        color-mix(in srgb, var(--color-accent) 4%, transparent) 0%,
+        transparent 42%
+      ),
+      repeating-linear-gradient(
+        -12deg,
+        transparent,
+        transparent 11px,
+        color-mix(in srgb, var(--color-line-strong) 3%, transparent) 11px,
+        color-mix(in srgb, var(--color-line-strong) 3%, transparent) 12px
+      );
+    padding: 0.75rem;
     display: flex;
     flex-direction: column;
-    gap: 0.85rem;
+    gap: 0.65rem;
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--color-line-strong) 5%, transparent),
+      inset 0 0 0 1px color-mix(in srgb, var(--color-panel) 40%, transparent);
+  }
+
+  div.feed-state {
+    margin: auto;
+    padding: 2.5rem 1.5rem;
+    max-width: 22rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  div.feed-state-empty {
+    max-width: 26rem;
+    text-align: center;
+    align-items: center;
+  }
+
+  p.feed-empty-title {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--color-ink-strong);
+  }
+
+  p.feed-empty-body {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.55;
+    color: var(--color-ink-soft);
+    max-width: 38ch;
+  }
+
+  p.feed-state-label {
+    margin: 0.25rem 0 0;
+    font-size: 0.8125rem;
+    color: var(--color-ink-soft);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  div.skeleton-line {
+    height: 0.55rem;
+    width: 100%;
+    max-width: 14rem;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      var(--color-panel-muted) 0%,
+      color-mix(in srgb, var(--color-accent) 12%, var(--color-panel)) 50%,
+      var(--color-panel-muted) 100%
+    );
+    background-size: 200% 100%;
+    animation: tx-shimmer 1.35s var(--tx-ease) infinite;
+  }
+
+  div.skeleton-line.wide {
+    max-width: 18rem;
+  }
+
+  div.skeleton-line.narrow {
+    max-width: 9rem;
+  }
+
+  @keyframes tx-shimmer {
+    0% {
+      background-position: 100% 0;
+    }
+    100% {
+      background-position: -100% 0;
+    }
+  }
+
+  /* Entries */
+  div.entry-head,
+  div.tool-foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: flex-start;
   }
 
   article.entry {
-    border-radius: 0;
-    padding: 1rem 1rem 0.95rem;
+    border-radius: var(--tx-r-sm);
+    padding: 0.85rem 1rem;
     border: var(--border-width) solid var(--color-line);
     background: var(--color-panel);
     display: flex;
     flex-direction: column;
-    gap: 0.8rem;
+    gap: 0.55rem;
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--color-line-strong) 5%, transparent);
+    transition:
+      border-color 0.22s var(--tx-ease),
+      transform 0.22s var(--tx-ease),
+      box-shadow 0.22s var(--tx-ease);
+  }
+
+  article.entry:hover {
+    border-color: color-mix(in srgb, var(--color-accent) 28%, var(--color-line));
+    transform: translateY(-1px);
+    box-shadow:
+      0 2px 8px color-mix(in srgb, var(--color-line-strong) 6%, transparent),
+      0 1px 0 color-mix(in srgb, var(--color-line-strong) 5%, transparent);
   }
 
   article.entry-tool {
-    background: color-mix(in srgb, var(--color-accent) 9%, var(--color-panel));
+    background: color-mix(in srgb, var(--color-accent) 6%, var(--color-panel));
+    border-color: color-mix(in srgb, var(--color-accent) 22%, var(--color-line));
   }
 
   div.entry-meta {
     display: flex;
     align-items: center;
-    gap: 0.7rem;
+    gap: 0.5rem;
     flex-wrap: wrap;
+    min-width: 0;
   }
 
   span.role-pill,
   span.status-pill {
-    border-radius: 0;
-    padding: 0.35rem 0.7rem;
-    font-size: 0.76rem;
-    text-transform: capitalize;
+    border-radius: 999px;
+    padding: 0.2rem 0.65rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
     border: var(--border-width) solid var(--color-line);
   }
 
   span.role-robot {
     color: var(--color-accent);
-    border-color: color-mix(in srgb, var(--color-accent) 35%, var(--color-line));
+    border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-line));
+    background: color-mix(in srgb, var(--color-accent) 8%, transparent);
   }
 
   span.role-resident {
     color: var(--color-warning);
     border-color: color-mix(in srgb, var(--color-warning) 35%, var(--color-line));
+    background: color-mix(in srgb, var(--color-warning) 8%, transparent);
   }
 
   span.role-system,
   span.role-guardian {
+    color: var(--color-ink-soft);
+    background: color-mix(in srgb, var(--color-panel-muted) 50%, transparent);
+  }
+
+  span.status-started {
     color: var(--color-ink-soft);
   }
 
   span.status-completed {
     color: var(--color-success);
     border-color: color-mix(in srgb, var(--color-success) 35%, var(--color-line));
+    background: color-mix(in srgb, var(--color-success) 8%, transparent);
   }
 
   span.status-failed {
     color: var(--color-danger);
     border-color: color-mix(in srgb, var(--color-danger) 35%, var(--color-line));
+    background: color-mix(in srgb, var(--color-danger) 8%, transparent);
+  }
+
+  time.timestamp {
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--color-ink-soft);
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   strong.tool-name,
-  strong.status-copy,
   strong.metric-value {
     color: var(--color-ink-strong);
   }
 
   strong.tool-name {
-    font-family: var(--font-display);
-    font-size: 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    font-weight: 600;
   }
 
   p.entry-copy {
     margin: 0;
     color: var(--color-ink-strong);
-    line-height: 1.6;
+    line-height: 1.55;
+    font-size: 0.9375rem;
   }
 
   code.meta {
-    display: inline-block;
+    display: block;
     max-width: 100%;
     overflow: auto;
     font-family: var(--font-mono);
-    font-size: 0.82rem;
-    background: color-mix(in srgb, var(--color-panel-muted) 55%, transparent);
-    border-radius: 0;
-    padding: 0.45rem 0.6rem;
+    font-size: 0.7rem;
+    line-height: 1.45;
+    color: var(--color-ink-soft);
+    background: var(--color-input);
+    border-radius: calc(var(--tx-r-sm) - 2px);
+    padding: 0.5rem 0.65rem;
+    border: var(--border-width) solid var(--color-line);
   }
 
-  section.panel-voice {
-    border-radius: 0;
+  /* Sidebar */
+  p.sidebar-card-title {
+    margin: 0;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+  }
+
+  section.sidebar-card {
+    border-radius: var(--tx-r);
     border: var(--border-width) solid var(--color-line);
     background: var(--color-panel-muted);
-    padding: 1.25rem 1rem;
+    padding: 1rem 1.1rem;
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 0.75rem;
+    gap: 0.65rem;
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--color-line-strong) 7%, transparent),
+      0 1px 0 color-mix(in srgb, var(--color-panel) 55%, transparent);
   }
 
-  section.callout,
-  article.metric-card,
-  section.panel-note {
-    border-radius: 0;
-    border: var(--border-width) solid var(--color-line);
-    background: var(--color-panel-muted);
-    padding: 1rem;
-  }
-
-  section.callout {
+  section.connection-card {
     background:
-      radial-gradient(circle at top right, color-mix(in srgb, var(--color-accent) 20%, transparent), transparent 46%),
+      radial-gradient(120% 80% at 100% 0%, color-mix(in srgb, var(--color-accent) 12%, transparent), transparent),
       var(--color-panel-muted);
   }
 
+  div.card-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  span.state-badge {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.25rem 0.55rem;
+    border-radius: 999px;
+    border: var(--border-width) solid var(--color-line);
+    color: var(--color-ink-soft);
+    background: var(--color-panel);
+  }
+
+  span.state-live {
+    color: var(--color-success);
+    border-color: color-mix(in srgb, var(--color-success) 40%, var(--color-line));
+    background: color-mix(in srgb, var(--color-success) 10%, transparent);
+  }
+
+  span.state-connecting {
+    color: var(--color-warning);
+    border-color: color-mix(in srgb, var(--color-warning) 40%, var(--color-line));
+    background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+  }
+
+  span.state-error {
+    color: var(--color-danger);
+    border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-line));
+    background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+  }
+
+  span.state-offline {
+    color: var(--color-ink-soft);
+  }
+
+  div.status-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+  }
+
+  p.status-detail {
+    margin: 0;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    color: var(--color-ink);
+  }
+
   span.live-dot {
-    inline-size: 0.8rem;
-    block-size: 0.8rem;
-    border-radius: 0;
+    inline-size: 0.55rem;
+    block-size: 0.55rem;
+    border-radius: 50%;
+    margin-top: 0.35rem;
+    flex-shrink: 0;
     background: var(--color-line-strong);
-    box-shadow: 0 0 0 0.3rem color-mix(in srgb, var(--color-line-strong) 20%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-panel) 35%, transparent);
   }
 
   span.live-live {
     background: var(--color-success);
-    box-shadow: 0 0 0 0.3rem color-mix(in srgb, var(--color-success) 20%, transparent);
   }
 
   span.live-connecting {
     background: var(--color-warning);
-    box-shadow: 0 0 0 0.3rem color-mix(in srgb, var(--color-warning) 20%, transparent);
+    animation: tx-connect-pulse 1.1s var(--tx-ease) infinite;
   }
 
   span.live-error {
     background: var(--color-danger);
-    box-shadow: 0 0 0 0.3rem color-mix(in srgb, var(--color-danger) 20%, transparent);
+  }
+
+  span.live-offline {
+    background: var(--color-ink-soft);
+  }
+
+  @keyframes tx-connect-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  p.feedback {
+    margin: 0;
+    border-radius: var(--tx-r-sm);
+    padding: 0.65rem 0.85rem;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    background: color-mix(in srgb, var(--color-danger) 10%, var(--color-panel));
+    border: var(--border-width) solid color-mix(in srgb, var(--color-danger) 28%, var(--color-line));
+    color: var(--color-danger);
+  }
+
+  /* Asymmetric metrics: primary readout + stacked secondary (not 3 equal tiles) */
+  section.metrics {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    grid-template-rows: 1fr 1fr;
+    gap: 0.5rem;
+    min-height: 6.5rem;
+  }
+
+  article.metric-card {
+    border-radius: var(--tx-r-sm);
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-panel);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-line-strong) 5%, transparent);
+  }
+
+  article.metric-hero {
+    grid-row: 1 / -1;
+    padding: 1rem 1.05rem;
+    justify-content: center;
+    text-align: left;
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--color-accent) 7%, var(--color-panel)) 0%,
+      var(--color-panel) 55%
+    );
+    border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-line));
+  }
+
+  article.metric-stack {
+    padding: 0.65rem 0.75rem;
+    justify-content: center;
+    text-align: right;
+  }
+
+  p.metric-label {
+    margin: 0;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+  }
+
+  p.metric-hint {
+    margin: 0;
+    font-size: 0.6875rem;
+    color: var(--color-ink-soft);
+    line-height: 1.35;
+    max-width: 12rem;
   }
 
   strong.metric-value {
-    font-family: var(--font-display);
-    font-size: 1.55rem;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 2rem;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    color: var(--color-ink-strong);
+  }
+
+  strong.metric-value-sm {
+    font-size: 1.35rem;
+  }
+
+  section.panel-voice {
+    align-items: center;
+    text-align: center;
   }
 
   ul.note-list {
     margin: 0;
-    padding-left: 1.15rem;
+    padding-left: 1.1rem;
     display: grid;
-    gap: 0.65rem;
-  }
-
-  li.note-item {
+    gap: 0.45rem;
+    font-size: 0.8125rem;
+    line-height: 1.45;
     color: var(--color-ink-soft);
   }
 
-  p.feedback {
-    margin: 0.75rem 0 0;
-    border-radius: 0;
-    padding: 0.85rem 1rem;
-    background: color-mix(in srgb, var(--color-danger) 12%, transparent);
-    border: var(--border-width) solid var(--color-line);
-    color: var(--color-danger);
+  @media (prefers-reduced-motion: reduce) {
+    div.skeleton-line {
+      animation: none;
+      background: var(--color-panel-muted);
+    }
+
+    span.live-connecting {
+      animation: none;
+    }
+
+    article.entry {
+      transition: none;
+    }
+
+    article.entry:hover {
+      transform: none;
+    }
+
+    div.feed {
+      scroll-behavior: auto;
+    }
   }
 
   @media (max-width: 1080px) {
-    section.page-grid {
+    section.page-grid.tx-console {
       grid-template-columns: 1fr;
     }
   }
 
   @media (max-width: 720px) {
-    header.panel-header,
-    section.toolbar,
+    header.feed-toolbar {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    div.toolbar-actions {
+      justify-content: space-between;
+    }
+
+    div.segmented {
+      width: 100%;
+      justify-content: stretch;
+    }
+
+    button.seg-btn {
+      flex: 1;
+      text-align: center;
+      padding-inline: 0.5rem;
+    }
+
     div.entry-head,
     div.tool-foot {
       flex-direction: column;
       align-items: flex-start;
     }
 
-    div.button-row,
-    div.filter-row,
-    section.metrics {
+    div.button-row {
       width: 100%;
     }
 
-    button.ghost,
-    button.chip {
-      flex: 1 1 0;
+    button.btn-secondary,
+    button.btn-quiet {
+      flex: 1;
+      text-align: center;
+    }
+
+    section.metrics {
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto auto;
+      min-height: unset;
+    }
+
+    article.metric-hero {
+      grid-column: 1 / -1;
+      grid-row: auto;
+    }
+
+    article.metric-stack {
       text-align: center;
     }
 
     div.feed {
       max-height: none;
-      min-height: 24rem;
+      min-height: 22rem;
     }
   }
 </style>

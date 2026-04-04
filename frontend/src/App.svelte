@@ -17,10 +17,10 @@
     },
     {
       id: 'transcription',
-      label: 'Transcription',
-      eyebrow: 'Transcript',
-      title: 'Transcription',
-      description: 'Live conversation and actions.',
+      label: 'Transcript',
+      eyebrow: 'Live feed',
+      title: 'Transcript',
+      description: 'Conversation, tools, and agent actions in one stream.',
       metricLabel: 'Live',
     },
     {
