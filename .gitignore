@@ -6,3 +6,5 @@ backend/data/
 __pycache__/
 .pytest_cache/
 .vscode/*
+node_modules
+bun.lock
