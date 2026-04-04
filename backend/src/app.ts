@@ -11,6 +11,7 @@ import type {
   TranscriptRole,
 } from "./contracts";
 import { AgentHarness, type AgentTurnResult } from "./agent";
+import { AudioService } from "./audio";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
 import { ReminderScheduler } from "./reminder-scheduler";
@@ -380,6 +381,8 @@ export class GazabotApp {
 
   private readonly ttsService: TtsService;
 
+  private readonly audioService = new AudioService();
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
@@ -481,6 +484,14 @@ export class GazabotApp {
 
       if (request.method === "POST" && url.pathname === "/api/agent/voice-turn") {
         return this.handleVoiceTurn(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/agent/voice-start") {
+        return jsonResponse(request, this.config, await this.handleVoiceStart());
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/agent/voice-stop") {
+        return jsonResponse(request, this.config, await this.handleVoiceStop());
       }
 
       if (request.method === "GET" && url.pathname === "/api/prompts") {
@@ -654,22 +665,10 @@ export class GazabotApp {
     return eventStreamResponse(request, this.config, stream);
   }
 
-  private async handleVoiceTurn(request: Request): Promise<Response> {
-    let formData: Awaited<ReturnType<Request["formData"]>>;
-    try {
-      formData = await request.formData();
-    } catch {
-      return errorResponse(request, this.config, 422, "Expected multipart/form-data.");
-    }
-
-    const audioField = formData.get("audio");
-    if (!audioField || !(audioField instanceof File)) {
-      return errorResponse(request, this.config, 422, "Missing audio field.");
-    }
-
-    const transcript = await this.sttService.transcribe(audioField);
+  private async processVoiceAudio(audio: File | Blob | Buffer): Promise<{ transcript: string; replyText: string }> {
+    const transcript = await this.sttService.transcribe(audio);
     if (!transcript.trim()) {
-      return errorResponse(request, this.config, 422, "No speech detected.");
+      throw Object.assign(new Error("No speech detected."), { noSpeech: true });
     }
 
     const userEntry = this.database.createTranscriptEntry({
@@ -697,14 +696,66 @@ export class GazabotApp {
       this.transcriptBus.publish("transcript", robotEntry);
     }
 
-    const audioOut = await this.ttsService.synthesize(replyText);
+    return { transcript, replyText };
+  }
 
-    return new Response(audioOut, {
-      headers: {
-        "Content-Type": "audio/mpeg",
-        ...corsHeaders(request, this.config),
-      },
+  private async handleVoiceTurn(request: Request): Promise<Response> {
+    let formData: Awaited<ReturnType<Request["formData"]>>;
+    try {
+      formData = await request.formData();
+    } catch {
+      return errorResponse(request, this.config, 422, "Expected multipart/form-data.");
+    }
+
+    const audioField = formData.get("audio");
+    if (!audioField || !(audioField instanceof File)) {
+      return errorResponse(request, this.config, 422, "Missing audio field.");
+    }
+
+    let result: { transcript: string; replyText: string };
+    try {
+      result = await this.processVoiceAudio(audioField);
+    } catch (err) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
+        return errorResponse(request, this.config, 422, err.message);
+      }
+      throw err;
+    }
+
+    const audioOut = await this.ttsService.synthesize(result.replyText);
+    // Play on backend speaker; do not return audio to the client
+    this.audioService.playAudio(audioOut).catch((err) => {
+      console.error("[voice] Playback error:", err);
     });
+
+    return jsonResponse(request, this.config, { ok: true, transcript: result.transcript });
+  }
+
+  private async handleVoiceStart(): Promise<{ ok: boolean }> {
+    await this.audioService.startRecording();
+    return { ok: true };
+  }
+
+  private async handleVoiceStop(): Promise<{ ok: boolean; transcript: string }> {
+    const audioBuffer = await this.audioService.stopRecording();
+
+    let result: { transcript: string; replyText: string };
+    try {
+      result = await this.processVoiceAudio(audioBuffer);
+    } catch (err) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
+        return { ok: false, transcript: "" };
+      }
+      throw err;
+    }
+
+    const audioOut = await this.ttsService.synthesize(result.replyText);
+    // Play on backend speaker asynchronously so the HTTP response returns promptly
+    this.audioService.playAudio(audioOut).catch((err) => {
+      console.error("[voice] Playback error:", err);
+    });
+
+    return { ok: true, transcript: result.transcript };
   }
 
   private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {
