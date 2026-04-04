@@ -1,0 +1,61 @@
+camera_publisher_node:
+  ros__parameters:
+    # Camera device index: 0 = /dev/video0, 1 = /dev/video1
+    camera_device: 0
+    frame_width: 640
+    frame_height: 480
+    # 10 fps — MobileNet SSD takes ~135ms/frame so 30fps just queues up frames
+    publish_rate: 10.0
+
+human_follower_node:
+  ros__parameters:
+
+    # -----------------------------------------------------------------------
+    # Drive speeds
+    # -----------------------------------------------------------------------
+    linear_speed: 0.3          # m/s forward while approaching
+    angular_speed: 0.5         # rad/s max yaw correction
+    search_angular_speed: 0.3  # rad/s spin while no person detected
+
+    # -----------------------------------------------------------------------
+    # Proximity thresholds (bounding-box area in pixels² at 640x480)
+    # Larger area = person is closer to the camera.
+    # -----------------------------------------------------------------------
+    target_box_area_min: 8000.0    # below this → far, start approaching
+    target_box_area_max: 40000.0   # above this → close enough, hold
+
+    # -----------------------------------------------------------------------
+    # Control gains
+    # -----------------------------------------------------------------------
+    lateral_gain: 1.8    # normalised lateral error → yaw command
+    pan_gain: 0.06       # deg/px for camera pan correction
+
+    # -----------------------------------------------------------------------
+    # Camera / gimbal settings
+    # -----------------------------------------------------------------------
+    tilt_offset_deg: 45.0          # static tilt (positive = look up)
+    pan_limit_deg: 60.0            # max pan from centre (±degrees)
+    camera_search_sweep_deg: 45.0  # pan sweep amplitude while SEARCHING
+    camera_search_speed: 2.0       # pan sweep step per frame (degrees)
+
+    # -----------------------------------------------------------------------
+    # MobileNet SSD detector
+    # Paths to the Caffe model already on disk (same files used by cv_ctrl.py).
+    # confidence_threshold: raise to reduce false positives, lower to catch
+    # detections further away.  0.45 is a good starting point.
+    # -----------------------------------------------------------------------
+    model_prototxt: '/home/dronelab/ugv_jetson/models/deploy.prototxt'
+    model_weights:  '/home/dronelab/ugv_jetson/models/mobilenet_iter_73000.caffemodel'
+    confidence_threshold: 0.05
+    # Set to true to open the annotated OpenCV window alongside the node.
+    # Reuses the detection result — no extra inference cost.
+    show_viewer: false
+
+    # -----------------------------------------------------------------------
+    # Hardware integration
+    # -----------------------------------------------------------------------
+    serial_port: '/dev/ttyTHS1'
+    wheel_separation: 0.3   # meters — tune to actual track width
+    gimbal_spd_rate: 60.0   # matches config.yaml cv.track_spd_rate
+    gimbal_acc_rate: 0.4    # matches config.yaml cv.track_acc_rate
+    gimbal_max_spd: 500.0   # upper cap on SPD command value
