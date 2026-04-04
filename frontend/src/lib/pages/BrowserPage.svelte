@@ -220,12 +220,6 @@
 </section>
 
 <style>
-  section.page-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(18rem, 0.8fr);
-    gap: 1.5rem;
-  }
-
   section.panel {
     display: flex;
     flex-direction: column;
@@ -397,12 +391,6 @@
     background: color-mix(in srgb, var(--color-danger) 12%, transparent);
     border: 2px solid var(--color-line);
     color: var(--color-danger);
-  }
-
-  @media (max-width: 1080px) {
-    section.page-grid {
-      grid-template-columns: 1fr;
-    }
   }
 
   @media (max-width: 720px) {
