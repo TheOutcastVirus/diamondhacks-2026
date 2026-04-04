@@ -76,7 +76,7 @@ main.workspace {
 
 aside.sidebar {
   border-radius: var(--radius-shell);
-  border-right: 0;
+  border-right: 0px;
   padding: 2rem;
   display: flex;
   flex-direction: column;
@@ -85,6 +85,7 @@ aside.sidebar {
   position: sticky;
   box-sizing: border-box;
   border-right: var(--border-width) solid var(--color-line);
+  top: 0px;
 }
 
 main.workspace {
