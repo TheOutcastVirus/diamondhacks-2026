@@ -166,7 +166,17 @@
       <p class="panel-copy">Current browser work.</p>
     </section>
 
-    {#if browserContext.screenshotUrl}
+    {#if browserContext.previewUrl}
+      <section class="panel panel-muted">
+        <p class="panel-label">Live preview</p>
+        <iframe
+          class="preview-frame"
+          src={browserContext.previewUrl}
+          title="Live Browser Use session"
+          loading="lazy"
+        ></iframe>
+      </section>
+    {:else if browserContext.screenshotUrl}
       <section class="panel panel-muted">
         <p class="panel-label">Visual preview</p>
         <img class="preview-image" src={browserContext.screenshotUrl} alt="Robot browser preview" />
@@ -220,6 +230,12 @@
 </section>
 
 <style>
+  section.page-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(18rem, 0.8fr);
+    gap: 1.5rem;
+  }
+
   section.panel {
     display: flex;
     flex-direction: column;
@@ -346,6 +362,13 @@
     object-fit: cover;
   }
 
+  iframe.preview-frame {
+    width: 100%;
+    min-height: 24rem;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-input);
+  }
+
   pre.snippet {
     margin: 0;
     padding: 1rem;
@@ -391,6 +414,12 @@
     background: color-mix(in srgb, var(--color-danger) 12%, transparent);
     border: 2px solid var(--color-line);
     color: var(--color-danger);
+  }
+
+  @media (max-width: 1080px) {
+    section.page-grid {
+      grid-template-columns: 1fr;
+    }
   }
 
   @media (max-width: 720px) {
