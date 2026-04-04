@@ -34,6 +34,13 @@ export type AppConfig = {
   tts: {
     endpoint?: string;
   };
+  assemblyAi: {
+    apiKey: string;
+  };
+  elevenLabs: {
+    apiKey: string;
+    voiceId: string;
+  };
 };
 
 type EnvSource = Record<string, string | undefined>;
@@ -149,7 +156,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   const imagine: AppConfig["imagine"] = {
     apiKey: source.INFERENCE_CLOUD_API_KEY?.trim() || "",
     endpoint: source.INFERENCE_CLOUD_ENDPOINT?.trim() || "https://aisuite.cirrascale.com/apis/v2",
-    model: "Llama-3.1-8B",
+    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-8B",
     maxTokens: parseInteger(source.INFERENCE_CLOUD_MAX_TOKENS, 1024),
     maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
   };
@@ -175,5 +182,12 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     },
     imagine,
     tts,
+    assemblyAi: {
+      apiKey: source.ASSEMBLY_API_KEY?.trim() || "",
+    },
+    elevenLabs: {
+      apiKey: source.ELEVEN_LABS_API_KEY?.trim() || "",
+      voiceId: source.ELEVEN_LABS_VOICE_ID?.trim() || "21m00Tcm4TlvDq8ikWAM",
+    },
   };
 }

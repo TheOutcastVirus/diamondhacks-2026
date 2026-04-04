@@ -1,4 +1,5 @@
 export type ThemeMode = 'light' | 'dark';
+export type RecordingState = 'idle' | 'recording' | 'processing';
 export type PageId = 'reminders' | 'transcription' | 'browser';
 export type EndpointKey = 'reminders' | 'browser' | 'transcript' | 'transcriptStream';
 
