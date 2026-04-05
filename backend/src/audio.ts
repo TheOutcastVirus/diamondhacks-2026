@@ -428,7 +428,7 @@ export class AudioService {
       this.proc          = child;
       this.recordingPath = outPath;
 
-      const bytesPer20ms = 640; // 16 kHz * 1 ch * 2 bytes * 0.02 s
+      const bytesPer800ms = 25600; // 16 kHz * 1 ch * 2 bytes * 0.8 s
       let pcmTail = Buffer.alloc(0);
       let pcmWindowIndex = 0;
 
@@ -486,9 +486,9 @@ export class AudioService {
 
       child.stdout?.on("data", (chunk: Buffer) => {
         pcmTail = Buffer.concat([pcmTail, chunk]);
-        while (pcmTail.length >= bytesPer20ms) {
-          const frame = pcmTail.subarray(0, bytesPer20ms);
-          pcmTail = pcmTail.subarray(bytesPer20ms);
+        while (pcmTail.length >= bytesPer800ms) {
+          const frame = pcmTail.subarray(0, bytesPer800ms);
+          pcmTail = pcmTail.subarray(bytesPer800ms);
           pcmWindowIndex += 1;
 
           let sumSquares = 0;
@@ -502,7 +502,7 @@ export class AudioService {
           const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
           const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
           process.stderr.write(
-            `[audio:level:win] ${(pcmWindowIndex * 20).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+            `[audio:level:win] ${(pcmWindowIndex * 800).toString().padStart(5, " ")}ms ${label} dBFS\n`,
           );
         }
       });
@@ -592,7 +592,7 @@ export class AudioService {
       this.proc          = child;
       this.recordingPath = null;
 
-      const bytesPer20ms = 640; // 16 kHz * 1 ch * 2 bytes * 0.02 s
+      const bytesPer800ms = 25600; // 16 kHz * 1 ch * 2 bytes * 0.8 s
       let pcmTail = Buffer.alloc(0);
       let pcmWindowIndex = 0;
 
@@ -615,9 +615,9 @@ export class AudioService {
         onChunk(chunk);
 
         pcmTail = Buffer.concat([pcmTail, chunk]);
-        while (pcmTail.length >= bytesPer20ms) {
-          const frame = pcmTail.subarray(0, bytesPer20ms);
-          pcmTail = pcmTail.subarray(bytesPer20ms);
+        while (pcmTail.length >= bytesPer800ms) {
+          const frame = pcmTail.subarray(0, bytesPer800ms);
+          pcmTail = pcmTail.subarray(bytesPer800ms);
           pcmWindowIndex += 1;
 
           let sumSquares = 0;
@@ -631,7 +631,7 @@ export class AudioService {
           const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
           const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
           process.stderr.write(
-            `[audio:level:mac] ${(pcmWindowIndex * 20).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+            `[audio:level:mac] ${(pcmWindowIndex * 800).toString().padStart(5, " ")}ms ${label} dBFS\n`,
           );
         }
       });
