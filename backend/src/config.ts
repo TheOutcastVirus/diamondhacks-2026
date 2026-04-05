@@ -11,6 +11,9 @@ export type AppConfig = {
   reminders: {
     enabled: boolean;
   };
+  wakeWord: {
+    enabled: boolean;
+  };
   browserUse: {
     apiKey?: string;
     baseUrl: string;
@@ -21,6 +24,11 @@ export type AppConfig = {
     proxyCountryCode?: string;
     pollIntervalMs: number;
     maxPollAttempts: number;
+    authStatePath?: string;
+    liveEmbed: {
+      theme?: "dark" | "light";
+      ui?: boolean;
+    };
   };
   agent: {
     chunkDelayMs: number;
@@ -142,13 +150,25 @@ function resolveBrowserUseModel(value: string | undefined): string {
 }
 
 export function loadConfig(source: EnvSource = process.env): AppConfig {
+  const liveEmbedConfig: AppConfig["browserUse"]["liveEmbed"] = {};
+  const liveTheme = source.BROWSER_USE_LIVE_THEME?.trim().toLowerCase();
+  if (liveTheme === "dark" || liveTheme === "light") {
+    liveEmbedConfig.theme = liveTheme;
+  }
+  const liveUiRaw = source.BROWSER_USE_LIVE_UI?.trim();
+  if (liveUiRaw !== undefined) {
+    liveEmbedConfig.ui = parseBoolean(liveUiRaw, true);
+  }
+
   const browserUse: AppConfig["browserUse"] = {
     baseUrl: source.BROWSER_USE_BASE_URL?.trim() || "https://api.browser-use.com/api/v3",
     model: resolveBrowserUseModel(source.BROWSER_USE_MODEL),
-    keepAlive: parseBoolean(source.BROWSER_USE_KEEP_ALIVE, true),
+    // Default to ending sessions after each task unless explicitly kept alive via env.
+    keepAlive: parseBoolean(source.BROWSER_USE_KEEP_ALIVE, false),
     idleStopSeconds: parseInteger(source.BROWSER_USE_IDLE_STOP_SECONDS, 900),
     pollIntervalMs: parseInteger(source.BROWSER_USE_POLL_INTERVAL_MS, 2000),
     maxPollAttempts: parseInteger(source.BROWSER_USE_MAX_POLL_ATTEMPTS, 120),
+    liveEmbed: liveEmbedConfig,
   };
   const apiKey = source.BROWSER_USE_API_KEY?.trim();
   const profileId = source.BROWSER_USE_PROFILE_ID?.trim();
@@ -162,6 +182,10 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   }
   if (proxyCountryCode) {
     browserUse.proxyCountryCode = proxyCountryCode;
+  }
+  const authStatePath = source.BROWSER_USE_AUTH_STATE_PATH?.trim();
+  if (authStatePath) {
+    browserUse.authStatePath = authStatePath;
   }
 
   const imagine: AppConfig["imagine"] = {
@@ -196,6 +220,9 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     allowedOrigins: parseOrigins(source.ALLOWED_ORIGINS),
     reminders: {
       enabled: parseBoolean(source.REMINDER_SCHEDULER_ENABLED, true),
+    },
+    wakeWord: {
+      enabled: parseBoolean(source.WAKE_WORD_ENABLED, true),
     },
     browserUse,
     agent: {

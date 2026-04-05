@@ -27,6 +27,23 @@ import type {
 import { computeNextRun } from "./cron";
 import { resolveReminderTimezone } from "./reminders";
 
+function isSqliteBusyError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: string }).code;
+    if (
+      code === "SQLITE_BUSY" ||
+      code === "SQLITE_BUSY_RECOVERY" ||
+      code === "SQLITE_LOCKED"
+    ) {
+      return true;
+    }
+  }
+  if (error instanceof Error && /\b(locked|busy)\b/i.test(error.message)) {
+    return true;
+  }
+  return false;
+}
+
 type ReminderRow = {
   id: string;
   title: string;
@@ -452,13 +469,52 @@ export class GazabotDatabase {
 
   constructor(path: string) {
     this.database = new Database(path, { create: true, strict: true });
-    this.database.exec("PRAGMA journal_mode = WAL;");
+    // Wait on contention instead of failing immediately (dev: duplicate `bun run dev`, DB GUIs, WAL recovery).
+    this.database.exec("PRAGMA busy_timeout = 10000;");
+    this.ensureWalMode(path);
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.initialize();
   }
 
+  private ensureWalMode(pathForHint: string): void {
+    const attempts = 12;
+    const pauseMs = 250;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        this.database.exec("PRAGMA journal_mode = WAL;");
+        return;
+      } catch (error) {
+        const last = i === attempts - 1;
+        if (!isSqliteBusyError(error) || last) {
+          const hint =
+            "If another `bun run dev` (or a SQLite GUI) has this file open, stop it or use one server instance.";
+          const wrapped =
+            error instanceof Error
+              ? new Error(`${error.message} (${pathForHint}). ${hint}`, { cause: error })
+              : error;
+          throw wrapped;
+        }
+        Bun.sleepSync(pauseMs);
+      }
+    }
+  }
+
   close(): void {
     this.database.close(false);
+  }
+
+  /**
+   * Wipe all session data — transcript, browser state, prompts, HITL requests,
+   * and shopping orders. Memory and reminders are preserved so the bot retains
+   * saved payment/address/preferences across resets.
+   */
+  resetSession(): void {
+    this.database.query("DELETE FROM transcript_entries").run();
+    this.database.query("DELETE FROM browser_actions").run();
+    this.database.query("DELETE FROM browser_sessions").run();
+    this.database.query("DELETE FROM browser_hitl_requests").run();
+    this.database.query("DELETE FROM user_prompts").run();
+    this.database.query("DELETE FROM shopping_orders").run();
   }
 
   subscribeReminderChanges(listener: () => void): () => void {
@@ -1041,9 +1097,13 @@ export class GazabotDatabase {
     return serializeBrowserAction(row);
   }
 
+  /**
+   * Latest inserted session wins (rowid). Using last_updated would let a stale
+   * in-flight poll on an old session steal the UI from a newer task.
+   */
   getCurrentBrowserContext(): BrowserContext {
     const session = this.database
-      .query("SELECT * FROM browser_sessions ORDER BY last_updated DESC LIMIT 1")
+      .query("SELECT * FROM browser_sessions ORDER BY rowid DESC LIMIT 1")
       .get() as BrowserSessionRow | null;
     if (!session) {
       return {
@@ -1057,6 +1117,48 @@ export class GazabotDatabase {
       .all(session.id) as BrowserActionRow[];
 
     return serializeBrowserContext(session, actionRows.map(serializeBrowserAction));
+  }
+
+  /** Mark a session as replaced so it no longer competes with newer tasks (UI + polling). */
+  supersedeBrowserSession(browserSessionId: string): void {
+    const existing = this.database
+      .query("SELECT * FROM browser_sessions WHERE id = ?1")
+      .get(browserSessionId) as BrowserSessionRow | null;
+    if (!existing) {
+      return;
+    }
+
+    const lastUpdated = nowIso();
+    this.database
+      .query(
+        `
+          UPDATE browser_sessions
+          SET status = 'idle',
+              summary = ?2,
+              active_task = NULL,
+              preview_url = NULL,
+              screenshot_url = NULL,
+              last_updated = ?3
+          WHERE id = ?1
+        `,
+      )
+      .run(browserSessionId, "Stopped — a new browser task replaced this session.", lastUpdated);
+
+    this.database
+      .query(
+        `
+          INSERT INTO browser_actions (id, session_id, kind, detail, timestamp, status)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        `,
+      )
+      .run(
+        prefixedId("a"),
+        browserSessionId,
+        "superseded",
+        "This session was replaced by a newer browser task.",
+        lastUpdated,
+        "failed",
+      );
   }
 
   listMemoryTitles(): string[] {

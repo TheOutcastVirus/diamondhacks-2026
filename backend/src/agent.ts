@@ -5,6 +5,7 @@ import type {
   ReminderCadence,
   ReminderUpdateInput,
 } from "./contracts";
+import { detectFoodPlatform, isCvsTask } from "./order-tasks";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
@@ -129,7 +130,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "run_browser_task",
       description:
-        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Before placing any order, ensure payment_card and delivery_address are stored in memory; if missing, call request_user_input first.",
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately — the browser agent will automatically pause and ask the user for payment or delivery details if needed during checkout.",
       parameters: {
         type: "object",
         properties: {
@@ -661,6 +662,7 @@ Ending:
 
         case "run_browser_task": {
           const task = String(args.task ?? "");
+
           const session = this.database.beginBrowserTask(task, profileId);
           const queuedEntry = this.database.createTranscriptEntry({
             kind: "tool",
@@ -861,6 +863,10 @@ Ending:
       if (browserTask) {
         return { kind: "browser_task", ...browserTask };
       }
+      return {
+        kind: "text",
+        text: "Could not start the browser task yet. For orders, save payment and delivery details in Memory, or finish any forms in Requested Info, then try again.",
+      };
     }
 
     if (!this.config.imagine.apiKey.trim()) {
@@ -889,9 +895,13 @@ Ending:
 
         let promptSent = false;
         let endConversation = false;
+        let dispatchedBrowser: { browserSessionId: string; previewUrl: string | null } | undefined;
         for (const toolCall of toolCalls) {
           const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
-          if (bt) browserTask = bt;
+          if (bt) {
+            browserTask = bt;
+            dispatchedBrowser = bt;
+          }
           if (toolCall.function.name === "request_user_input") promptSent = true;
           if (toolCall.function.name === "end_conversation") endConversation = true;
           messages.push({
@@ -899,6 +909,9 @@ Ending:
             tool_call_id: toolCall.id,
             content: JSON.stringify(result),
           });
+        }
+        if (dispatchedBrowser) {
+          return { kind: "browser_task", ...dispatchedBrowser };
         }
         // Stop looping once a user input form has been sent — further iterations would duplicate it
         if (promptSent) {

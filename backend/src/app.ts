@@ -598,7 +598,11 @@ export class GazabotApp {
     this.reminderScheduler.start();
     this.sttService = new SttService(config);
     this.ttsService = new TtsService(config);
-    this.startWakeWordListener();
+    if (config.wakeWord.enabled) {
+      this.startWakeWordListener();
+    } else {
+      console.log("[wake-word] Disabled (set WAKE_WORD_ENABLED=false).");
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -708,6 +712,12 @@ export class GazabotApp {
       if (request.method === "POST" && url.pathname.startsWith("/api/prompts/") && url.pathname.endsWith("/respond")) {
         const id = url.pathname.slice("/api/prompts/".length, -"/respond".length);
         return jsonResponse(request, this.config, await this.handlePromptRespond(request, id));
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/reset") {
+        this.database.resetSession();
+        console.log("[reset] Session data cleared (transcript, browser, prompts, orders).");
+        return jsonResponse(request, this.config, { status: "ok", message: "Session reset." });
       }
 
       if (request.method === "GET" && url.pathname === "/api/memory") {

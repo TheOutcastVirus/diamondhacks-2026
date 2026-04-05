@@ -45,6 +45,38 @@ export function buildUrl(endpoint: EndpointKey | string, query?: Record<string, 
   return url.toString();
 }
 
+function isNetworkFailure(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    error.name === 'TypeError' ||
+    message.includes('networkerror') ||
+    message.includes('failed to fetch') ||
+    message.includes('load failed')
+  );
+}
+
+function toApiError(error: unknown, endpoint: EndpointKey | string): ApiError {
+  if (error instanceof ApiError) {
+    return error;
+  }
+
+  if (isNetworkFailure(error)) {
+    const path = resolvePath(endpoint);
+    const message =
+      path === '/api/browser' || path === '/api/agent/turn'
+        ? 'Unable to reach the backend or Browser Use service. Check that the backend is running, then try again.'
+        : 'Unable to reach the backend. Check that the server is running, then try again.';
+    return new ApiError(message, 0, null);
+  }
+
+  if (error instanceof Error) {
+    return new ApiError(error.message, 0, null);
+  }
+
+  return new ApiError('Unexpected request failure.', 0, null);
+}
+
 async function parseResponse(response: Response) {
   if (response.status === 204) {
     return null;
@@ -65,16 +97,21 @@ async function request<T>(
   options: RequestOptions = {},
 ) {
   const { body, query, headers, ...rest } = options;
-  const response = await fetch(buildUrl(endpoint, query), {
-    method,
-    headers: {
-      Accept: 'application/json, text/plain;q=0.9, */*;q=0.8',
-      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      ...headers,
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-    ...rest,
-  });
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(endpoint, query), {
+      method,
+      headers: {
+        Accept: 'application/json, text/plain;q=0.9, */*;q=0.8',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...headers,
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...rest,
+    });
+  } catch (error) {
+    throw toApiError(error, endpoint);
+  }
 
   const payload = await parseResponse(response);
 
@@ -116,7 +153,12 @@ export function del<T>(endpoint: EndpointKey | string, options?: Omit<RequestOpt
 export async function postAudio(endpoint: EndpointKey | string, blob: Blob): Promise<ArrayBuffer> {
   const form = new FormData();
   form.append('audio', blob, 'recording.webm');
-  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  } catch (error) {
+    throw toApiError(error, endpoint);
+  }
   if (!response.ok) {
     throw new ApiError(`Audio request failed`, response.status, null);
   }
@@ -136,7 +178,12 @@ export async function uploadFile(
     }
   }
 
-  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  } catch (error) {
+    throw toApiError(error, endpoint);
+  }
   const payload = await parseResponse(response);
   if (!response.ok) {
     const message =

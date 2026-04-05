@@ -26,7 +26,7 @@
     {
       id: 'browser',
       label: 'Browser',
-      eyebrow: 'Browser',
+      eyebrow: '',
       title: 'Browser',
       description: 'Current page, task, and recent actions.',
       metricLabel: 'Session',

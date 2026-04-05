@@ -458,6 +458,86 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("surfaces Browser Use network failures as actionable browser status", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_1",
+                    type: "function",
+                    function: {
+                      name: "run_browser_task",
+                      arguments: JSON.stringify({
+                        task: "Check the weather in the browser.",
+                      }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        throw new TypeError("NetworkError when attempting to fetch resource.");
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Check the weather in the browser.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        expect(browserResponse.status).toBe(200);
+        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
+        expect(browserPayload.browser.status).toBe("blocked");
+        expect(String(browserPayload.browser.summary)).toContain("Browser Use is unreachable");
+
+        const transcriptResponse = await app.fetch(new Request("http://localhost/api/transcript"));
+        expect(transcriptResponse.status).toBe(200);
+        const transcriptPayload = (await transcriptResponse.json()) as {
+          entries: Array<{ text: string; role: string }>;
+        };
+        expect(
+          transcriptPayload.entries.some(
+            (entry) =>
+              entry.role === "robot" &&
+              entry.text.includes("I couldn't reach Browser Use right now."),
+          ),
+        ).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("updates reminders from agent tool calls that use reminderId and records the JSON result", async () => {
     let completionRound = 0;
     const { app, database } = createTestApp();
@@ -702,6 +782,29 @@ describe("Gazabot Bun backend", () => {
       });
 
       try {
+        database.writeMemory("payment_card", "Test card on file", {
+          data: {
+            cardholder_name: "Test User",
+            card_number: "4242424242424242",
+            exp_month: "12",
+            exp_year: "2030",
+            cvv: "123",
+            billing_zip: "94102",
+          },
+        });
+        database.writeMemory("delivery_address", "Test delivery address", {
+          data: {
+            full_name: "Test User",
+            line_1: "1 Market St",
+            line_2: "",
+            city: "San Francisco",
+            state_or_region: "CA",
+            postal_code: "94102",
+            country: "US",
+            phone_number: "5555555555",
+          },
+        });
+
         const firstOrderResponse = await app.fetch(
           new Request("http://localhost/api/agent/turn", {
             method: "POST",
@@ -1544,6 +1647,111 @@ trailer <<>>
         const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Example opened.");
+        // previewUrl is populated from liveUrl and no embed params are added when config is unset
+        expect(browserPayload.browser.previewUrl).toBe("https://live.example/session");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("applies live embed query params to previewUrl when BROWSER_USE_LIVE_THEME and BROWSER_USE_LIVE_UI are set", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_embed",
+                      type: "function",
+                      function: {
+                        name: "run_browser_task",
+                        arguments: JSON.stringify({ task: "Open example.com in the browser." }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          });
+        }
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Done." },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/sessions") && init?.method === "POST") {
+          return jsonResponse({ id: "embed-sess-1", status: "running", liveUrl: "https://live.example/embed-session" });
+        }
+        if (init?.method === "GET" && /\/sessions\/[^/]+$/.test(path) && !path.endsWith("/stop")) {
+          return jsonResponse({
+            id: "embed-sess-1",
+            status: "completed",
+            output: { summary: "Embed test done." },
+            title: "Embed Test",
+            url: "https://example.com",
+            liveUrl: "https://live.example/embed-session",
+          });
+        }
+        if (init?.method === "POST" && path.includes("/stop")) {
+          return jsonResponse({});
+        }
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        BROWSER_USE_LIVE_THEME: "dark",
+        BROWSER_USE_LIVE_UI: "false",
+      });
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Open example.com in the browser.",
+              source: "dashboard",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+
+        await new Promise((resolve) => setTimeout(resolve, 750));
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
+        expect(browserPayload.browser.status).toBe("idle");
+        // previewUrl should have embed params appended
+        const previewUrl = String(browserPayload.browser.previewUrl ?? "");
+        expect(previewUrl).toContain("theme=dark");
+        expect(previewUrl).toContain("ui=false");
+        expect(previewUrl).toContain("live.example/embed-session");
       } finally {
         app.close();
         database.close();

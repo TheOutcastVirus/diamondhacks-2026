@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { AppConfig } from "./config";
 import type { BrowserStatus, HitlNeed, HitlNeedKind, HitlRequest, PromptField } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
@@ -45,6 +46,58 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  if (error instanceof Error && error.name === "AbortError") return true;
+  return false;
+}
+
+/**
+ * Loads cookies from an auth_state.json file produced by the setup_auth script.
+ * Handles two formats:
+ *   - Raw array: [ { name, value, domain, ... }, ... ]
+ *   - Playwright storage state: { cookies: [...], origins: [...] }
+ * Returns undefined if the path is unset, the file is missing, or parsing fails.
+ */
+function loadAuthStateCookies(authStatePath: string | undefined): unknown[] | undefined {
+  if (!authStatePath) return undefined;
+  try {
+    const raw = readFileSync(authStatePath, "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (typeof parsed === "object" && parsed !== null) {
+      const obj = parsed as Record<string, unknown>;
+      if (Array.isArray(obj.cookies)) return obj.cookies as unknown[];
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Appends Browser Use live-embed query params (theme, ui) to a liveUrl when
+ * the matching config fields are set. Returns the url unchanged if no params
+ * are configured, or undefined/null if the input is falsy.
+ */
+function decorateLiveUrl(
+  liveUrl: string | null | undefined,
+  liveEmbed: AppConfig["browserUse"]["liveEmbed"],
+): string | undefined {
+  if (!liveUrl) return undefined;
+  const hasTheme = liveEmbed.theme !== undefined;
+  const hasUi = liveEmbed.ui !== undefined;
+  if (!hasTheme && !hasUi) return liveUrl;
+  try {
+    const url = new URL(liveUrl);
+    if (hasTheme) url.searchParams.set("theme", liveEmbed.theme as string);
+    if (hasUi) url.searchParams.set("ui", String(liveEmbed.ui));
+    return url.toString();
+  } catch {
+    return liveUrl;
+  }
+}
+
 function normalizeCloudStatus(status: string | undefined): string {
   return String(status ?? "").trim().toLowerCase();
 }
@@ -54,7 +107,183 @@ function isTerminalCloudStatus(status: string | undefined): boolean {
   return normalized === "completed" || normalized === "failed" || normalized === "stopped";
 }
 
+function formatBrowserUseNetworkError(baseUrl: string, error: unknown): string {
+  const detail =
+    error instanceof Error && error.message.trim().length > 0
+      ? error.message.trim()
+      : "Network error while contacting Browser Use.";
+  return `Browser Use is unreachable (${detail}). Check network access and BROWSER_USE_BASE_URL (${baseUrl}).`;
+}
+
+/** Turn API JSON/text bodies into a single line for logs and errors. */
+function parseBrowserUseApiErrorBody(body: string, status: number): string {
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return `Browser Use request failed (HTTP ${status}).`;
+  }
+  try {
+    const data = JSON.parse(trimmed) as Record<string, unknown>;
+    const detail = data.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return detail.trim();
+    }
+    if (Array.isArray(detail) && detail.length > 0 && typeof detail[0] === "object" && detail[0] !== null) {
+      const msg = (detail[0] as Record<string, unknown>).msg;
+      if (typeof msg === "string" && msg.trim()) {
+        return msg.trim();
+      }
+    }
+    const message = data.message;
+    if (typeof message === "string" && message.trim()) {
+      return message.trim();
+    }
+  } catch {
+    /* not JSON */
+  }
+  return trimmed.length > 600 ? `${trimmed.slice(0, 597)}…` : trimmed;
+}
+
+function formatBrowserFailureForUser(message: string): string {
+  const lower = message.toLowerCase();
+
+  if (message.includes("BROWSER_USE_API_KEY is not configured")) {
+    return "I couldn't start Browser Use because the API key is not configured yet.";
+  }
+
+  if (message.includes("Browser Use is unreachable")) {
+    return "I couldn't reach Browser Use right now. Check the network connection and Browser Use API settings, then try again.";
+  }
+
+  if (lower.includes("timed out")) {
+    return "Browser Use took too long to respond. Please try again.";
+  }
+
+  if (
+    lower.includes("subscription") ||
+    lower.includes("workspace") ||
+    lower.includes("upgrade your plan") ||
+    lower.includes("payment required") ||
+    lower.includes("quota")
+  ) {
+    return "Browser automation didn't start—the Browser Use account hit a limit (subscription or workspaces). Open the Browser panel for the exact message, fix your Browser Use plan or free a workspace, then try again.";
+  }
+
+  if (lower.includes("unauthorized") || lower.includes("invalid api key") || lower.includes("401")) {
+    return "Browser Use rejected the API key. Check BROWSER_USE_API_KEY in backend/.env, then try again.";
+  }
+
+  return "The browser agent failed to run and isn't working for that task. Check Recent Actions in the Browser panel, then try again.";
+}
+
+/**
+ * Stored in `browser_task_templates.workspace_id` when Browser Use rejects creating a workspace.
+ * Never send this value to the Cloud API as `workspaceId`.
+ */
+const BROWSER_WORKSPACE_SKIPPED_MARKER = "gazabot:workspace_skipped";
+
+function effectiveBrowserWorkspaceId(stored: string | null | undefined): string | undefined {
+  if (!stored || stored === BROWSER_WORKSPACE_SKIPPED_MARKER) {
+    return undefined;
+  }
+  return stored;
+}
+
+/** True when the API refuses a new workspace (usually billing/plan), not a transient glitch. */
+function isBrowserUseWorkspaceCreationBlockedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (!msg) return false;
+  if (msg.includes("upgrade your plan") || msg.includes("delete unused workspaces")) {
+    return true;
+  }
+  if (msg.includes("active subscription") && msg.includes("workspace")) {
+    return true;
+  }
+  if (msg.includes("subscription") && msg.includes("workspace")) {
+    return true;
+  }
+  if (msg.includes("payment required") || msg.includes("quota exceeded")) {
+    return true;
+  }
+  return false;
+}
+
+type BrowserUseStructuredOutput = {
+  status?: string;
+  orderNumber?: string;
+  total?: string;
+  estimatedArrival?: string;
+  blockedReason?: string;
+  summary?: string;
+  message?: string;
+  text?: string;
+};
+
+function coerceStructuredOutput(output: unknown): BrowserUseStructuredOutput | undefined {
+  if (typeof output === "object" && output !== null) {
+    return output as BrowserUseStructuredOutput;
+  }
+
+  if (typeof output === "string") {
+    const trimmed = output.trim();
+    if (!trimmed) return undefined;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      return typeof parsed === "object" && parsed !== null ? (parsed as BrowserUseStructuredOutput) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function formatStructuredSummary(structured: BrowserUseStructuredOutput): string | undefined {
+  const status = typeof structured.status === "string" ? structured.status.trim().toLowerCase() : "";
+  const orderNumber = typeof structured.orderNumber === "string" ? structured.orderNumber.trim() : "";
+  const total = typeof structured.total === "string" ? structured.total.trim() : "";
+  const estimatedArrival =
+    typeof structured.estimatedArrival === "string" ? structured.estimatedArrival.trim() : "";
+  const blockedReason = typeof structured.blockedReason === "string" ? structured.blockedReason.trim() : "";
+
+  const freeform =
+    typeof structured.summary === "string"
+      ? structured.summary
+      : typeof structured.message === "string"
+        ? structured.message
+        : typeof structured.text === "string"
+          ? structured.text
+          : "";
+  const freeformTrimmed = freeform.trim();
+
+  if (status === "placed") {
+    const details = [
+      orderNumber ? `Order #: ${orderNumber}` : "",
+      total ? `Total: ${total}` : "",
+      estimatedArrival ? `ETA: ${estimatedArrival}` : "",
+    ].filter(Boolean);
+    return details.length > 0 ? `Order placed. ${details.join(" · ")}.` : "Order placed.";
+  }
+
+  if (status === "blocked") {
+    const reason = blockedReason || freeformTrimmed;
+    return reason ? `I couldn’t complete the task. Needed: ${reason}` : "I couldn’t complete the task (missing info).";
+  }
+
+  if (freeformTrimmed) {
+    return freeformTrimmed;
+  }
+
+  return undefined;
+}
+
 function extractSummary(output: unknown): string {
+  const structured = coerceStructuredOutput(output);
+  if (structured) {
+    const formatted = formatStructuredSummary(structured);
+    if (formatted) return formatted;
+    return JSON.stringify(structured);
+  }
+
   if (typeof output === "string" && output.trim().length > 0) {
     return output.trim();
   }
@@ -203,6 +432,11 @@ function toBrowserStatus(status: string | undefined): BrowserStatus {
 }
 
 export class BrowserUseService {
+  private browserRunAbort: AbortController | null = null;
+
+  /** Latest local session id passed to runBrowserTask; used to reject stale HITL resumes. */
+  private activeBrowserSessionId: string | null = null;
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
@@ -214,12 +448,6 @@ export class BrowserUseService {
     task: string;
     profileId?: string;
   }): Promise<void> {
-    const preparedTask = await this.prepareBrowserTask(input.task);
-    const profileLabel = input.profileId ?? this.config.browserUse.profileId ?? "(default)";
-    console.log(
-      `[browser-use] Queued browser task — localSession=${input.browserSessionId}, profileId=${profileLabel}, model=${this.config.browserUse.model}, task=${JSON.stringify(preparedTask.task)}`,
-    );
-
     if (!this.config.browserUse.apiKey?.trim()) {
       console.warn(
         `[browser-use] Not sending to Browser Use Cloud (missing BROWSER_USE_API_KEY) — localSession=${input.browserSessionId}`,
@@ -232,16 +460,57 @@ export class BrowserUseService {
       return;
     }
 
-    console.log(
-      `[browser-use] Sending to ${this.config.browserUse.baseUrl} — localSession=${input.browserSessionId}`,
-    );
-    await this.runRemoteTask(input, preparedTask);
+    const supersededId = this.activeBrowserSessionId;
+    this.browserRunAbort?.abort();
+    const runAbort = new AbortController();
+    this.browserRunAbort = runAbort;
+    this.activeBrowserSessionId = input.browserSessionId;
+    const signal = runAbort.signal;
+
+    if (supersededId && supersededId !== input.browserSessionId) {
+      this.database.supersedeBrowserSession(supersededId);
+      console.log(`[browser-use] Superseded previous session ${supersededId} — starting ${input.browserSessionId}`);
+    }
+
+    try {
+      const preparedTask = await this.prepareBrowserTask(input.task);
+      if (signal.aborted) {
+        return;
+      }
+      const profileLabel = input.profileId ?? this.config.browserUse.profileId ?? "(default)";
+      console.log(
+        `[browser-use] Queued browser task — localSession=${input.browserSessionId}, profileId=${profileLabel}, model=${this.config.browserUse.model}, task=${JSON.stringify(preparedTask.task)}`,
+      );
+
+      console.log(
+        `[browser-use] Sending to ${this.config.browserUse.baseUrl} — localSession=${input.browserSessionId}`,
+      );
+      await this.runRemoteTask(input, preparedTask, signal);
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) {
+        return;
+      }
+      console.error("[browser-use] Browser task failed:", error);
+      const detail = error instanceof Error ? error.message.trim() : String(error);
+      const technical = detail ? `Browser task failed: ${detail}` : "Browser task failed.";
+      this.recordBrowserTaskFailure(input, technical, formatBrowserFailureForUser(technical));
+    }
   }
 
   async resumeHitlRequest(hitlRequest: HitlRequest): Promise<void> {
     const followUpTask = this.buildFollowUpTaskForHitlNeed(hitlRequest.needKind);
     if (!followUpTask) {
       throw new Error(`Unable to resolve HITL request ${hitlRequest.id} for need ${hitlRequest.needKind}.`);
+    }
+
+    if (
+      this.activeBrowserSessionId !== null &&
+      hitlRequest.browserSessionId !== this.activeBrowserSessionId
+    ) {
+      console.warn(
+        `[browser-use] Skipping HITL resume — session ${hitlRequest.browserSessionId} is not active (current ${this.activeBrowserSessionId}).`,
+      );
+      return;
     }
 
     this.database.updateBrowserSession({
@@ -295,8 +564,9 @@ export class BrowserUseService {
         resumedUpdate.title = completedSession.title;
         resumedUpdate.tabLabel = completedSession.title;
       }
-      if (completedSession.liveUrl) {
-        resumedUpdate.previewUrl = completedSession.liveUrl;
+      const resumedPreviewUrl = decorateLiveUrl(completedSession.liveUrl, this.config.browserUse.liveEmbed);
+      if (resumedPreviewUrl) {
+        resumedUpdate.previewUrl = resumedPreviewUrl;
       }
       this.database.updateBrowserSession(resumedUpdate);
       this.database.appendBrowserAction({
@@ -398,11 +668,19 @@ export class BrowserUseService {
     this.transcriptBus.publish("transcript", robot);
   }
 
-  private async runRemoteTask(input: {
-    browserSessionId: string;
-    task: string;
-    profileId?: string;
-  }, preparedTask: PreparedBrowserTask): Promise<void> {
+  private async runRemoteTask(
+    input: {
+      browserSessionId: string;
+      task: string;
+      profileId?: string;
+    },
+    preparedTask: PreparedBrowserTask,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) {
+      return;
+    }
+
     const effectiveProfileId = input.profileId || this.config.browserUse.profileId;
     const started = this.database.createTranscriptEntry({
       kind: "tool",
@@ -448,7 +726,10 @@ export class BrowserUseService {
       if (preparedTask.workspaceId) {
         createRemoteSessionRequest.workspaceId = preparedTask.workspaceId;
       }
-      const initialSession = await this.createRemoteSession(createRemoteSessionRequest);
+      const initialSession = await this.createRemoteSession(createRemoteSessionRequest, signal);
+      if (signal.aborted) {
+        return;
+      }
 
       const initialUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
@@ -460,16 +741,23 @@ export class BrowserUseService {
       if (effectiveProfileId) {
         initialUpdate.profileId = effectiveProfileId;
       }
-      if (initialSession.liveUrl) {
-        initialUpdate.previewUrl = initialSession.liveUrl;
+      const initialPreviewUrl = decorateLiveUrl(initialSession.liveUrl, this.config.browserUse.liveEmbed);
+      if (initialPreviewUrl) {
+        initialUpdate.previewUrl = initialPreviewUrl;
       }
       this.database.updateBrowserSession(initialUpdate);
 
-      let currentSession = await this.pollRemoteSession(initialSession.id);
+      let currentSession = await this.pollRemoteSession(initialSession.id, signal);
+      if (signal.aborted) {
+        return;
+      }
       const MAX_HITL_LOOPS = 3;
 
       // --- HITL loop: detect needs, auto-resolve or request user input ---
       for (let hitlLoop = 0; hitlLoop < MAX_HITL_LOOPS; hitlLoop++) {
+        if (signal.aborted) {
+          return;
+        }
         const currentStatus = normalizeCloudStatus(currentSession.status);
         if (currentStatus === "failed" || currentStatus === "stopped") break;
 
@@ -524,7 +812,12 @@ export class BrowserUseService {
             currentSession.id,
             followUpTask,
             effectiveProfileId ?? undefined,
+            signal,
           );
+
+          if (signal.aborted) {
+            return;
+          }
 
           if (expired) {
             // Session expired — start fresh with full context
@@ -541,8 +834,11 @@ export class BrowserUseService {
             if (preparedTask.workspaceId) {
               freshCreateRequest.workspaceId = preparedTask.workspaceId;
             }
-            const freshSession = await this.createRemoteSession(freshCreateRequest);
-            currentSession = await this.pollRemoteSession(freshSession.id);
+            const freshSession = await this.createRemoteSession(freshCreateRequest, signal);
+            if (signal.aborted) {
+              return;
+            }
+            currentSession = await this.pollRemoteSession(freshSession.id, signal);
           } else {
             currentSession = nextSession;
           }
@@ -658,8 +954,9 @@ export class BrowserUseService {
       if (effectiveProfileId) {
         finalUpdate.profileId = effectiveProfileId;
       }
-      if (finalSession.liveUrl) {
-        finalUpdate.previewUrl = finalSession.liveUrl;
+      const finalPreviewUrl = decorateLiveUrl(finalSession.liveUrl, this.config.browserUse.liveEmbed);
+      if (finalPreviewUrl) {
+        finalUpdate.previewUrl = finalPreviewUrl;
       }
       this.database.updateBrowserSession(finalUpdate);
       this.database.appendBrowserAction({
@@ -710,18 +1007,24 @@ export class BrowserUseService {
       this.transcriptBus.publish("tool", completed);
       this.transcriptBus.publish("transcript", robot);
     } catch (error) {
+      if (signal.aborted || isAbortError(error)) {
+        return;
+      }
       console.error("[browser-use] Remote task failed:", error);
       const message =
         error instanceof Error ? `Browser task failed: ${error.message}` : "Browser task failed.";
-      this.recordBrowserTaskFailure(input, message);
+      this.recordBrowserTaskFailure(input, message, formatBrowserFailureForUser(message));
     }
   }
 
-  private async createRemoteSession(input: {
-    task: string;
-    profileId?: string;
-    workspaceId?: string;
-  }): Promise<BrowserUseSessionResponse> {
+  private async createRemoteSession(
+    input: {
+      task: string;
+      profileId?: string;
+      workspaceId?: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<BrowserUseSessionResponse> {
     const body: Record<string, unknown> = {
       task: input.task,
       model: this.config.browserUse.model,
@@ -736,20 +1039,42 @@ export class BrowserUseService {
     if (this.config.browserUse.proxyCountryCode) {
       body.proxyCountryCode = this.config.browserUse.proxyCountryCode;
     }
+    const cookies = loadAuthStateCookies(this.config.browserUse.authStatePath);
+    if (cookies && cookies.length > 0) {
+      body.cookies = cookies;
+    }
 
     const url = `${this.config.browserUse.baseUrl}/sessions`;
-    console.log(`[browser-use] POST ${url} body=${JSON.stringify(body)}`);
+    const logBody = { ...body, cookies: cookies ? `[${cookies.length} cookies]` : undefined };
+    console.log(`[browser-use] POST ${url} body=${JSON.stringify(logBody)}`);
 
-    return this.browserUseRequest<BrowserUseSessionResponse>("/sessions", {
+    const session = await this.browserUseRequest<BrowserUseSessionResponse>("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
+
+    console.log(
+      `[browser-use] Session created: id=${session.id}, status=${session.status}, liveUrl=${session.liveUrl ?? "(none)"}`,
+    );
+
+    if (!session.id) {
+      throw new Error("Browser Use returned a response without a session id. The session was not created.");
+    }
+
+    return session;
   }
 
-  private async pollRemoteSession(sessionId: string): Promise<BrowserUseSessionResponse> {
+  private async pollRemoteSession(sessionId: string, signal?: AbortSignal): Promise<BrowserUseSessionResponse> {
     for (let attempt = 0; attempt < this.config.browserUse.maxPollAttempts; attempt += 1) {
-      const session = await this.browserUseRequest<BrowserUseSessionResponse>(`/sessions/${sessionId}`, { method: "GET" });
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      const session = await this.browserUseRequest<BrowserUseSessionResponse>(`/sessions/${sessionId}`, {
+        method: "GET",
+        ...(signal ? { signal } : {}),
+      });
       if (isTerminalCloudStatus(session.status)) {
         return session;
       }
@@ -839,21 +1164,10 @@ export class BrowserUseService {
         taskTemplate,
       });
 
-    let workspaceId = template.workspaceId ?? undefined;
+    let workspaceId = effectiveBrowserWorkspaceId(template.workspaceId);
     let cacheLabel: string;
-    if (!workspaceId) {
-      const workspace = await this.createWorkspace(`${orderIntent.merchant} repeat orders`);
-      workspaceId = workspace.id;
-      template = this.database.saveBrowserTaskTemplate({
-        templateKey,
-        label: `${orderIntent.merchant} repeat order`,
-        merchant: orderIntent.merchant,
-        taskTemplate,
-        workspaceId,
-        incrementUseCount: true,
-      });
-      cacheLabel = `Created deterministic rerun workspace for ${orderIntent.merchant}. This first order seeds the reusable script.`;
-    } else {
+
+    if (workspaceId) {
       template = this.database.saveBrowserTaskTemplate({
         templateKey,
         label: `${orderIntent.merchant} repeat order`,
@@ -863,14 +1177,59 @@ export class BrowserUseService {
         incrementUseCount: true,
       });
       cacheLabel = `Reusing saved deterministic rerun workspace for ${orderIntent.merchant}.`;
+    } else if (template.workspaceId === BROWSER_WORKSPACE_SKIPPED_MARKER) {
+      template = this.database.saveBrowserTaskTemplate({
+        templateKey,
+        label: `${orderIntent.merchant} repeat order`,
+        merchant: orderIntent.merchant,
+        taskTemplate,
+        workspaceId: BROWSER_WORKSPACE_SKIPPED_MARKER,
+        incrementUseCount: true,
+      });
+      workspaceId = undefined;
+      cacheLabel =
+        "Repeat-order workspace skipped (Browser Use plan); running a normal browser session without deterministic cache.";
+    } else {
+      try {
+        const workspace = await this.createWorkspace(`${orderIntent.merchant} repeat orders`);
+        workspaceId = workspace.id;
+        template = this.database.saveBrowserTaskTemplate({
+          templateKey,
+          label: `${orderIntent.merchant} repeat order`,
+          merchant: orderIntent.merchant,
+          taskTemplate,
+          workspaceId,
+          incrementUseCount: true,
+        });
+        cacheLabel = `Created deterministic rerun workspace for ${orderIntent.merchant}. This first order seeds the reusable script.`;
+      } catch (error) {
+        if (!isBrowserUseWorkspaceCreationBlockedError(error)) {
+          throw error;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `[browser-use] Workspace creation refused by Browser Use (often plan/subscription—their wording can imply “more” workspaces even when you see one). Continuing without workspace. Detail: ${detail}`,
+        );
+        template = this.database.saveBrowserTaskTemplate({
+          templateKey,
+          label: `${orderIntent.merchant} repeat order`,
+          merchant: orderIntent.merchant,
+          taskTemplate,
+          workspaceId: BROWSER_WORKSPACE_SKIPPED_MARKER,
+          incrementUseCount: true,
+        });
+        workspaceId = undefined;
+        cacheLabel =
+          "Browser Use blocked creating a repeat-order workspace (billing/plan). Running a normal session without deterministic cache.";
+      }
     }
 
     return {
       task: taskTemplate,
-      workspaceId,
-      cacheLabel,
-      template,
-      orderIntent,
+      ...(workspaceId !== undefined ? { workspaceId } : {}),
+      ...(cacheLabel !== undefined ? { cacheLabel } : {}),
+      ...(template !== undefined ? { template } : {}),
+      ...(orderIntent !== undefined ? { orderIntent } : {}),
     };
   }
 
@@ -940,6 +1299,7 @@ export class BrowserUseService {
     remoteSessionId: string,
     task: string,
     profileId?: string,
+    signal?: AbortSignal,
   ): Promise<{ session: BrowserUseSessionResponse; expired: boolean }> {
     const body: Record<string, unknown> = {
       session_id: remoteSessionId,
@@ -958,10 +1318,14 @@ export class BrowserUseService {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        ...(signal ? { signal } : {}),
       });
-      const finalSession = await this.pollRemoteSession(session.id);
+      const finalSession = await this.pollRemoteSession(session.id, signal);
       return { session: finalSession, expired: false };
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) {
+        throw error;
+      }
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes("404") || msg.includes("410") || msg.includes("not found") || msg.includes("expired")) {
         console.warn(`[browser-use] Session ${remoteSessionId} expired, cannot send follow-up.`);
@@ -1050,19 +1414,26 @@ export class BrowserUseService {
   }
 
   private async browserUseRequest<T>(path: string, init: RequestInit): Promise<T> {
-    const response = await fetch(`${this.config.browserUse.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        Accept: "application/json",
-        "X-Browser-Use-API-Key": this.config.browserUse.apiKey ?? "",
-        "x-api-key": this.config.browserUse.apiKey ?? "",
-        ...init.headers,
-      },
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.browserUse.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/json",
+          "X-Browser-Use-API-Key": this.config.browserUse.apiKey ?? "",
+          "x-api-key": this.config.browserUse.apiKey ?? "",
+          ...init.headers,
+        },
+      });
+    } catch (error) {
+      throw new Error(formatBrowserUseNetworkError(this.config.browserUse.baseUrl, error));
+    }
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(body || `Browser Use request failed with status ${response.status}`);
+      console.error(`[browser-use] API error: HTTP ${response.status} ${response.statusText} — ${body.slice(0, 500)}`);
+      const parsed = parseBrowserUseApiErrorBody(body, response.status);
+      throw new Error(parsed);
     }
 
     return (await response.json()) as T;
