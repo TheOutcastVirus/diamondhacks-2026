@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import type { AppConfig } from "./config";
 import type { BrowserStatus, HitlNeed, HitlNeedKind, HitlRequest, PromptField } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
@@ -46,33 +45,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function shortProfileId(profileId: string): string {
+  return profileId.length <= 18 ? profileId : `${profileId.slice(0, 8)}...${profileId.slice(-8)}`;
+}
+
 function isAbortError(error: unknown): boolean {
   if (error instanceof DOMException && error.name === "AbortError") return true;
   if (error instanceof Error && error.name === "AbortError") return true;
   return false;
-}
-
-/**
- * Loads cookies from an auth_state.json file produced by the setup_auth script.
- * Handles two formats:
- *   - Raw array: [ { name, value, domain, ... }, ... ]
- *   - Playwright storage state: { cookies: [...], origins: [...] }
- * Returns undefined if the path is unset, the file is missing, or parsing fails.
- */
-function loadAuthStateCookies(authStatePath: string | undefined): unknown[] | undefined {
-  if (!authStatePath) return undefined;
-  try {
-    const raw = readFileSync(authStatePath, "utf-8");
-    const parsed: unknown = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed;
-    if (typeof parsed === "object" && parsed !== null) {
-      const obj = parsed as Record<string, unknown>;
-      if (Array.isArray(obj.cookies)) return obj.cookies as unknown[];
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -682,6 +662,7 @@ export class BrowserUseService {
     }
 
     const effectiveProfileId = input.profileId || this.config.browserUse.profileId;
+    let currentRemoteSessionId: string | undefined;
     const started = this.database.createTranscriptEntry({
       kind: "tool",
       role: "system",
@@ -699,6 +680,14 @@ export class BrowserUseService {
       kind: "dispatch",
       detail: "Sent task to Browser Use Cloud.",
       status: "pending",
+    });
+    this.database.appendBrowserAction({
+      browserSessionId: input.browserSessionId,
+      kind: "auth",
+      detail: effectiveProfileId
+        ? `Attached Browser Use profile ${shortProfileId(effectiveProfileId)}. Synced cookies and saved browser state should be available to this session.`
+        : "No Browser Use profile was attached. This session will not receive synced cookies or saved browser state.",
+      status: effectiveProfileId ? "completed" : "failed",
     });
     if (preparedTask.workspaceId) {
       this.database.appendBrowserAction({
@@ -726,7 +715,13 @@ export class BrowserUseService {
       if (preparedTask.workspaceId) {
         createRemoteSessionRequest.workspaceId = preparedTask.workspaceId;
       }
+      console.log(
+        effectiveProfileId
+          ? `[browser-use] Auth passthrough enabled — profileId=${effectiveProfileId}; synced cookies/saved state will be available if they exist in that profile.`
+          : "[browser-use] Auth passthrough disabled — no profileId attached; synced cookies/saved state will not be available for this session.",
+      );
       const initialSession = await this.createRemoteSession(createRemoteSessionRequest, signal);
+      currentRemoteSessionId = initialSession.id;
       if (signal.aborted) {
         return;
       }
@@ -759,11 +754,21 @@ export class BrowserUseService {
           return;
         }
         const currentStatus = normalizeCloudStatus(currentSession.status);
-        if (currentStatus === "failed" || currentStatus === "stopped") break;
 
         const currentSummary = extractSummary(currentSession.output);
-        const need = this.detectNeededInfo(currentSummary);
-        if (!need) break; // No HITL need — proceed to finalize
+        // Also check raw output text so patterns match against the original blockedReason / output string
+        const rawOutputText = typeof currentSession.output === "string"
+          ? currentSession.output
+          : typeof currentSession.output === "object" && currentSession.output !== null
+            ? JSON.stringify(currentSession.output)
+            : "";
+        const need = this.detectNeededInfo(currentSummary) ?? this.detectNeededInfo(rawOutputText);
+        // Always check for HITL need first — even failed sessions may need user action (e.g. login).
+        // Only break on terminal-failure if no actionable need was found.
+        if (!need) {
+          if (currentStatus === "failed" || currentStatus === "stopped") break;
+          break;
+        }
 
         console.log(`[browser-use] HITL need detected (loop ${hitlLoop + 1}): ${need.kind} — ${currentSummary.slice(0, 120)}`);
 
@@ -835,12 +840,14 @@ export class BrowserUseService {
               freshCreateRequest.workspaceId = preparedTask.workspaceId;
             }
             const freshSession = await this.createRemoteSession(freshCreateRequest, signal);
+            currentRemoteSessionId = freshSession.id;
             if (signal.aborted) {
               return;
             }
             currentSession = await this.pollRemoteSession(freshSession.id, signal);
           } else {
             currentSession = nextSession;
+            currentRemoteSessionId = nextSession.id;
           }
 
           this.database.appendBrowserAction({
@@ -860,19 +867,25 @@ export class BrowserUseService {
               ? "delivery_address"
               : need.kind === "confirmation"
                 ? "browser_confirmation"
-                : "browser_hitl_info";
+                : need.kind === "login"
+                  ? "browser_login"
+                  : "browser_hitl_info";
         const promptTitle =
           need.kind === "payment_card"
             ? "Payment Information Needed"
             : need.kind === "delivery_address"
               ? "Delivery Address Needed"
-              : "Information Needed";
+              : need.kind === "login"
+                ? "Login Required"
+                : "Information Needed";
         const promptDescription =
           need.kind === "payment_card"
             ? "The browser agent needs your payment card to complete checkout."
             : need.kind === "delivery_address"
               ? "The browser agent needs your delivery address to complete checkout."
-              : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
+              : need.kind === "login"
+                ? "The browser agent needs you to log in. Switch to the Browser tab, log in through the live view, then return here and click Done."
+                : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
         const fields =
           need.kind === "payment_card"
             ? this.buildPaymentPromptFields()
@@ -880,7 +893,9 @@ export class BrowserUseService {
               ? this.buildAddressPromptFields()
               : need.kind === "confirmation"
                 ? this.buildConfirmationPromptFields()
-                : [{ name: "info", label: "Information", type: "text" as const, required: true }];
+                : need.kind === "login"
+                  ? [] // No fields — user logs in via the live browser view
+                  : [{ name: "info", label: "Information", type: "text" as const, required: true }];
 
         const prompt = this.database.createPrompt({
           title: promptTitle,
@@ -1006,9 +1021,15 @@ export class BrowserUseService {
       });
       this.transcriptBus.publish("tool", completed);
       this.transcriptBus.publish("transcript", robot);
+      if (finalSession.id) {
+        await this.stopRemoteSession(finalSession.id);
+      }
     } catch (error) {
       if (signal.aborted || isAbortError(error)) {
         return;
+      }
+      if (currentRemoteSessionId) {
+        await this.stopRemoteSession(currentRemoteSessionId);
       }
       console.error("[browser-use] Remote task failed:", error);
       const message =
@@ -1039,14 +1060,8 @@ export class BrowserUseService {
     if (this.config.browserUse.proxyCountryCode) {
       body.proxyCountryCode = this.config.browserUse.proxyCountryCode;
     }
-    const cookies = loadAuthStateCookies(this.config.browserUse.authStatePath);
-    if (cookies && cookies.length > 0) {
-      body.cookies = cookies;
-    }
-
     const url = `${this.config.browserUse.baseUrl}/sessions`;
-    const logBody = { ...body, cookies: cookies ? `[${cookies.length} cookies]` : undefined };
-    console.log(`[browser-use] POST ${url} body=${JSON.stringify(logBody)}`);
+    console.log(`[browser-use] POST ${url} body=${JSON.stringify(body)}`);
 
     const session = await this.browserUseRequest<BrowserUseSessionResponse>("/sessions", {
       method: "POST",
@@ -1256,6 +1271,17 @@ export class BrowserUseService {
   detectNeededInfo(output: string): HitlNeed | null {
     const lower = output.toLowerCase();
 
+    const loginPatterns = [
+      "log in", "login", "sign in", "signin", "log into", "sign into",
+      "needs to be logged in", "requires login", "please sign in",
+      "please log in", "not logged in", "not signed in",
+      "authentication required", "please authenticate",
+      "credentials", "account credentials", "saved credentials",
+      "email and password", "email/phone and password",
+      "provide your", "provide.*email", "provide.*password",
+      "account email", "account password",
+      "no saved account",
+    ];
     const paymentPatterns = [
       "payment", "credit card", "card number", "card info",
       "billing", "pay with", "enter card", "add payment",
@@ -1271,6 +1297,11 @@ export class BrowserUseService {
       "place order", "submit order", "verify", "authorize",
     ];
 
+    for (const p of loginPatterns) {
+      if (lower.includes(p)) {
+        return { kind: "login", rawMessage: output };
+      }
+    }
     for (const p of paymentPatterns) {
       if (lower.includes(p)) {
         return { kind: "payment_card", rawMessage: output };
@@ -1369,6 +1400,9 @@ export class BrowserUseService {
       }
       return "";
     }
+    if (needKind === "login") {
+      return "The user has now logged in through the live browser view. Continue with the original task from where you left off.";
+    }
 
     const extraInfo = this.database.readMemory("browser_hitl_info");
     if (!extraInfo) {
@@ -1411,6 +1445,18 @@ export class BrowserUseService {
         description: "Allow the browser agent to place or submit the order.",
       },
     ];
+  }
+
+  private async stopRemoteSession(sessionId: string): Promise<void> {
+    try {
+      await this.browserUseRequest<BrowserUseSessionResponse>(`/sessions/${sessionId}/stop`, {
+        method: "POST",
+      });
+      console.log(`[browser-use] Stopped remote session ${sessionId} to persist profile state.`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`[browser-use] Failed to stop remote session ${sessionId}: ${detail}`);
+    }
   }
 
   private async browserUseRequest<T>(path: string, init: RequestInit): Promise<T> {

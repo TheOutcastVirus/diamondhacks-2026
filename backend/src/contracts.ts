@@ -67,6 +67,8 @@ export type BrowserContext = {
   summary: string;
   status: BrowserStatus;
   lastUpdated: string;
+  profileId?: string;
+  configuredProfileId?: string;
   activeTask?: string;
   tabLabel?: string;
   domSnippet?: string;
@@ -174,7 +176,7 @@ export type ApiErrorPayload = {
   details?: unknown;
 };
 
-export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "unknown";
+export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "login" | "unknown";
 
 export type HitlNeed = {
   kind: HitlNeedKind;

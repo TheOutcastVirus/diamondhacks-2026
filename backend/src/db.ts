@@ -377,6 +377,9 @@ function serializeBrowserContext(session: BrowserSessionRow | null, actions: Bro
   if (session.screenshot_url) {
     context.screenshotUrl = session.screenshot_url;
   }
+  if (session.profile_id) {
+    context.profileId = session.profile_id;
+  }
 
   return context;
 }

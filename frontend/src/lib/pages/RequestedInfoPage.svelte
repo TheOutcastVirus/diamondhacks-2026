@@ -542,7 +542,7 @@
 
               <div class="form-footer">
                 <button class="action" type="submit" disabled={submitBusy[prompt.id]}>
-                  {submitBusy[prompt.id] ? 'Saving...' : 'Save to memory'}
+                  {submitBusy[prompt.id] ? 'Saving...' : prompt.fields.length === 0 ? 'Done' : 'Save to memory'}
                 </button>
               </div>
             </form>

@@ -677,6 +677,10 @@ export class GazabotApp {
 
       if (request.method === "GET" && url.pathname === "/api/browser") {
         const browser = this.database.getCurrentBrowserContext();
+        const configuredProfileId = this.config.browserUse.profileId?.trim();
+        if (configuredProfileId) {
+          browser.configuredProfileId = configuredProfileId;
+        }
         return jsonResponse(request, this.config, { browser } satisfies { browser: BrowserContext });
       }
 

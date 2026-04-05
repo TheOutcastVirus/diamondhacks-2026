@@ -10,6 +10,8 @@
       'Submit a task above to start browser automation.',
     status: 'idle',
     lastUpdated: new Date().toISOString(),
+    profileId: undefined,
+    configuredProfileId: undefined,
     activeTask: '',
     tabLabel: 'No active tab',
     domSnippet: '',
@@ -43,6 +45,11 @@
   let liveFeedNonce = 0;
   let liveFeedRefreshing = false;
 
+  type FriendlyCopy = {
+    short: string;
+    title: string;
+  };
+
   function formatTimestamp(value: string) {
     const parsed = new Date(value);
     return Number.isNaN(parsed.valueOf())
@@ -70,6 +77,168 @@
     });
   }
 
+  function cleanInlineText(value: string) {
+    return value.replace(/\s+/g, ' ').trim();
+  }
+
+  function trimTrailingPunctuation(value: string) {
+    return value.replace(/[.?!,:;]+$/g, '').trim();
+  }
+
+  function shorten(value: string, limit = 88) {
+    if (value.length <= limit) return value;
+    return `${value.slice(0, Math.max(0, limit - 1)).trimEnd()}...`;
+  }
+
+  function formatItemList(value: string) {
+    return trimTrailingPunctuation(cleanInlineText(value)).replace(/\s+/g, ' ');
+  }
+
+  function describeActiveTask(task?: string): FriendlyCopy | null {
+    if (!task) return null;
+    const normalized = cleanInlineText(task);
+    if (!normalized) return null;
+
+    const cvsItems = normalized.match(/Order the following items:\s*([^.]*)\./i)?.[1];
+    if (normalized.includes('https://www.cvs.com') && cvsItems) {
+      const items = formatItemList(cvsItems);
+      return {
+        short: shorten(`Working on a CVS order for ${items}.`, 72),
+        title: `The browser agent is on CVS and is trying to get ${items}. It will stop and ask if it needs anything else.`,
+      };
+    }
+
+    const merchant = normalized.match(/place a delivery order from "([^"]+)"/i)?.[1];
+    const foodItems = normalized.match(/Add these items to the cart:\s*([^.]*)\./i)?.[1];
+    if (merchant && foodItems) {
+      const items = formatItemList(foodItems);
+      return {
+        short: shorten(`Ordering ${items} from ${merchant}.`, 72),
+        title: `The browser agent is placing an order from ${merchant} for ${items}.`,
+      };
+    }
+
+    const genericMerchant = normalized.match(/Go to ([^.]+?) and order ([^.]+?) for the household\./i);
+    if (genericMerchant) {
+      const merchantLabel = trimTrailingPunctuation(genericMerchant[1] ?? '');
+      const itemLabel = trimTrailingPunctuation(genericMerchant[2] ?? '');
+      return {
+        short: shorten(`Ordering ${itemLabel} from ${merchantLabel}.`, 72),
+        title: `The browser agent is trying to order ${itemLabel} from ${merchantLabel}.`,
+      };
+    }
+
+    return {
+      short: shorten(normalized, 72),
+      title: normalized,
+    };
+  }
+
+  function describeSummary(summary: string, status: BrowserContext['status']): FriendlyCopy {
+    const normalized = cleanInlineText(summary);
+    if (!normalized) {
+      return {
+        short: 'No update yet.',
+        title: 'No update yet.',
+      };
+    }
+
+    if (normalized.startsWith('Browser Use is working on the task')) {
+      return {
+        short: status === 'navigating' ? 'Opening the site now.' : 'Working on your request now.',
+        title: 'The browser agent is actively working and will update this panel when something changes.',
+      };
+    }
+
+    const waitingMatch = normalized.match(/^Waiting for user:\s*(.+)$/i);
+    if (waitingMatch) {
+      const promptLabel = waitingMatch[1] ?? 'more information';
+      let short = 'Needs a bit more information to continue.';
+      if (/payment/i.test(promptLabel)) {
+        short = 'Needs payment details to continue.';
+      } else if (/delivery|address/i.test(promptLabel)) {
+        short = 'Needs delivery details to continue.';
+      } else if (/confirm/i.test(promptLabel)) {
+        short = 'Waiting for your confirmation.';
+      }
+      return {
+        short,
+        title: `The browser agent paused because it needs ${promptLabel.toLowerCase()} before it can continue.`,
+      };
+    }
+
+    if (normalized.includes('Browser Use is unreachable')) {
+      return {
+        short: 'Could not connect to the browser service.',
+        title: 'The app could not reach the browser automation service. Check the backend connection or Browser Use settings, then try again.',
+      };
+    }
+
+    if (/timed out/i.test(normalized)) {
+      return {
+        short: 'The browser task took too long and stopped.',
+        title: 'The browser agent did not finish in time. You can try the task again.',
+      };
+    }
+
+    if (/order placed/i.test(normalized)) {
+      return {
+        short: shorten(normalized, 88),
+        title: normalized,
+      };
+    }
+
+    if (/i couldn't complete|could not complete|blocked/i.test(normalized)) {
+      return {
+        short: shorten(normalized, 88),
+        title: normalized,
+      };
+    }
+
+    return {
+      short: shorten(normalized, 88),
+      title: normalized,
+    };
+  }
+
+  function describeAction(action: BrowserAction): FriendlyCopy {
+    const detail = cleanInlineText(action.detail);
+
+    if (action.kind === 'dispatch') {
+      return {
+        short: 'Started the browser task.',
+        title: 'The task was sent to the browser agent.',
+      };
+    }
+
+    if (action.kind === 'auth') {
+      return {
+        short: shorten(detail, 88),
+        title: detail,
+      };
+    }
+
+    if (action.kind === 'cache') {
+      return {
+        short: shorten(detail.replace(/Deterministic rerun/gi, 'Saved flow'), 88),
+        title: detail,
+      };
+    }
+
+    if (action.kind === 'error') {
+      return describeSummary(detail, 'blocked');
+    }
+
+    if (action.kind === 'summary') {
+      return describeSummary(detail, action.status === 'failed' ? 'blocked' : 'idle');
+    }
+
+    return {
+      short: shorten(detail, 88),
+      title: detail,
+    };
+  }
+
   function normalizeContext(payload: unknown): BrowserContext {
     const value = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
     const container =
@@ -89,6 +258,8 @@
           ? container.status
           : 'idle',
       lastUpdated: String(container.lastUpdated ?? container.timestamp ?? new Date().toISOString()),
+      profileId: container.profileId ? String(container.profileId) : undefined,
+      configuredProfileId: container.configuredProfileId ? String(container.configuredProfileId) : undefined,
       activeTask: container.activeTask ? String(container.activeTask) : fallbackContext.activeTask,
       tabLabel: container.tabLabel ? String(container.tabLabel) : fallbackContext.tabLabel,
       domSnippet: container.domSnippet ? String(container.domSnippet) : '',
@@ -201,6 +372,14 @@
   $: syncTimer();
 
   $: isActive = browserContext.status === 'executing' || browserContext.status === 'navigating';
+  $: activeTaskCopy = describeActiveTask(browserContext.activeTask);
+  $: summaryCopy = describeSummary(browserContext.summary, browserContext.status);
+  $: configuredProfileShort = browserContext.configuredProfileId
+    ? `${browserContext.configuredProfileId.slice(0, 8)}...${browserContext.configuredProfileId.slice(-8)}`
+    : '';
+  $: activeProfileShort = browserContext.profileId
+    ? `${browserContext.profileId.slice(0, 8)}...${browserContext.profileId.slice(-8)}`
+    : '';
 </script>
 
 <section class="page-outer">
@@ -236,6 +415,19 @@
       </span>
       <span class="prompt-hint-text">to run · Enter alone starts a new line</span>
     </p>
+    {#if browserContext.configuredProfileId}
+      <div class="profile-banner">
+        <p class="profile-banner-title">Synced browser profile is enabled by default.</p>
+        <p class="profile-banner-copy">
+          New browser tasks reuse the configured Browser Use cloud profile
+          <code>{configuredProfileShort}</code>.
+          {#if browserContext.profileId}
+            Active session profile: <code>{activeProfileShort}</code>.
+          {/if}
+          Re-syncing cookies is still a separate manual step.
+        </p>
+      </div>
+    {/if}
     {#if submitError}
       <p class="feedback feedback-error" role="alert">{submitError}</p>
     {/if}
@@ -251,9 +443,10 @@
           <p class="panel-label">Status</p>
           <strong class={`status-pill status-pill-${browserContext.status}`}>{browserContext.status}</strong>
         </div>
-        {#if browserContext.activeTask}
-          <p class="active-task">{browserContext.activeTask}</p>
+        {#if activeTaskCopy}
+          <p class="active-task" title={activeTaskCopy.title}>{activeTaskCopy.short}</p>
         {/if}
+        <p class="panel-copy callout-summary" title={summaryCopy.title}>{summaryCopy.short}</p>
         <p class="panel-copy url-copy" title={browserContext.url}>{browserContext.url}</p>
       </section>
 
@@ -280,12 +473,13 @@
         {:else}
           <div class="stack">
             {#each [...browserContext.recentActions].reverse() as action (action.id)}
+              {@const actionCopy = describeAction(action)}
               <article class="action-card">
                 <div class="action-head">
                   <strong class="action-kind">{action.kind}</strong>
                   <span class={`status status-${action.status ?? 'pending'}`}>{action.status ?? 'pending'}</span>
                 </div>
-                <p class="panel-copy">{action.detail}</p>
+                <p class="panel-copy" title={actionCopy.title}>{actionCopy.short}</p>
                 <time class="timestamp" datetime={action.timestamp}>{formatTimestamp(action.timestamp)}</time>
               </article>
             {/each}
@@ -404,6 +598,34 @@
     font-size: 0.8rem;
     color: var(--color-ink-soft);
     line-height: 1.4;
+  }
+
+  div.profile-banner {
+    margin-top: 0.15rem;
+    border-radius: 10px;
+    padding: 0.8rem 0.95rem;
+    background: color-mix(in srgb, var(--color-accent) 10%, var(--color-panel-muted));
+    border: 1px solid color-mix(in srgb, var(--color-accent) 24%, var(--color-line));
+  }
+
+  p.profile-banner-title {
+    margin: 0 0 0.28rem;
+    font-size: 0.84rem;
+    font-weight: 600;
+    color: var(--color-ink-strong);
+  }
+
+  p.profile-banner-copy {
+    margin: 0;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--color-ink-soft);
+  }
+
+  p.profile-banner-copy code {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--color-ink-strong);
   }
 
   span.prompt-hint-keys {
