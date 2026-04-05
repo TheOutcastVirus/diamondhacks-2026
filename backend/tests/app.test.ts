@@ -326,6 +326,137 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("reuses deterministic rerun workspaces for repeat merchant orders", async () => {
+    const sessionBodies: Array<Record<string, unknown>> = [];
+    let workspaceCreates = 0;
+    let sessionCreates = 0;
+
+    const restore = withFetchStub(async (url, init) => {
+      if (url.endsWith("/workspaces")) {
+        workspaceCreates += 1;
+        expect(init?.method).toBe("POST");
+        return jsonResponse({ id: "ws_cvs_repeat" });
+      }
+
+      if (url.endsWith("/sessions")) {
+        sessionCreates += 1;
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        sessionBodies.push(body);
+
+        if (sessionCreates === 1) {
+          expect(body.workspaceId).toBe("ws_cvs_repeat");
+          expect(String(body.task)).toContain("Go to CVS and order @{{chips}}");
+          return jsonResponse({
+            id: "remote-order-1",
+            status: "running",
+            liveUrl: "https://browser-use.example/live/1",
+            workspaceId: "ws_cvs_repeat",
+          });
+        }
+
+        expect(body.workspaceId).toBe("ws_cvs_repeat");
+        expect(String(body.task)).toContain("Go to CVS and order @{{pretzels}}");
+        return jsonResponse({
+          id: "remote-order-2",
+          status: "running",
+          liveUrl: "https://browser-use.example/live/2",
+          workspaceId: "ws_cvs_repeat",
+        });
+      }
+
+      if (url.endsWith("/sessions/remote-order-1")) {
+        return jsonResponse({
+          id: "remote-order-1",
+          status: "completed",
+          output: "Ordered chips from CVS.",
+          title: "CVS checkout",
+          url: "https://www.cvs.com/",
+          workspaceId: "ws_cvs_repeat",
+          llmCostUsd: "0.21",
+        });
+      }
+
+      if (url.endsWith("/sessions/remote-order-2")) {
+        return jsonResponse({
+          id: "remote-order-2",
+          status: "completed",
+          output: "Ordered pretzels from CVS.",
+          title: "CVS checkout",
+          url: "https://www.cvs.com/",
+          workspaceId: "ws_cvs_repeat",
+          llmCostUsd: "0",
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        INFERENCE_CLOUD_API_KEY: "",
+      });
+
+      try {
+        const firstOrderResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Order chips from CVS",
+              source: "guardian",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(firstOrderResponse.status).toBe(200);
+        expect(workspaceCreates).toBe(1);
+        expect(sessionCreates).toBe(1);
+        await Bun.sleep(30);
+
+        const secondOrderResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Order pretzels from CVS",
+              source: "guardian",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(secondOrderResponse.status).toBe(200);
+        expect(workspaceCreates).toBe(1);
+        expect(sessionCreates).toBe(2);
+        expect(sessionBodies).toHaveLength(2);
+        await Bun.sleep(30);
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        expect(browserResponse.status).toBe(200);
+        const browserPayload = (await browserResponse.json()) as {
+          browser: { summary: string; recentActions: Array<{ detail: string }> };
+        };
+
+        expect(browserPayload.browser.summary).toContain("$0 LLM cost");
+        expect(browserPayload.browser.recentActions.some((action) => action.detail.includes("deterministic rerun"))).toBe(
+          true,
+        );
+
+        const orders = database.listShoppingOrders();
+        expect(orders).toHaveLength(2);
+        expect(orders[0]?.merchant).toBe("CVS");
+        expect(orders[0]?.itemName).toBe("pretzels");
+        expect(orders[1]?.itemName).toBe("chips");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("stores prompt responses and plain notes in the same memory surface", async () => {
     const { app, database } = createTestApp();
 

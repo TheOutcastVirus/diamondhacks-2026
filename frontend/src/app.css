@@ -5,9 +5,9 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  --font-body: 'Aptos', 'Segoe UI', sans-serif;
-  --font-display: 'Fraunces', 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', serif;
-  --font-mono: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  --font-body: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-display: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
 
   --radius-shell: 0;
   --radius-panel: 0;
@@ -50,14 +50,20 @@
   --color-danger: #ff8a7a;
 }
 
+html {
+  height: 100%;
+}
+
 html,
 body,
 #app {
   min-height: 100%;
+  min-height: 100dvh;
 }
 
 body {
   margin: 0;
+  height: 100%;
   min-height: 100vh;
   font: 16px/1.55 var(--font-body);
   color: var(--color-ink);
@@ -66,12 +72,20 @@ body {
     linear-gradient(180deg, var(--color-bg) 0%, color-mix(in srgb, var(--color-bg-strong) 82%, var(--color-bg)) 100%);
 }
 
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
 div.app-shell {
   width: min(100%, 120rem);
-  min-height: 100dvh;
   margin: 0 auto;
+  flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: clamp(15rem, 18vw, 18rem) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
 }
 
 aside.sidebar,
@@ -87,10 +101,12 @@ aside.sidebar {
   flex-direction: column;
   gap: 1rem;
   min-height: 100dvh;
+  height: 100%;
+  max-height: 100dvh;
   position: sticky;
+  top: 0;
   box-sizing: border-box;
   border-right: var(--border-width) solid var(--color-line);
-  top: 0px;
 }
 
 main.workspace {
@@ -101,6 +117,21 @@ main.workspace {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  min-height: 0;
+  height: 100%;
+  max-height: 100dvh;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* Let each routed page fill space below the header (transcript feed, etc.) */
+main.workspace > header.page-header + * {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 div.brand-block {
@@ -188,6 +219,7 @@ header.page-header {
   gap: 1rem;
   border-bottom: 1px solid var(--color-line);
   padding-bottom: 0.75rem;
+  flex-shrink: 0;
 }
 
 h1.heading {
@@ -209,12 +241,15 @@ article.action-card {
 @media (max-width: 1100px) {
   div.app-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   aside.sidebar {
     position: static;
     top: auto;
     min-height: auto;
+    height: auto;
+    max-height: none;
     border-right: 0;
     border-bottom: var(--border-width) solid var(--color-line);
     gap: 0.875rem;
@@ -235,9 +270,15 @@ article.action-card {
     margin-top: 0;
     align-self: flex-start;
   }
-
+  
   main.workspace {
     min-height: auto;
+  }
+
+  main.workspace {
+    max-height: none;
+    min-height: 0;
+    overflow: hidden;
   }
 }
 

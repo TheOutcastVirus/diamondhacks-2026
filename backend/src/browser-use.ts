@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config";
 import type { BrowserStatus } from "./contracts";
+import type { BrowserTaskTemplate } from "./db";
 import { GazabotDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
 
@@ -10,6 +11,26 @@ type BrowserUseSessionResponse = {
   output?: unknown;
   title?: string | null;
   url?: string | null;
+  workspaceId?: string | null;
+  llmCostUsd?: string | number | null;
+};
+
+type BrowserUseWorkspaceResponse = {
+  id: string;
+  name?: string | null;
+};
+
+type PreparedBrowserTask = {
+  task: string;
+  workspaceId?: string;
+  cacheLabel?: string;
+  template?: BrowserTaskTemplate;
+  orderIntent?: {
+    merchant: string;
+    normalizedMerchant: string;
+    itemName: string;
+    normalizedItemName: string;
+  };
 };
 
 function sleep(ms: number): Promise<void> {
@@ -43,6 +64,78 @@ function extractSummary(output: unknown): string {
   return "Browser task completed.";
 }
 
+function normalizeKeySegment(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function cleanOrderValue(value: string): string {
+  return value
+    .trim()
+    .replace(/^(some|a|an|the)\s+/i, "")
+    .replace(/[.?!]+$/g, "")
+    .trim();
+}
+
+function parseOrderIntent(task: string):
+  | {
+      merchant: string;
+      normalizedMerchant: string;
+      itemName: string;
+      normalizedItemName: string;
+    }
+  | undefined {
+  const normalizedTask = task.trim().replace(/\s+/g, " ");
+  const patterns = [
+    /(?:order|buy|purchase|get|reorder)\s+(.+?)\s+(?:from|on|at)\s+([a-z0-9][a-z0-9.'& -]{1,80})$/i,
+    /(?:from|on|at)\s+([a-z0-9][a-z0-9.'& -]{1,80})\s+(?:order|buy|purchase|get)\s+(.+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalizedTask);
+    if (!match) {
+      continue;
+    }
+
+    const candidateItem = cleanOrderValue(
+      pattern === patterns[0] ? (match[1] ?? "") : (match[2] ?? ""),
+    );
+    const candidateMerchant = cleanOrderValue(
+      pattern === patterns[0] ? (match[2] ?? "") : (match[1] ?? ""),
+    );
+    if (!candidateItem || !candidateMerchant) {
+      continue;
+    }
+
+    const normalizedMerchant = normalizeKeySegment(candidateMerchant);
+    const normalizedItemName = normalizeKeySegment(candidateItem);
+    if (!normalizedMerchant || !normalizedItemName) {
+      continue;
+    }
+
+    return {
+      merchant: candidateMerchant,
+      normalizedMerchant,
+      itemName: candidateItem,
+      normalizedItemName,
+    };
+  }
+
+  return undefined;
+}
+
+function buildMerchantOrderTemplate(merchant: string, itemName: string): string {
+  return [
+    `Go to ${merchant} and order @{{${itemName}}} for the household.`,
+    "Reuse the saved browser profile if available.",
+    "Add only the requested item to the cart.",
+    "If checkout needs confirmation, payment, substitutions, delivery timing, or any missing info, stop and clearly report what is needed.",
+  ].join(" ");
+}
+
 function toBrowserStatus(status: string | undefined): BrowserStatus {
   if (status === "failed" || status === "blocked" || status === "error") {
     return "blocked";
@@ -71,9 +164,10 @@ export class BrowserUseService {
     task: string;
     profileId?: string;
   }): Promise<void> {
+    const preparedTask = await this.prepareBrowserTask(input.task);
     const profileLabel = input.profileId ?? this.config.browserUse.profileId ?? "(default)";
     console.log(
-      `[browser-use] Queued browser task — localSession=${input.browserSessionId}, profileId=${profileLabel}, model=${this.config.browserUse.model}, task=${JSON.stringify(input.task)}`,
+      `[browser-use] Queued browser task — localSession=${input.browserSessionId}, profileId=${profileLabel}, model=${this.config.browserUse.model}, task=${JSON.stringify(preparedTask.task)}`,
     );
 
     if (!this.config.browserUse.apiKey?.trim()) {
@@ -91,7 +185,7 @@ export class BrowserUseService {
     console.log(
       `[browser-use] Sending to ${this.config.browserUse.baseUrl} — localSession=${input.browserSessionId}`,
     );
-    await this.runRemoteTask(input);
+    await this.runRemoteTask(input, preparedTask);
   }
 
   private recordBrowserTaskFailure(
@@ -133,15 +227,19 @@ export class BrowserUseService {
     browserSessionId: string;
     task: string;
     profileId?: string;
-  }): Promise<void> {
+  }, preparedTask: PreparedBrowserTask): Promise<void> {
     const effectiveProfileId = input.profileId || this.config.browserUse.profileId;
     const started = this.database.createTranscriptEntry({
       kind: "tool",
       role: "system",
-      text: `Started browser task: ${input.task}`,
+      text: `Started browser task: ${preparedTask.task}`,
       toolName: "browser-use",
       toolStatus: "started",
-      metadata: { task: input.task },
+      metadata: {
+        task: preparedTask.task,
+        workspaceId: preparedTask.workspaceId,
+        cacheLabel: preparedTask.cacheLabel,
+      },
     });
     this.database.appendBrowserAction({
       browserSessionId: input.browserSessionId,
@@ -149,14 +247,31 @@ export class BrowserUseService {
       detail: "Sent task to Browser Use Cloud.",
       status: "pending",
     });
+    if (preparedTask.workspaceId) {
+      this.database.appendBrowserAction({
+        browserSessionId: input.browserSessionId,
+        kind: "cache",
+        detail:
+          preparedTask.cacheLabel ??
+          `Using deterministic rerun workspace ${preparedTask.workspaceId} for this browser task.`,
+        status: "pending",
+      });
+    }
     this.transcriptBus.publish("tool", started);
 
     try {
-      const createRemoteSessionRequest: { task: string; profileId?: string } = {
-        task: input.task,
+      const createRemoteSessionRequest: {
+        task: string;
+        profileId?: string;
+        workspaceId?: string;
+      } = {
+        task: preparedTask.task,
       };
       if (effectiveProfileId) {
         createRemoteSessionRequest.profileId = effectiveProfileId;
+      }
+      if (preparedTask.workspaceId) {
+        createRemoteSessionRequest.workspaceId = preparedTask.workspaceId;
       }
       const initialSession = await this.createRemoteSession(createRemoteSessionRequest);
 
@@ -164,7 +279,7 @@ export class BrowserUseService {
         browserSessionId: input.browserSessionId,
         status: toBrowserStatus(initialSession.status),
         summary: "Browser Use is working on the task.",
-        activeTask: input.task,
+        activeTask: preparedTask.task,
         remoteSessionId: initialSession.id,
       };
       if (effectiveProfileId) {
@@ -183,12 +298,13 @@ export class BrowserUseService {
         summary === "Browser task completed." && failed
           ? `Browser task ${cloudStatus || "failed"} in Browser Use Cloud.`
           : summary;
+      const cacheStatus = this.describeCacheOutcome(preparedTask, finalSession);
 
       const finalUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
         status: failed ? "blocked" : "idle",
-        summary: resolvedSummary,
-        activeTask: input.task,
+        summary: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
+        activeTask: preparedTask.task,
         remoteSessionId: finalSession.id,
         title: finalSession.title ?? "Browser Use session",
         currentUrl: finalSession.url ?? "Browser Use cloud session",
@@ -207,22 +323,44 @@ export class BrowserUseService {
         detail: resolvedSummary,
         status: failed ? "failed" : "completed",
       });
+      if (cacheStatus) {
+        this.database.appendBrowserAction({
+          browserSessionId: input.browserSessionId,
+          kind: "cache",
+          detail: cacheStatus,
+          status: failed ? "failed" : "completed",
+        });
+      }
+      if (!failed && preparedTask.orderIntent) {
+        this.database.recordShoppingOrder({
+          merchant: preparedTask.orderIntent.merchant,
+          normalizedMerchant: preparedTask.orderIntent.normalizedMerchant,
+          itemName: preparedTask.orderIntent.itemName,
+          normalizedItemName: preparedTask.orderIntent.normalizedItemName,
+          sourceTask: input.task,
+          templateId: preparedTask.template?.id ?? null,
+          browserSessionId: input.browserSessionId,
+        });
+      }
 
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
         role: "system",
-        text: resolvedSummary,
+        text: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
         toolName: "browser-use",
         toolStatus: failed ? "failed" : "completed",
         metadata: {
           sessionId: finalSession.id,
           liveUrl: finalSession.liveUrl ?? undefined,
+          workspaceId: finalSession.workspaceId ?? preparedTask.workspaceId,
+          deterministicRerun: Boolean(preparedTask.workspaceId),
+          cacheStatus: cacheStatus ?? undefined,
         },
       });
       const robot = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",
-        text: resolvedSummary,
+        text: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
       });
       this.transcriptBus.publish("tool", completed);
       this.transcriptBus.publish("transcript", robot);
@@ -237,6 +375,7 @@ export class BrowserUseService {
   private async createRemoteSession(input: {
     task: string;
     profileId?: string;
+    workspaceId?: string;
   }): Promise<BrowserUseSessionResponse> {
     const body: Record<string, unknown> = {
       task: input.task,
@@ -246,6 +385,9 @@ export class BrowserUseService {
     if (input.profileId) {
       body.profileId = input.profileId;
     }
+    if (input.workspaceId) {
+      body.workspaceId = input.workspaceId;
+    }
     if (this.config.browserUse.proxyCountryCode) {
       body.proxyCountryCode = this.config.browserUse.proxyCountryCode;
     }
@@ -253,7 +395,7 @@ export class BrowserUseService {
     const url = `${this.config.browserUse.baseUrl}/sessions`;
     console.log(`[browser-use] POST ${url} body=${JSON.stringify(body)}`);
 
-    return this.browserUseRequest("/sessions", {
+    return this.browserUseRequest<BrowserUseSessionResponse>("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -262,7 +404,7 @@ export class BrowserUseService {
 
   private async pollRemoteSession(sessionId: string): Promise<BrowserUseSessionResponse> {
     for (let attempt = 0; attempt < this.config.browserUse.maxPollAttempts; attempt += 1) {
-      const session = await this.browserUseRequest(`/sessions/${sessionId}`, { method: "GET" });
+      const session = await this.browserUseRequest<BrowserUseSessionResponse>(`/sessions/${sessionId}`, { method: "GET" });
       if (isTerminalCloudStatus(session.status)) {
         return session;
       }
@@ -273,7 +415,87 @@ export class BrowserUseService {
     throw new Error("Browser Use task timed out while polling the session.");
   }
 
-  private async browserUseRequest(path: string, init: RequestInit): Promise<BrowserUseSessionResponse> {
+  private async createWorkspace(name: string): Promise<BrowserUseWorkspaceResponse> {
+    return this.browserUseRequest<BrowserUseWorkspaceResponse>("/workspaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  private async prepareBrowserTask(task: string): Promise<PreparedBrowserTask> {
+    const orderIntent = parseOrderIntent(task);
+    if (!orderIntent) {
+      return { task };
+    }
+
+    const templateKey = `merchant_order:${orderIntent.normalizedMerchant}`;
+    const taskTemplate = buildMerchantOrderTemplate(orderIntent.merchant, orderIntent.itemName);
+    let template =
+      this.database.findBrowserTaskTemplateByKey(templateKey) ??
+      this.database.saveBrowserTaskTemplate({
+        templateKey,
+        label: `${orderIntent.merchant} repeat order`,
+        merchant: orderIntent.merchant,
+        taskTemplate,
+      });
+
+    let workspaceId = template.workspaceId ?? undefined;
+    let cacheLabel: string;
+    if (!workspaceId) {
+      const workspace = await this.createWorkspace(`${orderIntent.merchant} repeat orders`);
+      workspaceId = workspace.id;
+      template = this.database.saveBrowserTaskTemplate({
+        templateKey,
+        label: `${orderIntent.merchant} repeat order`,
+        merchant: orderIntent.merchant,
+        taskTemplate,
+        workspaceId,
+        incrementUseCount: true,
+      });
+      cacheLabel = `Created deterministic rerun workspace for ${orderIntent.merchant}. This first order seeds the reusable script.`;
+    } else {
+      template = this.database.saveBrowserTaskTemplate({
+        templateKey,
+        label: `${orderIntent.merchant} repeat order`,
+        merchant: orderIntent.merchant,
+        taskTemplate,
+        workspaceId,
+        incrementUseCount: true,
+      });
+      cacheLabel = `Reusing saved deterministic rerun workspace for ${orderIntent.merchant}.`;
+    }
+
+    return {
+      task: taskTemplate,
+      workspaceId,
+      cacheLabel,
+      template,
+      orderIntent,
+    };
+  }
+
+  private describeCacheOutcome(
+    preparedTask: PreparedBrowserTask,
+    session: BrowserUseSessionResponse,
+  ): string | undefined {
+    if (!preparedTask.workspaceId) {
+      return undefined;
+    }
+
+    const llmCost =
+      typeof session.llmCostUsd === "number"
+        ? session.llmCostUsd
+        : Number.parseFloat(String(session.llmCostUsd ?? ""));
+
+    if (Number.isFinite(llmCost) && llmCost === 0) {
+      return "Deterministic rerun reused the cached Browser Use script with $0 LLM cost.";
+    }
+
+    return "Deterministic rerun refreshed or seeded the Browser Use script for future repeat orders.";
+  }
+
+  private async browserUseRequest<T>(path: string, init: RequestInit): Promise<T> {
     const response = await fetch(`${this.config.browserUse.baseUrl}${path}`, {
       ...init,
       headers: {
@@ -289,6 +511,6 @@ export class BrowserUseService {
       throw new Error(body || `Browser Use request failed with status ${response.status}`);
     }
 
-    return (await response.json()) as BrowserUseSessionResponse;
+    return (await response.json()) as T;
   }
 }

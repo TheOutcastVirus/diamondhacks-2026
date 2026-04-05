@@ -18,7 +18,7 @@
     {
       id: 'transcription',
       label: 'Transcript',
-      eyebrow: 'Live feed',
+      eyebrow: '',
       title: 'Transcript',
       description: 'Conversation, tools, and agent actions in one stream.',
       metricLabel: 'Live',
@@ -139,7 +139,9 @@
   <main class="workspace">
     <header class="page-header">
       <div class="page-title">
-        <p class="eyebrow">{currentPage.eyebrow}</p>
+        {#if currentPage.eyebrow}
+          <p class="eyebrow">{currentPage.eyebrow}</p>
+        {/if}
         <h1 class="heading">{currentPage.title}</h1>
       </div>
     </header>
