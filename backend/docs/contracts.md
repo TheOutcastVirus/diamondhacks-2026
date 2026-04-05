@@ -28,7 +28,7 @@ All frontend-facing routes are rooted at `/api` and return JSON unless marked as
       "scheduleLabel": "Every day at 15:00",
       "nextRun": "2026-04-05T22:00:00.000Z",
       "status": "active",
-      "owner": "Gazabot agent",
+      "owner": "Sodium agent",
       "timezone": "America/Los_Angeles",
       "attachments": [
         {

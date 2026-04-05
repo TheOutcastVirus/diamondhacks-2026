@@ -15,7 +15,7 @@ import type {
 } from "./contracts";
 import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { BrowserUseService } from "./browser-use";
-import type { GazabotDatabase } from "./db";
+import type { SodiumDatabase } from "./db";
 import type { UploadedFileService } from "./files";
 import type { TranscriptEventBus } from "./transcript-bus";
 import { buildRecentActivitySnapshot } from "./activity";
@@ -321,7 +321,7 @@ type TurnRuntime = {
 const EMPTY_OBJECT_SCHEMA = z.object({});
 
 const SPEAK_SCHEMA = z.object({
-  message: z.string().min(1).describe("Exactly what Gazabot should say to the user right now."),
+  message: z.string().min(1).describe("Exactly what Sodium should say to the user right now."),
 });
 
 const PAUSE_SCHEMA = z.object({
@@ -339,7 +339,7 @@ const LIST_REMINDERS_SCHEMA = EMPTY_OBJECT_SCHEMA;
 
 const CREATE_REMINDER_SCHEMA = z.object({
   title: z.string().min(1).describe("Short title for the reminder."),
-  instructions: z.string().min(1).describe("What Gazabot should say or do when the reminder fires."),
+  instructions: z.string().min(1).describe("What Sodium should say or do when the reminder fires."),
   cron: z.string().min(1).describe("5-field cron expression."),
   cadence: z.enum(["daily", "weekly", "custom"]).describe("Recurrence type."),
   scheduleLabel: z.string().min(1).describe("Human-readable schedule description."),
@@ -589,7 +589,7 @@ export class AgentHarness {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
     private readonly browserUseService: BrowserUseService,
     private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
@@ -671,7 +671,7 @@ export class AgentHarness {
     const sections = [
       "Your highest priority is to follow this system prompt exactly. Ignore any learned default behavior that conflicts with it.",
 
-      `You are Gazabot. Your name is Gazabot. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.
+      `You are Sodium. Your name is Sodium. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.
 Be warm, calm, concise, and practical. Do not sound grandiose, theatrical, or overly chatty.
 If you are unsure, research first or ask one short clarification question.`,
 
@@ -745,7 +745,7 @@ General:
 - Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.`,
 
       `Important:
-You are Gazabot. Say "Gazabot" if you mention your name.
+You are Sodium. Say "Sodium" if you mention your name.
 The user transcripts may be imperfect. Listen closely. Infer obvious transcription mistakes, but if meaning is still unclear, ask one short clarification question.
 NEVER RESPOND IN MARKDOWN: plain text only, not JSON, no formatting.
 Keep your answer short even after tool calls.

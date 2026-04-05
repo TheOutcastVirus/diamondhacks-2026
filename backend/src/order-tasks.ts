@@ -1,5 +1,5 @@
 // Structured browser task strings for food and pharmacy ordering.
-// Adapted from SeeFood (gazabot).
+// Adapted from SeeFood (sodium).
 
 export type OrderCard = {
   card: string;

@@ -59,7 +59,7 @@
   function applyTheme(mode: ThemeMode) {
     themeMode = mode;
     document.documentElement.dataset.theme = mode;
-    window.localStorage.setItem('gazabot-theme', mode);
+    window.localStorage.setItem('sodium-theme', mode);
   }
 
   function syncRoute() {
@@ -84,7 +84,7 @@
   onMount(() => {
     syncRoute();
 
-    const storedTheme = window.localStorage.getItem('gazabot-theme') as ThemeMode | null;
+    const storedTheme = window.localStorage.getItem('sodium-theme') as ThemeMode | null;
     if (storedTheme === 'light' || storedTheme === 'dark') {
       applyTheme(storedTheme);
     } else {
@@ -108,10 +108,10 @@
 </script>
 
 <svelte:head>
-  <title>Gazabot Guardian Console</title>
+  <title>Sodium Guardian Console</title>
   <meta
     name="description"
-    content="Guardian-facing control surface for monitoring reminders, transcription, and browser activity on Gazabot."
+    content="Guardian-facing control surface for monitoring reminders, transcription, and browser activity on Sodium."
   />
 </svelte:head>
 
@@ -119,7 +119,7 @@
   <aside class="sidebar">
     <div class="brand-block">
       <p class="eyebrow">Guardian</p>
-      <h1 class="brand-heading">Gazabot</h1>
+      <h1 class="brand-heading">Sodium</h1>
     </div>
 
     <nav class="navigation" aria-label="Primary">

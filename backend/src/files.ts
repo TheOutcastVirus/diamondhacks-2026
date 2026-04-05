@@ -3,7 +3,7 @@ import { basename, extname, join } from "node:path";
 
 import type { AppConfig } from "./config";
 import type { UploadedFile } from "./contracts";
-import type { GazabotDatabase } from "./db";
+import type { SodiumDatabase } from "./db";
 
 function sanitizeDisplayName(value: string): string {
   return value
@@ -74,7 +74,7 @@ function normalizeGeminiText(value: string): string | null {
 export class UploadedFileService {
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
   ) {}
 
   async saveUpload(
