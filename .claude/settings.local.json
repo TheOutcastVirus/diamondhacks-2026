@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(bunx tsc:*)",
-      "Bash(bun test:*)"
+      "Bash(bun test:*)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

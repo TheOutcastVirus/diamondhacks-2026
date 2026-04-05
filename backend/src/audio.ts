@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 
 type AudioCommand = {
@@ -198,6 +198,67 @@ async function resolveRecordingCommand(outputPath: string): Promise<AudioCommand
   }
 
   return recordingArgsForPlatform(os, outputPath);
+}
+
+/**
+ * Returns ffmpeg args that stream raw PCM (s16le, 16 kHz, mono) to stdout on
+ * every platform — used by the Silero VAD recording path.
+ */
+async function resolvePcmStreamingArgs(): Promise<AudioCommand> {
+  const os = platform();
+  const pcmOutputArgs = ["-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"];
+
+  if (os === "darwin") {
+    return {
+      cmd: "ffmpeg",
+      args: ["-hide_banner", "-f", "avfoundation", "-i", ":0", ...pcmOutputArgs],
+    };
+  }
+
+  if (os === "linux") {
+    return {
+      cmd: "ffmpeg",
+      args: ["-hide_banner", "-f", "alsa", "-i", "default", ...pcmOutputArgs],
+    };
+  }
+
+  if (os === "win32") {
+    const openAlOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "openal", "-i", "dummy"]);
+    const openAlDevices = parseOpenAlCaptureDevices(openAlOutput);
+    if (openAlDevices.length > 0) {
+      return {
+        cmd: "ffmpeg",
+        args: [
+          "-hide_banner",
+          "-f", "openal",
+          "-channels", "1",
+          "-sample_size", "16",
+          "-sample_rate", "44100",
+          "-i", openAlDevices[0] ?? "",
+          ...pcmOutputArgs,
+        ],
+      };
+    }
+
+    const dshowOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+    const dshowDevices = parseDshowAudioDevices(dshowOutput);
+    if (dshowDevices.length > 0) {
+      return {
+        cmd: "ffmpeg",
+        args: [
+          "-hide_banner",
+          "-f", "dshow",
+          "-audio_buffer_size", "50",
+          "-i", `audio=${dshowDevices[0] ?? ""}`,
+          ...pcmOutputArgs,
+        ],
+      };
+    }
+
+    throw new Error("No Windows audio capture device found via ffmpeg (checked OpenAL and DirectShow).");
+  }
+
+  throw unsupportedPlatformError("recording", os);
 }
 
 export class AudioService {
@@ -602,6 +663,135 @@ export class AudioService {
       });
 
       // Start the max-duration timer even if stderr is slow
+      setTimeout(() => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      }, 600);
+    });
+  }
+
+  /**
+   * Records from the microphone on any platform, streams raw PCM s16le chunks
+   * (16 kHz, mono) to `onChunk`, and stops automatically when Silero VAD detects
+   * `silenceDuration` seconds of silence following a speech onset.
+   *
+   * A hard `maxDuration` cap prevents runaway recordings.  Falls back to the
+   * FFmpeg `silencedetect` filter if the Python/ONNX subprocess fails to start.
+   */
+  async recordPcmWithSileroVad(
+    onChunk: (pcm: Buffer) => void,
+    options?: {
+      maxDuration?: number;
+      silenceDuration?: number;
+      speechThreshold?: number;
+    },
+  ): Promise<void> {
+    if (this.proc) {
+      throw new Error("Already recording.");
+    }
+
+    const maxDuration     = options?.maxDuration     ?? 10;
+    const silenceDuration = options?.silenceDuration ?? 1.0;
+    const speechThreshold = options?.speechThreshold ?? 0.5;
+
+    const { cmd: ffmpegCmd, args: ffmpegArgs } = await resolvePcmStreamingArgs();
+
+    // Resolve the venv Python and VAD script paths (same convention as wake_word)
+    const botDir    = resolvePath(import.meta.dir, "../../bot");
+    const vadScript = resolvePath(botDir, "silero_vad.py");
+    const venvPython = process.platform === "win32"
+      ? resolvePath(botDir, ".venv/Scripts/python.exe")
+      : resolvePath(botDir, ".venv/bin/python3");
+    const python = (await stat(venvPython).catch(() => null)) ? venvPython : "python3";
+
+    return new Promise<void>((resolve, reject) => {
+      // ── Spawn Silero VAD subprocess ──────────────────────────────────────────
+      const vadProc = spawn(python, [
+        vadScript,
+        "--threshold",        String(speechThreshold),
+        "--silence-duration", String(silenceDuration),
+      ], { stdio: ["pipe", "pipe", "pipe"] });
+
+      let vadReady    = false;
+      let vadFailed   = false;
+      let vadStdoutBuf = "";
+
+      vadProc.stderr?.on("data", (chunk: Buffer) => {
+        process.stderr.write(`[silero-vad] ${chunk.toString()}`);
+      });
+
+      vadProc.on("error", (err: Error) => {
+        if (!vadReady) {
+          console.warn(`[silero-vad] Failed to start (${err.message}) — VAD unavailable.`);
+          vadFailed = true;
+        }
+      });
+
+      // ── Spawn FFmpeg for PCM capture ─────────────────────────────────────────
+      const ffmpeg = spawn(ffmpegCmd, ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
+      this.proc = ffmpeg;
+
+      let maxTimer: ReturnType<typeof setTimeout> | null = null;
+      let stopped       = false;
+      let inSpeech      = false;
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.proc = null;
+
+        // Close VAD stdin so it exits cleanly
+        try { vadProc.stdin?.end(); } catch { /* ignore */ }
+
+        ffmpeg.kill("SIGTERM");
+        ffmpeg.once("close", () => resolve());
+        setTimeout(resolve, 4000);
+      };
+
+      ffmpeg.on("error", (err: Error) => {
+        this.proc = null;
+        try { vadProc.stdin?.end(); } catch { /* ignore */ }
+        reject(new Error(`Failed to start recording: ${err.message}`));
+      });
+
+      ffmpeg.stderr?.on("data", (chunk: Buffer) => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      });
+
+      // Tee PCM chunks: invoke caller callback AND pipe to VAD subprocess
+      ffmpeg.stdout?.on("data", (chunk: Buffer) => {
+        onChunk(chunk);
+        if (vadReady && !vadFailed) {
+          try { vadProc.stdin?.write(chunk); } catch { /* ignore */ }
+        }
+      });
+
+      // Parse VAD events from the Python subprocess stdout
+      vadProc.stdout?.on("data", (chunk: Buffer) => {
+        vadStdoutBuf += chunk.toString();
+        const lines = vadStdoutBuf.split("\n");
+        vadStdoutBuf = lines[lines.length - 1] ?? "";
+
+        for (const line of lines.slice(0, -1)) {
+          const event = line.trim();
+          if (event === "READY") {
+            vadReady = true;
+            console.log("[silero-vad] Model ready.");
+          } else if (event === "speech_start") {
+            inSpeech = true;
+            process.stderr.write("[silero-vad] speech_start\n");
+          } else if (event === "speech_end" && inSpeech) {
+            process.stderr.write("[silero-vad] speech_end\n");
+            stop();
+          }
+        }
+      });
+
+      // Start max-duration timer even if ffmpeg stderr is slow
       setTimeout(() => {
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);
