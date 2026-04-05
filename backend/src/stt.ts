@@ -1,6 +1,11 @@
 import { AssemblyAI } from "assemblyai";
 import type { AppConfig } from "./config";
 
+export interface RealtimeSession {
+  sendAudio: (chunk: Buffer) => void;
+  finalize: () => Promise<string>;
+}
+
 export class SttService {
   private readonly client: AssemblyAI;
 
@@ -24,5 +29,46 @@ export class SttService {
     }
 
     return transcript.text ?? "";
+  }
+
+  /**
+   * Opens an AssemblyAI real-time streaming session.
+   * Call `sendAudio` with PCM s16le chunks (16 kHz, mono) as they arrive,
+   * then call `finalize` once recording stops to get the full transcript.
+   */
+  async createRealtimeSession(): Promise<RealtimeSession> {
+    const transcriber = this.client.realtime.transcriber({
+      sampleRate: 16000,
+      encoding: "pcm_s16le",
+    });
+
+    const finalParts: string[] = [];
+
+    transcriber.on("transcript", (t) => {
+      if (t.message_type === "FinalTranscript" && t.text?.trim()) {
+        finalParts.push(t.text.trim());
+      }
+    });
+
+    transcriber.on("error", (err: Error) => {
+      console.error("[stt] Realtime error:", err.message);
+    });
+
+    await transcriber.connect();
+
+    return {
+      sendAudio: (chunk: Buffer) => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (transcriber.sendAudio as (data: any) => void)(chunk);
+        } catch {
+          // ignore sends after the session is already closing
+        }
+      },
+      finalize: async () => {
+        await transcriber.close();
+        return finalParts.join(" ");
+      },
+    };
   }
 }

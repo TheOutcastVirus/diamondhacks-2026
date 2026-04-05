@@ -797,12 +797,7 @@ export class GazabotApp {
     return eventStreamResponse(request, this.config, stream);
   }
 
-  private async processVoiceAudio(audio: File | Blob | Buffer): Promise<{ transcript: string; replyText: string }> {
-    const transcript = await this.sttService.transcribe(audio);
-    if (!transcript.trim()) {
-      throw Object.assign(new Error("No speech detected."), { noSpeech: true });
-    }
-
+  private async processTranscriptText(transcript: string): Promise<{ transcript: string; replyText: string }> {
     const userEntry = this.database.createTranscriptEntry({
       kind: "message",
       role: "resident",
@@ -829,6 +824,14 @@ export class GazabotApp {
     }
 
     return { transcript, replyText };
+  }
+
+  private async processVoiceAudio(audio: File | Blob | Buffer): Promise<{ transcript: string; replyText: string }> {
+    const transcript = await this.sttService.transcribe(audio);
+    if (!transcript.trim()) {
+      throw Object.assign(new Error("No speech detected."), { noSpeech: true });
+    }
+    return this.processTranscriptText(transcript);
   }
 
   // ── Wake word ──────────────────────────────────────────────────────────────
@@ -889,36 +892,52 @@ export class GazabotApp {
     console.log("[wake-word] Wake word detected — recording command…");
     const t0 = Date.now();
 
-    let audioBuffer: Buffer;
+    // Open the AssemblyAI realtime WebSocket BEFORE starting the mic so
+    // transcription begins the moment the first audio chunk arrives.
+    let session: Awaited<ReturnType<typeof this.sttService.createRealtimeSession>>;
     try {
-      // Stop after 1 s of silence (-15 dB floor), hard cap at 10 s.
-      // Raise silenceDb toward -10 if still runs long; lower toward -25 if cutting off mid-sentence.
-      audioBuffer = await this.audioService.recordUntilSilence({
-        silenceDb: -15,
-        silenceDuration: 1,
-        maxDuration: 10,
-      });
+      session = await this.sttService.createRealtimeSession();
+    } catch (err) {
+      console.error("[wake-word] Failed to open STT session:", err);
+      return;
+    }
+
+    try {
+      // Stream PCM chunks directly to AssemblyAI while recording.
+      // Silence detection (-15 dB / 1 s) stops the mic; 10 s hard cap.
+      await this.audioService.recordPcmUntilSilence(
+        (chunk) => session.sendAudio(chunk),
+        { silenceDb: -15, silenceDuration: 1, maxDuration: 10 },
+      );
     } catch (err) {
       console.error("[wake-word] Recording failed:", err);
+      await session.finalize().catch(() => {});
       return;
     }
 
     console.log(`[wake-word] Recording stopped  +${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const t1 = Date.now();
 
-    let result: { transcript: string; replyText: string };
-    try {
-      result = await this.processVoiceAudio(audioBuffer);
-    } catch (err) {
-      if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
-        console.log("[wake-word] No speech detected after wake word.");
-        return;
-      }
-      console.error("[wake-word] Processing failed:", err);
+    // Flush any remaining transcripts — should be near-instant since
+    // transcription was running in parallel with recording.
+    const transcript = await session.finalize();
+    console.log(`[wake-word] STT done           +${((Date.now() - t1) / 1000).toFixed(1)}s`);
+
+    if (!transcript.trim()) {
+      console.log("[wake-word] No speech detected after wake word.");
       return;
     }
 
-    console.log(`[wake-word] STT + LLM done     +${((Date.now() - t1) / 1000).toFixed(1)}s  (command: "${result.transcript}"`);
+    const t2 = Date.now();
+    let result: { transcript: string; replyText: string };
+    try {
+      result = await this.processTranscriptText(transcript);
+    } catch (err) {
+      console.error("[wake-word] LLM processing failed:", err);
+      return;
+    }
+
+    console.log(`[wake-word] LLM done           +${((Date.now() - t2) / 1000).toFixed(1)}s  (command: "${result.transcript}")`);
 
     const audioOut = await this.ttsService.synthesize(result.replyText);
     await this.audioService.playAudio(audioOut);
