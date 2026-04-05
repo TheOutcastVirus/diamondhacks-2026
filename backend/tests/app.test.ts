@@ -884,7 +884,7 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-  test("tells the voice agent to call end_conversation before a farewell", async () => {
+  test("includes concise voice-turn context in the system prompt", async () => {
     let capturedSystemPrompt = "";
     const restore = withFetchStub(async (url, init) => {
       if (url.includes("/chat/completions")) {
@@ -921,8 +921,9 @@ describe("Gazabot Bun backend", () => {
       try {
         const result = await privateApp.processVoiceAudio(Buffer.from("voice-audio"));
         expect(result.replyText).toBe("Goodbye for now.");
-        expect(capturedSystemPrompt).toContain("you MUST call end_conversation before giving a brief farewell");
-        expect(capturedSystemPrompt).toContain("Do not end a voice conversation with farewell text alone");
+        expect(capturedSystemPrompt).toContain("You are Gazabot");
+        expect(capturedSystemPrompt).toContain("Turn type: voice.");
+        expect(capturedSystemPrompt).toContain("Current date and time:");
       } finally {
         app.close();
         database.close();
