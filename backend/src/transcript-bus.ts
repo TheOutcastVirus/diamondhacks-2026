@@ -31,6 +31,17 @@ export class TranscriptEventBus {
     }
   }
 
+  publishSessionReset(): void {
+    const frame = encodeSseFrame("session", { action: "reset" });
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber.enqueue(frame);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
+    }
+  }
+
   publishState(conversationState: "idle" | "conversation"): void {
     const frame = encodeSseFrame("state", { conversationState });
     for (const subscriber of this.subscribers) {

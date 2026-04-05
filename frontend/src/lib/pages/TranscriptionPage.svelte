@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { createEventStream, get } from '../api';
+  import { createEventStream, get, post } from '../api';
   import type { ConversationState, ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
   import VoiceInput from '../components/VoiceInput.svelte';
 
@@ -16,6 +16,20 @@
   let eventSource: EventSource | null = null;
   let expandedTools: Set<string> = new Set();
   let conversationState: ConversationState = 'idle';
+  let newConversationBusy = false;
+
+  async function startNewConversation() {
+    if (newConversationBusy) return;
+    newConversationBusy = true;
+    try {
+      await post('/api/conversation/new');
+      // entries cleared via the 'session' SSE event
+    } catch {
+      // non-critical — the SSE event will still arrive if the server handled it
+    } finally {
+      newConversationBusy = false;
+    }
+  }
 
   function formatTimestamp(value: string) {
     const parsed = new Date(value);
@@ -189,6 +203,18 @@
         // ignore malformed state events
       }
     });
+
+    source.addEventListener('session', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as { action?: string };
+        if (payload.action === 'reset') {
+          entries = [];
+          isBootstrapping = false;
+        }
+      } catch {
+        // ignore
+      }
+    });
   }
 
   function disconnectStream() {
@@ -239,12 +265,23 @@
         </button>
       </div>
 
-      {#if conversationState === 'conversation'}
-        <div class="convo-badge" role="status" aria-live="polite">
-          <span class="convo-dot" aria-hidden="true"></span>
-          Listening…
-        </div>
-      {/if}
+      <div class="toolbar-right">
+        {#if conversationState === 'conversation'}
+          <div class="convo-badge" role="status" aria-live="polite">
+            <span class="convo-dot" aria-hidden="true"></span>
+            Listening…
+          </div>
+        {/if}
+        <button
+          class="new-convo-btn"
+          type="button"
+          disabled={newConversationBusy}
+          on:click={startNewConversation}
+          title="Archive this conversation and start fresh"
+        >
+          {newConversationBusy ? '…' : 'New conversation'}
+        </button>
+      </div>
     </header>
 
     <div class="feed" data-transcript-feed>
@@ -496,6 +533,35 @@
     gap: 0.875rem 1rem;
     padding: 0.35rem 0;
     flex-shrink: 0;
+  }
+
+  div.toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+  }
+
+  button.new-convo-btn {
+    padding: 0.25rem 0.75rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-line-strong) 20%, transparent);
+    background: transparent;
+    color: var(--color-ink-soft);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+
+  button.new-convo-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-ink-strong) 6%, transparent);
+    color: var(--color-ink);
+    border-color: color-mix(in srgb, var(--color-line-strong) 40%, transparent);
+  }
+
+  button.new-convo-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   div.convo-badge {

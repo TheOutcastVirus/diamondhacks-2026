@@ -21,7 +21,7 @@ import { GazabotDatabase } from "./db";
 import { UploadedFileService } from "./files";
 import { parseMultipartUpload } from "./multipart";
 import { ReminderScheduler } from "./reminder-scheduler";
-import { resolveReminderTimezone } from "./reminders";
+import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import { SttService } from "./stt";
 import { TtsService } from "./tts";
 import { TranscriptEventBus } from "./transcript-bus";
@@ -468,6 +468,8 @@ export class GazabotApp {
   private conversationState: "idle" | "conversation" = "idle";
   private conversationTimer: ReturnType<typeof setTimeout> | null = null;
   private isSpeaking = false;
+  private lastActivityAt: Date | null = null;
+  private static readonly SESSION_GAP_MS = 10 * 60 * 1000; // 10 minutes
 
   private enterConversationMode(): void {
     this.conversationState = "conversation";
@@ -493,6 +495,36 @@ export class GazabotApp {
       () => this.exitConversationMode(),
       this.config.agent.conversationTimeoutSeconds * 1000,
     );
+  }
+
+  async archiveAndResetConversation(): Promise<void> {
+    const entries = this.database.listMessageTranscriptEntries();
+
+    if (entries.length > 0) {
+      const dateLabel = new Date().toLocaleString("en-US", {
+        timeZone: DEFAULT_REMINDER_TIMEZONE,
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+
+      const lines = entries
+        .filter((e) => e.role === "robot" || e.role === "resident")
+        .map((e) => {
+          const speaker = e.role === "robot" ? "Gazabot" : "User";
+          return `${speaker}: ${e.text}`;
+        });
+
+      if (lines.length > 0) {
+        const title = `past_conversation_${new Date().toISOString().slice(0, 16).replace(/[T:]/g, "_")}`;
+        this.database.writeMemory(title, `Conversation on ${dateLabel}:\n${lines.join("\n")}`);
+        console.log(`[session] Archived conversation as "${title}".`);
+      }
+    }
+
+    this.database.clearTranscriptEntries();
+    this.lastActivityAt = null;
+    this.transcriptBus.publishSessionReset();
+    console.log("[session] Transcript cleared — new session started.");
   }
 
   constructor(
@@ -581,6 +613,11 @@ export class GazabotApp {
 
       if (request.method === "GET" && url.pathname === "/api/transcript") {
         return jsonResponse(request, this.config, { entries: this.database.listTranscriptEntries() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/conversation/new") {
+        await this.archiveAndResetConversation();
+        return jsonResponse(request, this.config, { ok: true });
       }
 
       if (request.method === "GET" && url.pathname === "/api/transcript/stream") {
@@ -926,6 +963,16 @@ export class GazabotApp {
       return;
     }
 
+    // If the user has been away for more than SESSION_GAP_MS, archive the old
+    // conversation and start fresh before entering the new one.
+    if (
+      this.lastActivityAt !== null &&
+      Date.now() - this.lastActivityAt.valueOf() > GazabotApp.SESSION_GAP_MS
+    ) {
+      console.log("[session] Session gap exceeded — archiving conversation.");
+      await this.archiveAndResetConversation();
+    }
+
     console.log("[wake-word] Wake word detected — entering conversation mode.");
     this.enterConversationMode();
     await this.runConversationTurn();
@@ -973,7 +1020,8 @@ export class GazabotApp {
 
     console.log(`[conversation] User: "${result.transcript}"`);
 
-    // Processing complete — restart the inactivity timer with a fresh window
+    // Record activity time and restart the inactivity timer
+    this.lastActivityAt = new Date();
     this.resetConversationTimer();
 
     this.isSpeaking = true;
