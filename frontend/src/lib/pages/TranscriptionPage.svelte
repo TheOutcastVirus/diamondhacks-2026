@@ -1595,4 +1595,25 @@
       max-width: 100%;
     }
   }
+
+  @media (max-width: 480px) {
+    section.panel-feed {
+      min-block-size: 0;
+    }
+
+    button.seg-btn,
+    button.ghost,
+    button.action {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+
+    div.bubble-row {
+      max-width: 100%;
+    }
+
+    div.feed-scroll {
+      padding: 0.75rem 0.75rem 1.5rem;
+    }
+  }
 </style>

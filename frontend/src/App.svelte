@@ -10,6 +10,7 @@
     {
       id: 'reminders',
       label: 'Reminders',
+      shortLabel: 'Reminders',
       eyebrow: 'Reminders',
       title: 'Reminders',
       description: 'View, add, and update reminders.',
@@ -18,6 +19,7 @@
     {
       id: 'transcription',
       label: 'Transcript',
+      shortLabel: 'Transcript',
       eyebrow: '',
       title: 'Transcript',
       description: 'One timeline: live chat, tool calls, and what the agent is doing.',
@@ -26,6 +28,7 @@
     {
       id: 'browser',
       label: 'Browser',
+      shortLabel: 'Browser',
       eyebrow: '',
       title: 'Browser',
       description: 'Current page, task, and recent actions.',
@@ -34,6 +37,7 @@
     {
       id: 'requested-info',
       label: 'Requested Info',
+      shortLabel: 'Info',
       eyebrow: 'Memory',
       title: 'Requested Information',
       description: 'Review active intake forms and unified user memory.',
@@ -144,6 +148,9 @@
         {/if}
         <h1 class="heading">{currentPage.title}</h1>
       </div>
+      <button class="toggle mobile-header-toggle" type="button" on:click={toggleTheme} aria-label={themeLabel}>
+        {themeMode === 'light' ? '☀' : '☾'}
+      </button>
     </header>
 
     {#if currentPageId === 'reminders'}
@@ -157,3 +164,16 @@
     {/if}
   </main>
 </div>
+
+<nav class="mobile-bottom-nav" aria-label="Mobile navigation">
+  {#each pages as page}
+    <button
+      class:active={page.id === currentPageId}
+      class="mobile-tab"
+      type="button"
+      on:click={() => navigate(page.id)}
+    >
+      <span class="mobile-tab-label">{page.shortLabel}</span>
+    </button>
+  {/each}
+</nav>

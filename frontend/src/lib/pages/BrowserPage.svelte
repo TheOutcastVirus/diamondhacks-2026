@@ -1343,6 +1343,25 @@
     }
   }
 
+  @media (max-width: 480px) {
+    div.live-chrome {
+      min-height: 16rem;
+    }
+
+    iframe.preview-frame,
+    img.preview-image,
+    div.live-placeholder {
+      min-height: 14rem;
+    }
+
+    button.run-btn,
+    button.ghost,
+    button.action {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+  }
+
   button.ghost-danger {
     color: #e06c75;
     border-color: color-mix(in srgb, #e06c75 30%, var(--color-line));

@@ -1383,4 +1383,25 @@
       text-align: left;
     }
   }
+
+  @media (max-width: 480px) {
+    button.action,
+    button.ghost,
+    button.memory-item {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+
+    button.chip-action {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    input.field-input,
+    textarea.field-input,
+    select.field-input {
+      font-size: 1rem;
+      min-height: 3rem;
+    }
+  }
 </style>
