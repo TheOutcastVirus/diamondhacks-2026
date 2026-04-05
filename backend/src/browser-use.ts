@@ -6,6 +6,7 @@ import { TranscriptEventBus } from "./transcript-bus";
 import {
   buildCvsTask,
   buildFoodOrderTask,
+  buildGenericOrderTemplate,
   detectFoodPlatform,
   isCvsTask,
   type OrderCard,
@@ -84,7 +85,7 @@ function normalizeCloudStatus(status: string | undefined): string {
 
 function isTerminalCloudStatus(status: string | undefined): boolean {
   const normalized = normalizeCloudStatus(status);
-  return normalized === "completed" || normalized === "failed" || normalized === "stopped";
+  return normalized === "completed" || normalized === "failed" || normalized === "stopped" || normalized === "blocked";
 }
 
 function formatBrowserUseNetworkError(baseUrl: string, error: unknown): string {
@@ -244,6 +245,13 @@ function formatStructuredSummary(structured: BrowserUseStructuredOutput): string
     return details.length > 0 ? `Order placed. ${details.join(" · ")}.` : "Order placed.";
   }
 
+  if (status === "success") {
+    const body =
+      freeformTrimmed ||
+      "Reached checkout—finish delivery, address, or payment in the live browser view if needed.";
+    return `Success: ${body}`;
+  }
+
   if (status === "blocked") {
     const reason = blockedReason || freeformTrimmed;
     return reason ? `I couldn’t complete the task. Needed: ${reason}` : "I couldn’t complete the task (missing info).";
@@ -342,15 +350,6 @@ function parseOrderIntent(task: string):
   }
 
   return undefined;
-}
-
-function buildGenericOrderTemplate(merchant: string, itemName: string): string {
-  return [
-    `Go to ${merchant} and order ${itemName} for the household.`,
-    "Reuse the saved browser profile if available.",
-    "Add only the requested item to the cart.",
-    "If checkout needs confirmation, payment, substitutions, delivery timing, or any missing info, stop and clearly report what is needed.",
-  ].join(" ");
 }
 
 function parseCardFromMemory(raw: unknown): OrderCard | undefined {
@@ -755,6 +754,13 @@ export class BrowserUseService {
         }
         const currentStatus = normalizeCloudStatus(currentSession.status);
 
+        const structuredForHitl = coerceStructuredOutput(currentSession.output);
+        const structuredStatusEarly =
+          typeof structuredForHitl?.status === "string" ? structuredForHitl.status.trim().toLowerCase() : "";
+        if (structuredStatusEarly === "success" || structuredStatusEarly === "placed") {
+          break;
+        }
+
         const currentSummary = extractSummary(currentSession.output);
         // Also check raw output text so patterns match against the original blockedReason / output string
         const rawOutputText = typeof currentSession.output === "string"
@@ -762,7 +768,12 @@ export class BrowserUseService {
           : typeof currentSession.output === "object" && currentSession.output !== null
             ? JSON.stringify(currentSession.output)
             : "";
-        const need = this.detectNeededInfo(currentSummary) ?? this.detectNeededInfo(rawOutputText);
+        let need = this.detectNeededInfo(currentSummary) ?? this.detectNeededInfo(rawOutputText);
+        // If browser-use explicitly blocked (needs human action) but we couldn't classify why,
+        // treat it as a confirmation so the user is always prompted.
+        if (!need && currentStatus === "blocked") {
+          need = { kind: "confirmation", rawMessage: currentSummary };
+        }
         // Always check for HITL need first — even failed sessions may need user action (e.g. login).
         // Only break on terminal-failure if no actionable need was found.
         if (!need) {
@@ -1169,7 +1180,10 @@ export class BrowserUseService {
       });
     }
 
-    return buildGenericOrderTemplate(orderIntent.merchant, orderIntent.itemName);
+    return buildGenericOrderTemplate(orderIntent.merchant, orderIntent.itemName, {
+      ...(card !== undefined ? { card } : {}),
+      ...(deliveryAddress !== undefined ? { deliveryAddress } : {}),
+    });
   }
 
   private async prepareBrowserTask(task: string): Promise<PreparedBrowserTask> {
@@ -1296,6 +1310,9 @@ export class BrowserUseService {
       "payment", "credit card", "card number", "card info",
       "billing", "pay with", "enter card", "add payment",
       "payment method", "card details", "debit card",
+      "checkout", "reached checkout", "proceed to checkout",
+      "2. payment", "payment information", "card field", "cardholder",
+      "enter your card", "credit card information", "fill in payment",
     ];
     const addressPatterns = [
       "delivery address", "shipping address", "enter address",
@@ -1446,14 +1463,14 @@ export class BrowserUseService {
   private buildPaymentPromptFields(): PromptField[] {
     return [
       { name: "cardholder_name", label: "Cardholder Name", type: "string", required: true },
-      { name: "card_number", label: "Card Number", type: "password", required: true },
+      { name: "card_number", label: "Card Number", type: "string", required: true },
       { name: "exp_month", label: "Expiry Month (MM)", type: "string", required: true },
       { name: "exp_year", label: "Expiry Year (YYYY)", type: "string", required: true },
-      { name: "cvv", label: "Security Code (CVV)", type: "password", required: true },
+      { name: "cvv", label: "Security Code (CVV / CVC)", type: "password", required: true },
       { name: "billing_zip", label: "Billing ZIP Code", type: "string", required: false },
     ];
   }
-
+ 
   private buildAddressPromptFields(): PromptField[] {
     return [
       { name: "full_name", label: "Full Name", type: "string", required: true },

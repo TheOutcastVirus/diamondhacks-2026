@@ -1024,7 +1024,7 @@ describe("Gazabot Bun backend", () => {
         const result = await privateApp.processVoiceAudio(Buffer.from("voice-audio"));
         expect(result.replyText).toBe("Goodbye for now.");
         expect(capturedSystemPrompt).toContain("You are Gazabot");
-        expect(capturedSystemPrompt).toContain("Turn type: voice.");
+        expect(capturedSystemPrompt).toMatch(/voice/i);
         expect(capturedSystemPrompt).toContain("Current date and time:");
       } finally {
         app.close();

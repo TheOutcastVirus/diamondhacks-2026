@@ -10,7 +10,7 @@ const endpointMap: Record<EndpointKey, string> = {
   files: '/api/files',
 };
 
-const defaultDevApiBaseUrl = import.meta.env.DEV ? 'http://127.0.0.1:8000' : '';
+const defaultDevApiBaseUrl = import.meta.env.DEV ? 'http://100.64.213.177:8000' : '';
 const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 const apiBaseUrl = (configuredApiBaseUrl || defaultDevApiBaseUrl).replace(/\/$/, '');
 

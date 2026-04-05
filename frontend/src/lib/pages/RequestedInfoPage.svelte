@@ -23,6 +23,18 @@
   let expandedFileId = '';
   let eventSource: EventSource | null = null;
 
+  // Payment card form state
+  let cardFormData = {
+    cardholder_name: '',
+    card_number: '',
+    exp_month: '',
+    exp_year: '',
+    cvv: '',
+    billing_zip: '',
+  };
+  let cardFormBusy = false;
+  let cardFormFeedback: FeedbackState | null = null;
+
   function formatDate(value: string) {
     const parsed = new Date(value);
     return Number.isNaN(parsed.valueOf())
@@ -410,6 +422,41 @@
     }
   }
 
+  async function submitCardForm() {
+    if (!cardFormData.cardholder_name || !cardFormData.card_number || !cardFormData.exp_month || !cardFormData.exp_year) {
+      cardFormFeedback = { tone: 'error', text: 'Please fill in all required fields.' };
+      return;
+    }
+
+    cardFormBusy = true;
+    cardFormFeedback = null;
+
+    try {
+      await post('/api/memory/payment_card', {
+        cardholder_name: cardFormData.cardholder_name,
+        card_number: cardFormData.card_number,
+        exp_month: cardFormData.exp_month,
+        exp_year: cardFormData.exp_year,
+        ...(cardFormData.cvv ? { cvv: cardFormData.cvv } : {}),
+        ...(cardFormData.billing_zip ? { billing_zip: cardFormData.billing_zip } : {}),
+      });
+      cardFormFeedback = { tone: 'success', text: 'Payment card saved successfully.' };
+      cardFormData = {
+        cardholder_name: '',
+        card_number: '',
+        exp_month: '',
+        exp_year: '',
+        cvv: '',
+        billing_zip: '',
+      };
+      await loadRequestedInfo();
+    } catch (error) {
+      cardFormFeedback = { tone: 'error', text: error instanceof Error ? error.message : 'Unable to save payment card.' };
+    } finally {
+      cardFormBusy = false;
+    }
+  }
+
   onMount(async () => {
     await loadRequestedInfo();
     connectPromptStream();
@@ -460,7 +507,126 @@
         <h3 class="callout-heading">No active requests</h3>
         <p class="panel-copy">When the agent asks for deeper user details, the JSON-defined form will appear here.</p>
       </section>
-    {:else}
+    {/if}
+
+    <!-- Always-visible Payment Card Form -->
+    <article class="payment-card-section">
+      <div class="request-head">
+        <div>
+          <p class="panel-label">Quick Setup</p>
+          <h3 class="callout-heading">Save Payment Card</h3>
+        </div>
+      </div>
+      <p class="panel-copy">Save your payment card here. Browser automation will use it automatically when completing checkouts.</p>
+
+      <form class="dynamic-form" on:submit|preventDefault={submitCardForm}>
+        <label class="field">
+          <span class="field-label">
+            Cardholder Name
+            <span class="required-mark">*</span>
+          </span>
+          <input
+            class="field-input"
+            type="text"
+            placeholder="John Doe"
+            value={cardFormData.cardholder_name}
+            on:input={(e) => (cardFormData.cardholder_name = e.currentTarget.value)}
+            disabled={cardFormBusy}
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">
+            Card Number
+            <span class="required-mark">*</span>
+          </span>
+          <input
+            class="field-input"
+            type="text"
+            inputmode="numeric"
+            autocomplete="cc-number"
+            placeholder="1111 1111 1111 1111"
+            maxlength="23"
+            value={cardFormData.card_number}
+            on:input={(e) => (cardFormData.card_number = e.currentTarget.value)}
+            disabled={cardFormBusy}
+          />
+        </label>
+
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">
+              Expiry Month
+              <span class="required-mark">*</span>
+            </span>
+            <input
+              class="field-input"
+              type="text"
+              placeholder="MM"
+              maxlength="2"
+              value={cardFormData.exp_month}
+              on:input={(e) => (cardFormData.exp_month = e.currentTarget.value)}
+              disabled={cardFormBusy}
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">
+              Expiry Year
+              <span class="required-mark">*</span>
+            </span>
+            <input
+              class="field-input"
+              type="text"
+              placeholder="YYYY"
+              maxlength="4"
+              value={cardFormData.exp_year}
+              on:input={(e) => (cardFormData.exp_year = e.currentTarget.value)}
+              disabled={cardFormBusy}
+            />
+          </label>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Security code (CVV / CVC)</span>
+          <input
+            class="field-input"
+            type="password"
+            inputmode="numeric"
+            autocomplete="cc-csc"
+            placeholder="•••"
+            maxlength="4"
+            value={cardFormData.cvv}
+            on:input={(e) => (cardFormData.cvv = e.currentTarget.value)}
+            disabled={cardFormBusy}
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Billing ZIP Code</span>
+          <input
+            class="field-input"
+            type="text"
+            placeholder="12345"
+            value={cardFormData.billing_zip}
+            on:input={(e) => (cardFormData.billing_zip = e.currentTarget.value)}
+            disabled={cardFormBusy}
+          />
+        </label>
+
+        <button class="button button-primary" type="submit" disabled={cardFormBusy}>
+          {cardFormBusy ? 'Saving...' : 'Save Card'}
+        </button>
+
+        {#if cardFormFeedback}
+          <p class={`feedback ${cardFormFeedback.tone === 'error' ? 'feedback-error' : 'feedback-success'}`}>
+            {cardFormFeedback.text}
+          </p>
+        {/if}
+      </form>
+    </article>
+
+    {#if pendingPrompts.length > 0}
       <div class="stack">
         {#each pendingPrompts as prompt}
           <article class="request-card">
@@ -1402,6 +1568,25 @@
     select.field-input {
       font-size: 1rem;
       min-height: 3rem;
+    }
+  }
+
+  article.payment-card-section {
+    padding: 1.35rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-line);
+    background: color-mix(in srgb, var(--color-accent) 4%, var(--color-panel));
+  }
+
+  div.field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  @media (max-width: 600px) {
+    div.field-row {
+      grid-template-columns: 1fr;
     }
   }
 </style>

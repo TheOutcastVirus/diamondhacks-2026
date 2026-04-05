@@ -45,6 +45,29 @@
   let liveFeedNonce = 0;
   let liveFeedRefreshing = false;
 
+  /** Auto-refresh the iframe when a CDP timeout is detected (cross-origin, so we catch unhandledrejection). */
+  let iframeRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startIframeRefreshTimer() {
+    if (iframeRefreshTimer) return;
+    // Refresh the live view iframe every 60s to prevent stale CDP sessions
+    iframeRefreshTimer = setInterval(() => {
+      if (browserContext.previewUrl) {
+        liveFeedNonce += 1;
+      } else {
+        clearInterval(iframeRefreshTimer!);
+        iframeRefreshTimer = null;
+      }
+    }, 60_000);
+  }
+
+  function handleCdpTimeout(event: PromiseRejectionEvent) {
+    if (event.reason?.message?.includes('CDP') || String(event.reason).includes('CDP')) {
+      event.preventDefault();
+      liveFeedNonce += 1;
+    }
+  }
+
   type FriendlyCopy = {
     short: string;
     title: string;
@@ -188,6 +211,14 @@
       };
     }
 
+    if (status === 'success' || /^success:/i.test(normalized)) {
+      const detail = normalized.replace(/^success:\s*/i, '').trim() || normalized;
+      return {
+        short: shorten(detail, 88) || 'Checkout step reached.',
+        title: detail ? `Success — ${detail}` : 'Success — checkout step reached.',
+      };
+    }
+
     if (/i couldn't complete|could not complete|blocked/i.test(normalized)) {
       return {
         short: shorten(normalized, 88),
@@ -246,17 +277,23 @@
         ? (value.browser as Record<string, unknown>)
         : value;
 
+    const summary = String(container.summary ?? container.description ?? fallbackContext.summary);
+    let status: BrowserContext['status'] =
+      container.status === 'navigating' ||
+      container.status === 'executing' ||
+      container.status === 'blocked' ||
+      container.status === 'idle' ||
+      container.status === 'success'
+        ? (container.status as BrowserContext['status'])
+        : 'idle';
+    if (status === 'idle' && /^success:/i.test(summary)) {
+      status = 'success';
+    }
     return {
       url: String(container.url ?? fallbackContext.url),
       title: String(container.title ?? fallbackContext.title),
-      summary: String(container.summary ?? container.description ?? fallbackContext.summary),
-      status:
-        container.status === 'navigating' ||
-        container.status === 'executing' ||
-        container.status === 'blocked' ||
-        container.status === 'idle'
-          ? container.status
-          : 'idle',
+      summary,
+      status,
       lastUpdated: String(container.lastUpdated ?? container.timestamp ?? new Date().toISOString()),
       profileId: container.profileId ? String(container.profileId) : undefined,
       configuredProfileId: container.configuredProfileId ? String(container.configuredProfileId) : undefined,
@@ -363,13 +400,18 @@
   onMount(async () => {
     await loadBrowserContext();
     syncTimer();
+    window.addEventListener('unhandledrejection', handleCdpTimeout);
+    startIframeRefreshTimer();
   });
 
   onDestroy(() => {
     if (refreshTimer) clearInterval(refreshTimer);
+    if (iframeRefreshTimer) clearInterval(iframeRefreshTimer);
+    window.removeEventListener('unhandledrejection', handleCdpTimeout);
   });
 
   $: syncTimer();
+  $: if (browserContext.previewUrl) startIframeRefreshTimer();
 
   $: isActive = browserContext.status === 'executing' || browserContext.status === 'navigating';
   $: activeTaskCopy = describeActiveTask(browserContext.activeTask);
@@ -851,7 +893,8 @@
   }
 
   strong.status-pill-executing,
-  strong.status-pill-navigating {
+  strong.status-pill-navigating,
+  strong.status-pill-success {
     color: var(--color-success);
     background: color-mix(in srgb, var(--color-success) 14%, transparent);
     border-color: color-mix(in srgb, var(--color-success) 30%, transparent);

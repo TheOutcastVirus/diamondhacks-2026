@@ -108,18 +108,17 @@
 </script>
 
 <svelte:head>
-  <title>Gazabot Guardian Console</title>
+  <title>Sodium Dashboard</title>
   <meta
     name="description"
-    content="Guardian-facing control surface for monitoring reminders, transcription, and browser activity on Gazabot."
+    content="Control surface for monitoring reminders, transcription, and browser activity on Sodium."
   />
 </svelte:head>
 
 <div class="app-shell">
   <aside class="sidebar">
     <div class="brand-block">
-      <p class="eyebrow">Guardian</p>
-      <h1 class="brand-heading">Gazabot</h1>
+      <h1 class="brand-heading">Sodium</h1>
     </div>
 
     <nav class="navigation" aria-label="Primary">

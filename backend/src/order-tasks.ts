@@ -1,6 +1,22 @@
 // Structured browser task strings for food and pharmacy ordering.
 // Adapted from SeeFood (gazabot).
 
+/** Many sites (Walmart, grocers, etc.) leave the agent on a product or cart drawer unless checkout is clicked explicitly. */
+export const OPEN_CHECKOUT_FLOW =
+  "After items are in the cart, open the full cart or bag (not only a mini-cart preview), then click the primary checkout control (Checkout, Proceed to checkout, Check out, Start checkout, or View cart / Bag then Checkout). Continue until the checkout page or checkout step loads. Do not end the session while checkout has not been opened.";
+
+/** When the task does not include a card, stop before typing payment; report success once checkout (incl. address step) is open. */
+export const CHECKOUT_LIVE_BROWSER_HANDOFF =
+  "No payment card was included in this task: do not enter card details or click Place order yourself. Navigate through to checkout. When checkout is visible—including shipping, delivery, or address fields—return JSON with status 'success' and summary briefly describing the step (e.g. 'At shipping address—add payment in Requested Info or finish in the live view'). Use status 'blocked' only if you cannot reach checkout (login, errors, out of stock).";
+
+/** When payment details are in the task: milestone success at address/shipping, not blocked. */
+export const CHECKOUT_SUCCESS_WITH_PAYMENT_INSTRUCTION =
+  "Payment and delivery information are included in this task. When checkout opens, you will have what you need to complete it. Proceed through all checkout steps: enter/confirm delivery address if prompted, enter the payment card details provided, and submit the order. Return JSON with status 'success' when you reach a checkout field (address, payment, shipping method, etc.) and have successfully entered the provided information. Return status 'placed' only after the order submission is complete and you see an order confirmation (confirmation page, email prompt, order number, etc.). Use status 'blocked' only if you cannot proceed (sign-in required, item unavailable, payment declined, etc.).";
+
+/** Standard structured result shape for browser ordering tasks. */
+export const RETURN_CHECKOUT_JSON_SCHEMA =
+  "Return JSON: { status: 'placed' | 'success' | 'blocked', summary?: string, orderNumber?: string, total?: string, estimatedArrival?: string, blockedReason?: string }";
+
 export type OrderCard = {
   card: string;
   exp_month: string | number;
@@ -37,6 +53,41 @@ const FOOD_PLATFORM_URLS: Record<FoodOrderParams["platform"], string> = {
   grubhub: "https://www.grubhub.com",
 };
 
+export type GenericRetailOrderParams = {
+  merchant: string;
+  itemName: string;
+  card?: OrderCard;
+  deliveryAddress?: string;
+};
+
+export function buildGenericOrderTemplate(
+  merchant: string,
+  itemName: string,
+  extras?: { card?: OrderCard; deliveryAddress?: string },
+): string {
+  const card = extras?.card;
+  const deliveryAddress = extras?.deliveryAddress;
+  const cardInfo = card
+    ? `Card: ${card.card} exp ${card.exp_month}/${card.exp_year}${card.cvv ? ` CVV ${card.cvv}` : ""}.`
+    : "";
+  const addressInfo = deliveryAddress ? `Shipping or delivery address: ${deliveryAddress}.` : "";
+
+  return [
+    `Go to ${merchant} (e.g. walmart.com or the store's official site) and order ${itemName} for the household.`,
+    "Reuse the saved browser profile if available.",
+    "Add only the requested item to the cart.",
+    addressInfo,
+    cardInfo,
+    OPEN_CHECKOUT_FLOW,
+    ...(card ? [CHECKOUT_SUCCESS_WITH_PAYMENT_INSTRUCTION] : [CHECKOUT_LIVE_BROWSER_HANDOFF]),
+    "If sign-in, substitutions, delivery slot, or other info is needed before checkout, stop and clearly report what is required.",
+    "When you have the final result, stop browsing and end the session (do not keep it open).",
+    RETURN_CHECKOUT_JSON_SCHEMA,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export function buildFoodOrderTask(params: FoodOrderParams): string {
   const url = FOOD_PLATFORM_URLS[params.platform];
   const platformName =
@@ -62,9 +113,11 @@ export function buildFoodOrderTask(params: FoodOrderParams): string {
     `Add these items to the cart: ${itemList.join(", ")}.`,
     addressInfo,
     cardInfo,
+    OPEN_CHECKOUT_FLOW,
     "Proceed through checkout. If any substitution, timing, or confirmation is needed, stop and report what is required.",
+    ...(params.card ? [CHECKOUT_SUCCESS_WITH_PAYMENT_INSTRUCTION] : [CHECKOUT_LIVE_BROWSER_HANDOFF]),
     "When you have the final result, stop browsing and end the session (do not keep it open).",
-    "Return JSON: { status: 'placed' | 'blocked', orderNumber?: string, total?: string, estimatedArrival?: string, blockedReason?: string }",
+    RETURN_CHECKOUT_JSON_SCHEMA,
   ]
     .filter(Boolean)
     .join(" ");
@@ -93,9 +146,11 @@ export function buildCvsTask(params: CvsOrderParams): string {
     "For OTC items add them to the cart from the shop.",
     deliveryMode,
     cardInfo,
+    OPEN_CHECKOUT_FLOW,
     "Complete checkout. If anything is missing, out of stock, or requires input, stop and report clearly.",
+    ...(params.card ? [CHECKOUT_SUCCESS_WITH_PAYMENT_INSTRUCTION] : [CHECKOUT_LIVE_BROWSER_HANDOFF]),
     "When you have the final result, stop browsing and end the session (do not keep it open).",
-    "Return JSON: { status: 'placed' | 'blocked', orderNumber?: string, total?: string, estimatedArrival?: string, blockedReason?: string }",
+    RETURN_CHECKOUT_JSON_SCHEMA,
   ]
     .filter(Boolean)
     .join(" ");

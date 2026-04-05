@@ -142,14 +142,14 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "run_browser_task",
       description:
-        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately — the browser agent will automatically pause and ask the user for payment or delivery details if needed during checkout.",
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), retail or grocery (e.g. Walmart), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately. For purchases, the browser agent is instructed to open checkout (cart → Checkout); if payment was not supplied it pauses so the user can finish payment and place the order in the Browser panel live view, and it will ask for payment or delivery details when needed.",
       parameters: {
         type: "object",
         properties: {
           task: {
             type: "string",
             description:
-              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
+              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Order paper towels from Walmart', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
           },
         },
         required: ["task"],

@@ -882,6 +882,17 @@ export class GazabotApp {
           return jsonResponse(request, this.config, { entry });
         }
 
+        if (request.method === "POST") {
+          const data = asRecord(await parseJsonBody(request));
+          return jsonResponse(
+            request,
+            this.config,
+            this.database.writeMemory(title, JSON.stringify(data, null, 2), {
+              data,
+            }),
+          );
+        }
+
         if (request.method === "PATCH") {
           const payload = parseMemoryWrite(await parseJsonBody(request));
           return jsonResponse(

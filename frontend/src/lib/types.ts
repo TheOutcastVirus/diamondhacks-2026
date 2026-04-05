@@ -66,7 +66,7 @@ export type BrowserContext = {
   url: string;
   title: string;
   summary: string;
-  status: 'idle' | 'navigating' | 'executing' | 'blocked';
+  status: 'idle' | 'navigating' | 'executing' | 'blocked' | 'success';
   lastUpdated: string;
   profileId?: string;
   configuredProfileId?: string;
