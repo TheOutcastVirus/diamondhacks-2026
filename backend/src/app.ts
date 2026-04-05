@@ -662,6 +662,7 @@ export class GazabotApp {
       clearTimeout(this.conversationTimer);
       this.conversationTimer = null;
     }
+    this.releaseInteraction("conversation");
     this.transcriptBus.publishState("idle");
     console.log("[conversation] Returned to idle (inactivity timeout).");
   }
@@ -1008,6 +1009,7 @@ export class GazabotApp {
     if (result.kind === "browser_task") {
       return {
         route: "browser_task",
+        reply: result.text,
         browserSessionId: result.browserSessionId,
         previewUrl: result.previewUrl,
         status: "queued",
@@ -1084,9 +1086,18 @@ export class GazabotApp {
             const result = await this.agentHarness.collectTurn(payload);
 
             if (result.kind === "browser_task") {
+              if (result.text.trim()) {
+                const robotEntry = this.database.createTranscriptEntry({
+                  kind: "message",
+                  role: "robot",
+                  text: result.text,
+                });
+                this.transcriptBus.publish("transcript", robotEntry);
+                controller.enqueue(encodeSseFrame("chunk", { delta: result.text, done: false }));
+              }
               controller.enqueue(
                 encodeSseFrame("done", {
-                  text: "",
+                  text: result.text,
                   done: true,
                   route: "browser_task",
                   browserSessionId: result.browserSessionId,
@@ -1143,7 +1154,15 @@ export class GazabotApp {
     const endConversation = result.kind === "end_conversation";
 
     if (result.kind === "browser_task") {
-      replyText = "I'm on it - I'll handle that for you now.";
+      replyText = result.text || "I'm on it - I'll handle that for you now.";
+      if (replyText.trim()) {
+        const robotEntry = this.database.createTranscriptEntry({
+          kind: "message",
+          role: "robot",
+          text: replyText,
+        });
+        this.transcriptBus.publish("transcript", robotEntry);
+      }
     } else {
       replyText = result.text;
       const robotEntry = this.database.createTranscriptEntry({
@@ -1590,9 +1609,52 @@ export class GazabotApp {
       void this.browserUseService.resumeHitlRequest(hitlRequest).catch((error) => {
         console.error("[browser-use] Failed to resume HITL request:", error);
       });
+    } else if (this.wasAgentPrompt(completed.id)) {
+      void this.continueAfterPromptResponse(completed).catch((error) => {
+        console.error("[agent] Failed to continue after prompt response:", error);
+      });
     }
 
     return { prompt: completed, memoryEntry };
+  }
+
+  private wasAgentPrompt(promptId: string): boolean {
+    return this.database.listTranscriptEntries().some((entry) => {
+      if (entry.kind !== "tool" || entry.toolName !== "request_user_input") {
+        return false;
+      }
+
+      const metadata = entry.metadata ?? {};
+      if (metadata.promptId === promptId) {
+        return true;
+      }
+
+      const result =
+        typeof metadata.result === "object" && metadata.result !== null
+          ? (metadata.result as Record<string, unknown>)
+          : null;
+      return result?.promptId === promptId;
+    });
+  }
+
+  private async continueAfterPromptResponse(prompt: { title: string; memoryKey: string }): Promise<void> {
+    const result = await this.agentHarness.collectTurn({
+      message: `The user completed the "${prompt.title}" form. Read memory "${prompt.memoryKey}" and continue the pending task.`,
+      source: "dashboard",
+    });
+
+    if (result.text.trim()) {
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: result.text,
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+    }
+
+    if (result.kind === "end_conversation") {
+      await this.archiveAndResetConversation();
+    }
   }
 
   private async handleFileUpload(request: Request): Promise<{ file: UploadedFile }> {
@@ -1706,7 +1768,7 @@ export class GazabotApp {
     }
 
     const result = await this.agentHarness.collectTurn(payload);
-    if (result.kind === "text" || result.kind === "end_conversation") {
+    if (result.text.trim()) {
       const robotEntry = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",

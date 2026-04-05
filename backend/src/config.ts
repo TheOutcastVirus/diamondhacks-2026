@@ -199,7 +199,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   }
 
   const cerebras: AppConfig["cerebras"] = {
-    apiKey: source.CEREBRAS_API_KEY?.trim() || "",
+    apiKey: source.CEREBRAS_API_KEY?.trim() || source.INFERENCE_CLOUD_API_KEY?.trim() || "",
     endpoint: source.CEREBRAS_ENDPOINT?.trim() || "https://api.cerebras.ai/v1",
     model: source.CEREBRAS_MODEL?.trim() || "llama3.1-8b",
     maxTokens: parseInteger(source.CEREBRAS_MAX_TOKENS, 1024),
