@@ -14,19 +14,41 @@ The idea is simple: a voice-first assistant that can help with everyday tasks, s
 
 ## Run it locally
 
-Open two terminals.
+Do it in 3 steps:
 
-### 1. Start the backend
+### Bot (wake word)
+
+**macOS** — install PortAudio first:
+```bash
+brew install portaudio
+```
+
+
+**Linux** — install PortAudio first:
+```bash
+sudo apt install portaudio19-dev
+```
+
+
+Then set up the Python environment:
+```bash
+cd bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+
+### Backend
 
 ```bash
 cd backend
 bun install
 bun run dev
 ```
-
 The API health check should be available at `http://127.0.0.1:8000/health`.
 
-### 2. Start the frontend
+### Frontend
 
 ```bash
 cd frontend
