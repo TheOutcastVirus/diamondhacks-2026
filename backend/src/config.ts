@@ -24,6 +24,7 @@ export type AppConfig = {
   };
   agent: {
     chunkDelayMs: number;
+    conversationTimeoutSeconds: number;
   };
   imagine: {
     apiKey: string;
@@ -34,9 +35,6 @@ export type AppConfig = {
   };
   tts: {
     endpoint?: string;
-  };
-  assemblyAi: {
-    apiKey: string;
   };
   elevenLabs: {
     apiKey: string;
@@ -202,12 +200,10 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     browserUse,
     agent: {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
+      conversationTimeoutSeconds: parseInteger(source.CONVERSATION_TIMEOUT_SECONDS, 10),
     },
     imagine,
     tts,
-    assemblyAi: {
-      apiKey: source.ASSEMBLY_API_KEY?.trim() || "",
-    },
     elevenLabs: {
       apiKey: source.ELEVEN_LABS_API_KEY?.trim() || "",
       voiceId: source.ELEVEN_LABS_VOICE_ID?.trim() || "21m00Tcm4TlvDq8ikWAM",

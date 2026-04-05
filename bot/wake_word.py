@@ -7,7 +7,7 @@ each time the configured wake word is detected.  The Bun backend spawns this
 process on startup and reads its stdout to trigger the voice-command pipeline.
 
 Install deps:
-    pip install openwakeword pyaudio numpy
+    pip install openwakeword sounddevice numpy
 
 The first run downloads the TFLite model (~2 MB) and caches it locally.
 """
@@ -15,7 +15,7 @@ The first run downloads the TFLite model (~2 MB) and caches it locally.
 import sys
 import time
 import numpy as np
-import pyaudio
+import sounddevice as sd
 import openwakeword.utils
 from openwakeword.model import Model
 
@@ -38,37 +38,30 @@ def main() -> None:
     openwakeword.utils.download_models()
     model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")
 
-    audio = pyaudio.PyAudio()
-    stream = audio.open(
-        rate=SAMPLE_RATE,
-        channels=1,
-        format=pyaudio.paInt16,
-        input=True,
-        frames_per_buffer=CHUNK_FRAMES,
-    )
-
     print("[wake_word] Listening…", file=sys.stderr, flush=True)
     last_trigger = 0.0
 
     try:
-        while True:
-            raw = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
-            samples = np.frombuffer(raw, dtype=np.int16)
-            scores = model.predict(samples)
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=CHUNK_FRAMES,
+        ) as stream:
+            while True:
+                raw, _ = stream.read(CHUNK_FRAMES)
+                samples = np.frombuffer(raw, dtype=np.int16)
+                scores = model.predict(samples)
 
-            for score in scores.values():
-                if score >= DETECTION_THRESHOLD:
-                    now = time.monotonic()
-                    if now - last_trigger >= COOLDOWN_S:
-                        last_trigger = now
-                        print("WAKE", flush=True)   # backend reads this line
-                    break
+                for score in scores.values():
+                    if score >= DETECTION_THRESHOLD:
+                        now = time.monotonic()
+                        if now - last_trigger >= COOLDOWN_S:
+                            last_trigger = now
+                            print("WAKE", flush=True)   # backend reads this line
+                        break
     except KeyboardInterrupt:
         pass
-    finally:
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
 
 
 if __name__ == "__main__":

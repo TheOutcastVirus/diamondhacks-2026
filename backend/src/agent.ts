@@ -36,7 +36,8 @@ type ChatCompletionResponse = {
 
 export type AgentTurnResult =
   | { kind: "text"; text: string }
-  | { kind: "browser_task"; browserSessionId: string; previewUrl: string | null };
+  | { kind: "browser_task"; browserSessionId: string; previewUrl: string | null }
+  | { kind: "end_conversation"; text: string };
 
 const TOOL_DEFINITIONS = [
   {
@@ -184,21 +185,6 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "speak",
-      description:
-        "Speak a response aloud via text-to-speech. Use this to give voice feedback, confirmations, or spoken answers to the user.",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string", description: "Text to speak aloud" },
-        },
-        required: ["text"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "read_memory",
       description:
         "Fetch the full content of a stored memory entry by its title. Some entries are plain text and some are structured JSON-backed records, but they are all accessed through this same tool.",
@@ -240,6 +226,15 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "end_conversation",
+      description:
+        "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "request_user_input",
       description:
         'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
@@ -268,6 +263,61 @@ const TOOL_DEFINITIONS = [
     },
   },
 ] as const;
+
+// Maximum number of tool-call groups (assistant + results) to keep in the active
+// context window. Older groups are dropped before each API call to prevent context rot.
+const MAX_TOOL_GROUPS_IN_CONTEXT = 10;
+
+/**
+ * Prune the messages array sent to the model on each iteration.
+ *
+ * Strategy:
+ *  - Everything up to and including the current user message is kept (system
+ *    prompt + conversation history + the user's current request).
+ *  - After that point we have the agentic tool-call chain for this turn
+ *    (repeated assistant→tool_results pairs). We keep only the most recent
+ *    MAX_TOOL_GROUPS_IN_CONTEXT groups so the context doesn't bloat.
+ */
+function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
+  // Locate the last plain user message (not a tool result) — this is the pivot
+  let pivotIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const pivot = messages[i];
+    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
+      pivotIdx = i;
+      break;
+    }
+  }
+  if (pivotIdx === -1) return messages;
+
+  const prefix = messages.slice(0, pivotIdx + 1);
+  const toolChain = messages.slice(pivotIdx + 1);
+
+  // Group the tool chain into (assistant + its tool results) pairs
+  const groups: ChatMessage[][] = [];
+  let i = 0;
+  while (i < toolChain.length) {
+    const msg = toolChain[i];
+    if (!msg) break;
+    if (msg.role === "assistant" && msg.tool_calls?.length) {
+      const group: ChatMessage[] = [msg];
+      i++;
+      while (i < toolChain.length) {
+        const toolMsg = toolChain[i];
+        if (!toolMsg || toolMsg.role !== "tool") break;
+        group.push(toolMsg);
+        i++;
+      }
+      groups.push(group);
+    } else {
+      groups.push([msg]);
+      i++;
+    }
+  }
+
+  const kept = groups.slice(-MAX_TOOL_GROUPS_IN_CONTEXT);
+  return [...prefix, ...kept.flat()];
+}
 
 // Some model deployments output tool calls as plain JSON text instead of using the
 // tool_calls field. This parser detects and normalizes that pattern.
@@ -333,7 +383,7 @@ export class AgentHarness {
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Imagine API error ${response.status}: ${body}`);
+      throw new Error(`Imagine API error ${response.status} for model "${this.config.imagine.model}": ${body}`);
     }
 
     return response.json() as Promise<ChatCompletionResponse>;
@@ -360,7 +410,9 @@ export class AgentHarness {
                 r.attachments && r.attachments.length > 0
                   ? ` | attached files: ${r.attachments.map((attachment) => attachment.name).join(", ")}`
                   : "";
-              return `- ${r.title} (${r.scheduleLabel}): ${r.instructions}${attachmentSummary}`;
+              const nextRun = r.nextRun ?? "none";
+              const timezone = r.timezone ?? DEFAULT_REMINDER_TIMEZONE;
+              return `- id=${r.id} | title=${r.title} | status=${r.status} | schedule=${r.scheduleLabel} | timezone=${timezone} | next_run=${nextRun}: ${r.instructions}${attachmentSummary}`;
             })
             .join("\n");
 
@@ -380,44 +432,59 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically, so do NOT call the speak tool. Keep your response to 1-3 sentences."
-        : "\n\nUse the speak tool ONCE if you want to vocalize a reply.";
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
+        : "";
 
-    const systemPrompt = `You are Gazabot, a senior care assistant specializing in reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
+    const systemPrompt = `You are Gazabot, a senior-care assistant for reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
 
-Current date and time: ${new Date().toISOString()}
+Current date and time: ${new Date().toLocaleString("en-US", { timeZone: DEFAULT_REMINDER_TIMEZONE, dateStyle: "full", timeStyle: "long" })}
 
-Stored memory topics (call read_memory to get full details):
+Memory topics available via read_memory:
 ${memoryIndex}
 
 Active reminders:
 ${reminderSummary}
 
-When you learn something worth remembering about the user or household, call write_memory to store it.
-When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
-Available uploaded files (call list_uploaded_files or read_uploaded_file for details):
+Uploaded files available via list_uploaded_files or read_uploaded_file:
 ${uploadedFileSummary}
 
-ORDERING CAPABILITIES:
-- Food ordering platforms: DoorDash, Uber Eats, Grubhub — use run_browser_task with the platform name in the task string.
-- Pharmacy: CVS.com — OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
-- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
+Memory:
+- When you learn something worth remembering about the user or household, call write_memory.
+- When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
 
-TOOL USE RULES - follow exactly:
+Ordering:
+- Food ordering platforms: DoorDash, Uber Eats, Grubhub. Use run_browser_task and include the platform name in the task string.
+- Pharmacy: CVS.com for OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
+- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
+- run_browser_task hands work to another agent that cannot access your context. You must supply everything needed to finish the task. For example, when buying something, either collect credit card/address information with request_user_input or retrieve it from memory with read_memory when available.
+
+Tool rules. Follow exactly:
+
+General:
 - Only call a tool if the user EXPLICITLY requests that action.
-- For greetings, questions, or conversation: respond in plain text, call NO tools.
-- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
-- Use create_reminder ONLY if the user asks to set or schedule a reminder.
-- Use list_reminders ONLY if the user asks to see their reminders.
+- For greetings, questions, or conversation, respond in plain text and call NO tools.
 - Never call more than one tool per turn unless strictly necessary.
 - Never repeat a tool call.
+
+Web and browser:
+- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
+- run_browser_task hands work to another agent that does not have the information you do. Supply all information needed to complete the task.
+
+Reminders:
+- Use create_reminder ONLY if the user asks to set or schedule a reminder.
+- Use list_reminders ONLY if the user asks to see their reminders.
+- To update or delete a reminder, use the exact reminder id. If you are not certain which reminder id matches the user's request, call list_reminders first. Never guess a reminder id.
 - For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.
-- read_uploaded_file returns a text-only clone of the file. For images, prioritize the exact visible text and numbers from the image; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
-- When a user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on its contentText field as the file content you can reason over. If the user asks to extract text from an image, you only have access to the contentText. If the user absolutely wants to re-extract text, use the extract_pdf_text tool.
-- When you need specific user data (such as credit card information), prefer request_user_input over asking for free-form prose.
+
+Files and forms:
+- read_uploaded_file returns a text-only clone of the file. For images, prioritize exact visible text and numbers; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
+- If the user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on contentText as the file content you can reason over. If the user asks to extract text from an image, you only have access to contentText. If the user explicitly wants to re-extract text, use extract_pdf_text.
+- When you need specific user data, such as credit card information, prefer request_user_input over asking for free-form prose.
 - When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
-- The run_browser_task tool hands off the task to another agent, who does not have access to the information you do. It is your job to supply the browser agent with all the information needed to complete the task (For example, when buying something, ensure to either collect credit card information and address information - request_user_input - or retrieve it from memory - read_memory - when available)
-- Whenever you call request_user_input, ensure to use the speak tool to notify the user that they have information to fill out through the web UI Requested Info panel.`;
+- Whenever you call request_user_input, use the speak tool so the user knows to check the Requested Info panel in the web UI.
+
+Ending:
+- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -429,6 +496,67 @@ TOOL USE RULES - follow exactly:
 
     messages.push({ role: "user", content: request.message });
     return messages;
+  }
+
+  private resolveReminderId(
+    args: Record<string, unknown>,
+    options: { titleKeys?: string[] } = {},
+  ): string {
+    const findUniqueTitleMatch = (value: string): string | null => {
+      const normalized = value.trim().toLowerCase();
+      if (!normalized) {
+        return null;
+      }
+
+      const matches = this.database
+        .listReminders()
+        .filter((reminder) => reminder.title.trim().toLowerCase() === normalized);
+
+      if (matches.length === 1) {
+        return matches[0]!.id;
+      }
+
+      if (matches.length > 1) {
+        throw new Error(`Multiple reminders match "${value}". Use the exact reminder id.`);
+      }
+
+      return null;
+    };
+
+    for (const candidate of [args.id, args.reminderId, args.reminder_id]) {
+      if (typeof candidate !== "string" || !candidate.trim()) {
+        continue;
+      }
+
+      const identifier = candidate.trim();
+      const reminder = this.database.getReminderById(identifier);
+      if (reminder) {
+        return reminder.id;
+      }
+
+      const matchedByTitle = findUniqueTitleMatch(identifier);
+      if (matchedByTitle) {
+        return matchedByTitle;
+      }
+
+      throw new Error(`Reminder not found for identifier "${identifier}".`);
+    }
+
+    for (const key of options.titleKeys ?? []) {
+      const candidate = args[key];
+      if (typeof candidate !== "string" || !candidate.trim()) {
+        continue;
+      }
+
+      const matchedByTitle = findUniqueTitleMatch(candidate);
+      if (matchedByTitle) {
+        return matchedByTitle;
+      }
+
+      throw new Error(`Reminder not found for title "${candidate.trim()}".`);
+    }
+
+    throw new Error("Reminder id is required. Call list_reminders first if you are not certain which reminder to modify.");
   }
 
   private async executeTool(
@@ -450,6 +578,7 @@ TOOL USE RULES - follow exactly:
       text: `Calling tool: ${name}`,
       toolName: name,
       toolStatus: "started",
+      metadata: { params: args },
     });
     this.transcriptBus.publish("tool", startEntry);
 
@@ -480,6 +609,9 @@ TOOL USE RULES - follow exactly:
         }
 
         case "update_reminder": {
+          const reminderId = this.resolveReminderId(args, {
+            titleKeys: ["reminderTitle", "currentTitle", "existingTitle", "reminder_name"],
+          });
           const update: Record<string, unknown> = {};
           if (typeof args.title === "string") {
             update.title = args.title;
@@ -506,12 +638,19 @@ TOOL USE RULES - follow exactly:
             update.attachmentFileIds = args.attachmentFileIds.map((value) => String(value));
           }
 
-          result = this.database.updateReminder(String(args.id ?? ""), update as ReminderUpdateInput);
+          result = this.database.updateReminder(reminderId, update as ReminderUpdateInput);
           break;
         }
 
         case "delete_reminder": {
-          result = { deleted: this.database.deleteReminder(String(args.id ?? "")) };
+          const reminderId = this.resolveReminderId(args, {
+            titleKeys: ["title", "reminderTitle", "name", "reminder_name"],
+          });
+          const deleted = this.database.deleteReminder(reminderId);
+          if (!deleted) {
+            throw new Error(`Reminder not found for id "${reminderId}".`);
+          }
+          result = { deleted: true, id: reminderId };
           break;
         }
 
@@ -585,13 +724,6 @@ TOOL USE RULES - follow exactly:
           break;
         }
 
-        case "speak": {
-          const text = String(args.text ?? "");
-          await this.invokeTts(text);
-          result = { spoken: true };
-          break;
-        }
-
         case "read_memory": {
           result = this.database.readMemory(String(args.title ?? "")) ?? { error: "Memory entry not found" };
           break;
@@ -635,6 +767,11 @@ TOOL USE RULES - follow exactly:
             ...(fields !== undefined && { schema: fields }),
             ...(data !== undefined && { data }),
           });
+          break;
+        }
+
+        case "end_conversation": {
+          result = { ended: true };
           break;
         }
 
@@ -682,6 +819,7 @@ TOOL USE RULES - follow exactly:
         text: `Tool ${name} completed`,
         toolName: name,
         toolStatus: "completed",
+        metadata: { result },
       });
       this.transcriptBus.publish("tool", doneEntry);
 
@@ -696,27 +834,13 @@ TOOL USE RULES - follow exactly:
         text: `Tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`,
         toolName: name,
         toolStatus: "failed",
+        metadata: {
+          params: args,
+          error: error instanceof Error ? error.message : String(error),
+        },
       });
       this.transcriptBus.publish("tool", failEntry);
       return { result: { error: String(error) } };
-    }
-  }
-
-  private async invokeTts(text: string): Promise<void> {
-    // Publish TTS event so the frontend can play the audio
-    this.transcriptBus.publishTts(text);
-
-    const endpoint = this.config.tts.endpoint;
-    if (!endpoint) return;
-
-    try {
-      await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-    } catch {
-      // TTS is non-critical; ignore failures
     }
   }
 
@@ -747,7 +871,7 @@ TOOL USE RULES - follow exactly:
     let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
     for (let iteration = 0; iteration < 10; iteration++) {
-      const response = await this.callImagine(messages);
+      const response = await this.callImagine(pruneMessages(messages));
       const choice = response.choices[0];
       if (!choice) break;
 
@@ -764,10 +888,12 @@ TOOL USE RULES - follow exactly:
         messages.push({ ...choice.message, tool_calls: toolCalls });
 
         let promptSent = false;
+        let endConversation = false;
         for (const toolCall of toolCalls) {
           const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
           if (bt) browserTask = bt;
           if (toolCall.function.name === "request_user_input") promptSent = true;
+          if (toolCall.function.name === "end_conversation") endConversation = true;
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -777,6 +903,12 @@ TOOL USE RULES - follow exactly:
         // Stop looping once a user input form has been sent — further iterations would duplicate it
         if (promptSent) {
           return { kind: "text", text: "I've sent you a form to fill out. Please complete it and I'll continue." };
+        }
+        // Let the model produce a farewell text before we signal end_conversation
+        if (endConversation) {
+          const farewell = await this.callImagine(pruneMessages(messages));
+          const farewellText = (farewell.choices[0]?.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
+          return { kind: "end_conversation", text: farewellText };
         }
         continue;
       }

@@ -47,6 +47,43 @@ function openAlRecordingArgs(deviceName: string, outputPath: string): AudioComma
   };
 }
 
+function inputArgs(): string[] {
+  return platform() === "darwin"
+    ? ["-f", "avfoundation", "-i", ":0"]
+    : ["-f", "alsa", "-i", "default"];
+}
+
+function recordingArgs(outputPath: string): { cmd: string; args: string[] } {
+  return {
+    cmd: "ffmpeg",
+    args: [...inputArgs(), "-ar", "16000", "-ac", "1", outputPath, "-y"],
+  };
+}
+
+async function resolveRecordingCommandWithSilence(
+  outputPath: string,
+  silenceDb: number,
+  silenceDuration: number,
+): Promise<{ cmd: string; args: string[] }> {
+  // silencedetect logs "silence_start: <t>" to stderr when audio drops below
+  // the noise floor for the given duration; we parse that to auto-stop.
+  const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
+
+  if (platform() === "win32") {
+    const base = await probeWindowsRecordingCommand(outputPath);
+    // Splice the silence filter before the output path args
+    const outputIdx = base.args.indexOf(outputPath);
+    const before = base.args.slice(0, outputIdx);
+    const after = base.args.slice(outputIdx);
+    return { cmd: base.cmd, args: [...before, "-af", filter, ...after] };
+  }
+
+  return {
+    cmd: "ffmpeg",
+    args: [...inputArgs(), "-af", filter, "-ar", "16000", "-ac", "1", outputPath, "-y"],
+  };
+}
+
 function dshowRecordingArgs(deviceName: string, outputPath: string): AudioCommand {
   return {
     cmd: "ffmpeg",
@@ -66,117 +103,6 @@ function dshowRecordingArgs(deviceName: string, outputPath: string): AudioComman
       outputPath,
     ],
   };
-}
-
-export function recordingArgsForPlatform(os: NodeJS.Platform, outputPath: string): AudioCommand {
-  switch (os) {
-    case "darwin":
-      return {
-        cmd: "ffmpeg",
-        args: ["-hide_banner", "-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-y", outputPath],
-      };
-    case "linux":
-      // Linux (ALSA); works with PulseAudio/PipeWire via the ALSA plugin on most deployments.
-      return {
-        cmd: "ffmpeg",
-        args: ["-hide_banner", "-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-y", outputPath],
-      };
-    case "win32":
-      return openAlRecordingArgs("", outputPath);
-    default:
-      throw unsupportedPlatformError("recording", os);
-  }
-}
-
-function withSilenceFilter(command: AudioCommand, silenceDb: number, silenceDuration: number): AudioCommand {
-  const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
-  return {
-    cmd: command.cmd,
-    args: [...command.args.slice(0, -1), "-af", filter, command.args.at(-1) ?? ""].filter(Boolean),
-  };
-}
-
-export function playbackArgsForPlatform(os: NodeJS.Platform, audioPath: string): AudioCommand {
-  switch (os) {
-    case "darwin":
-      return { cmd: "afplay", args: [audioPath] };
-    case "linux":
-    case "win32":
-      return {
-        cmd: "ffplay",
-        args: ["-nodisp", "-autoexit", "-loglevel", "quiet", audioPath],
-      };
-    default:
-      throw unsupportedPlatformError("playback", os);
-  }
-}
-
-function runCommandCapture(command: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, { encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
-      const combined = `${stdout ?? ""}\n${stderr ?? ""}`;
-      if (error) {
-        const code = typeof error.code === "number" ? error.code : undefined;
-        const text = combined.trim();
-        if (code === 1 || code === 234) {
-          resolve(text);
-          return;
-        }
-
-        reject(new Error(text || error.message));
-        return;
-      }
-
-      resolve(combined.trim());
-    });
-  });
-}
-
-export function parseOpenAlCaptureDevices(output: string): string[] {
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.match(/^\[[^\]]+\]\s{2,}(.+?)\s*$/)?.[1] ?? "")
-    .filter((line) => line.length > 0);
-}
-
-export function parseDshowAudioDevices(output: string): string[] {
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.match(/^\[[^\]]+\]\s+"(.+)"\s+\(audio\)$/)?.[1] ?? "")
-    .filter((line) => line.length > 0);
-}
-
-async function probeWindowsRecordingCommand(outputPath: string): Promise<AudioCommand> {
-  const openAlOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "openal", "-i", "dummy"]);
-  const openAlDevices = parseOpenAlCaptureDevices(openAlOutput);
-  if (openAlDevices.length > 0) {
-    return openAlRecordingArgs(openAlDevices[0] ?? "", outputPath);
-  }
-
-  const dshowOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
-  const dshowDevices = parseDshowAudioDevices(dshowOutput);
-  if (dshowDevices.length > 0) {
-    return dshowRecordingArgs(dshowDevices[0] ?? "", outputPath);
-  }
-
-  throw new Error("No Windows audio capture device was found via ffmpeg (checked OpenAL and DirectShow).");
-}
-
-async function resolveRecordingCommand(outputPath: string): Promise<AudioCommand> {
-  const os = platform();
-  if (os === "win32") {
-    return probeWindowsRecordingCommand(outputPath);
-  }
-
-  return recordingArgsForPlatform(os, outputPath);
-}
-
-async function resolveRecordingCommandWithSilence(
-  outputPath: string,
-  silenceDb: number,
-  silenceDuration: number,
-): Promise<AudioCommand> {
-  return withSilenceFilter(await resolveRecordingCommand(outputPath), silenceDb, silenceDuration);
 }
 
 export function recordingArgsForPlatform(os: NodeJS.Platform, outputPath: string): AudioCommand {
@@ -496,13 +422,14 @@ export class AudioService {
     const { cmd, args } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
 
     return new Promise<Buffer>((resolve, reject) => {
-      const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
+      const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"] });
       this.proc          = child;
       this.recordingPath = outPath;
 
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
       let stderrTail = "";
+      let hasDetectedSpeech = false;
 
       const stop = () => {
         if (stopped) return;
@@ -512,9 +439,25 @@ export class AudioService {
         this.proc          = null;
         this.recordingPath = null;
 
-        child.kill("SIGTERM");
+        // Ask ffmpeg to stop gracefully by writing 'q' to stdin so it can flush
+        // the WAV container before exiting.  On Windows, kill("SIGTERM") is a
+        // hard TerminateProcess and skips the flush, producing a corrupt file.
+        let forcedKillTimer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          child.stdin?.write("q\n");
+          child.stdin?.end();
+          forcedKillTimer = setTimeout(() => {
+            try { child.kill(); } catch { /* ignore */ }
+          }, 2000);
+        } catch {
+          try { child.kill(); } catch { /* ignore */ }
+        }
 
+        let settled = false;
         const afterClose = async () => {
+          if (settled) return;
+          settled = true;
+          if (forcedKillTimer) { clearTimeout(forcedKillTimer); forcedKillTimer = null; }
           try {
             const buf = await readFile(outPath);
             unlink(outPath).catch(() => {});
@@ -543,9 +486,14 @@ export class AudioService {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
 
-        // ffmpeg silencedetect emits "silence_start: <timestamp>" when the
-        // configured silence duration has elapsed.  Stop as soon as we see it.
-        if (stderrTail.includes("silence_start")) {
+        // silence_end means audio went above the threshold — user has started speaking
+        if (stderrTail.includes("silence_end")) {
+          hasDetectedSpeech = true;
+        }
+
+        // Only stop on silence_start after speech was detected; otherwise the
+        // recording would end immediately if the environment starts quiet.
+        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
           stop();
         }
 
@@ -555,6 +503,100 @@ export class AudioService {
       });
 
       // Fallback: treat ffmpeg as started after 600 ms even with no stderr
+      setTimeout(() => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      }, 600);
+    });
+  }
+
+  /**
+   * Records from the microphone and streams raw PCM s16le chunks (16 kHz, mono)
+   * to `onChunk` in real-time.  Stops automatically once ffmpeg detects
+   * `silenceDuration` consecutive seconds below `silenceDb` dB, or after
+   * `maxDuration` seconds regardless.
+   *
+   * Use this with SttService.createRealtimeSession() so transcription runs in
+   * parallel with recording — by the time this resolves the transcript is ready.
+   */
+  async recordPcmUntilSilence(
+    onChunk: (pcm: Buffer) => void,
+    options?: { silenceDb?: number; silenceDuration?: number; maxDuration?: number },
+  ): Promise<void> {
+    if (this.proc) {
+      throw new Error("Already recording.");
+    }
+
+    const silenceDb       = options?.silenceDb       ?? -20;
+    const silenceDuration = options?.silenceDuration ?? 2;
+    const maxDuration     = options?.maxDuration      ?? 10;
+
+    const os = platform();
+    let micArgs: string[];
+    if (os === "darwin") {
+      micArgs = ["-f", "avfoundation", "-i", ":0"];
+    } else if (os === "linux") {
+      micArgs = ["-f", "alsa", "-i", "default"];
+    } else {
+      throw new Error(`Streaming PCM recording is not supported on ${os}.`);
+    }
+
+    const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
+    const args = [
+      "-hide_banner",
+      ...micArgs,
+      "-af", filter,
+      "-ar", "16000",
+      "-ac", "1",
+      "-f", "s16le",  // raw signed-16-bit little-endian PCM
+      "pipe:1",       // write to stdout
+    ];
+
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.proc          = child;
+      this.recordingPath = null;
+
+      let maxTimer: ReturnType<typeof setTimeout> | null = null;
+      let stopped = false;
+      let stderrTail = "";
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.proc = null;
+        child.kill("SIGTERM");
+        child.once("close", () => resolve());
+        setTimeout(resolve, 4000); // safety: don't block forever
+      };
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        onChunk(chunk);
+      });
+
+      child.on("error", (err) => {
+        this.proc = null;
+        reject(new Error(`Failed to start streaming recording: ${err.message}`));
+      });
+
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderrTail += chunk.toString();
+
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+
+        if (stderrTail.includes("silence_start")) {
+          stop();
+        }
+
+        const nl = stderrTail.lastIndexOf("\n");
+        if (nl !== -1) stderrTail = stderrTail.slice(nl + 1);
+      });
+
+      // Start the max-duration timer even if stderr is slow
       setTimeout(() => {
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);

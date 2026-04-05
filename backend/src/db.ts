@@ -292,21 +292,6 @@ function serializeReminder(row: ReminderRow): Reminder {
   };
 }
 
-function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
-  return {
-    id: row.id,
-    name: row.name,
-    originalName: row.original_name,
-    mimeType: row.mime_type,
-    sizeBytes: row.size_bytes,
-    textStatus: row.text_status,
-    createdAt: row.created_at,
-    reminderId: row.reminder_id ?? undefined,
-    promptId: row.prompt_id ?? undefined,
-    promptFieldName: row.prompt_field_name ?? undefined,
-  };
-}
-
 function serializeTranscriptEntry(row: TranscriptRow): TranscriptEntry {
   const entry: TranscriptEntry = {
     id: row.id,
@@ -839,6 +824,17 @@ export class GazabotDatabase {
       .query("SELECT * FROM transcript_entries ORDER BY timestamp ASC")
       .all() as TranscriptRow[];
     return rows.map(serializeTranscriptEntry);
+  }
+
+  listMessageTranscriptEntries(): TranscriptEntry[] {
+    const rows = this.database
+      .query("SELECT * FROM transcript_entries WHERE kind = 'message' ORDER BY timestamp ASC")
+      .all() as TranscriptRow[];
+    return rows.map(serializeTranscriptEntry);
+  }
+
+  clearTranscriptEntries(): void {
+    this.database.query("DELETE FROM transcript_entries").run();
   }
 
   createTranscriptEntry(input: {

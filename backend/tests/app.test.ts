@@ -410,6 +410,225 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("tells the voice agent to call end_conversation before a farewell", async () => {
+    let capturedSystemPrompt = "";
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          messages?: Array<{ role?: string; content?: string | null }>;
+        };
+        capturedSystemPrompt = String(body.messages?.[0]?.content ?? "");
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      const privateApp = app as unknown as {
+        sttService: { transcribe: (audio: File | Blob | Buffer) => Promise<string> };
+        processVoiceAudio: (audio: File | Blob | Buffer) => Promise<{
+          transcript: string;
+          replyText: string;
+          endConversation: boolean;
+        }>;
+      };
+
+      privateApp.sttService.transcribe = async () => "Goodbye";
+
+      try {
+        const result = await privateApp.processVoiceAudio(Buffer.from("voice-audio"));
+        expect(result.replyText).toBe("Goodbye for now.");
+        expect(capturedSystemPrompt).toContain("you MUST call end_conversation before giving a brief farewell");
+        expect(capturedSystemPrompt).toContain("Do not end a voice conversation with farewell text alone");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("updates reminders from agent tool calls that use reminderId and records the JSON result", async () => {
+    let completionRound = 0;
+    const { app, database } = createTestApp();
+    const reminder = database.createReminder({
+      title: "Hydration reminder",
+      instructions: "Prompt for water.",
+      cadence: "daily",
+      cron: "0 15 * * *",
+      scheduleLabel: "Every day at 15:00",
+      timezone: "America/Los_Angeles",
+    });
+
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_update_1",
+                      type: "function",
+                      function: {
+                        name: "update_reminder",
+                        arguments: JSON.stringify({
+                          reminderId: reminder.id,
+                          status: "paused",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Paused it.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost/api/agent/turn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: "Pause the hydration reminder.",
+            source: "guardian",
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(database.getReminderById(reminder.id)?.status).toBe("paused");
+
+      const toolEntries = database
+        .listTranscriptEntries()
+        .filter((entry) => entry.kind === "tool" && entry.toolName === "update_reminder");
+      const completedEntry = toolEntries.find((entry) => entry.toolStatus === "completed");
+      const resultMetadata = completedEntry?.metadata?.result as Record<string, unknown> | undefined;
+
+      expect(resultMetadata?.id).toBe(reminder.id);
+      expect(resultMetadata?.status).toBe("paused");
+    } finally {
+      restore();
+      app.close();
+      database.close();
+    }
+  });
+
+  test("deletes reminders from agent tool calls that pass the reminder title and records the JSON result", async () => {
+    let completionRound = 0;
+    const { app, database } = createTestApp();
+    const reminder = database.createReminder({
+      title: "Hydration reminder",
+      instructions: "Prompt for water.",
+      cadence: "daily",
+      cron: "0 15 * * *",
+      scheduleLabel: "Every day at 15:00",
+      timezone: "America/Los_Angeles",
+    });
+
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_delete_1",
+                      type: "function",
+                      function: {
+                        name: "delete_reminder",
+                        arguments: JSON.stringify({
+                          id: "Hydration reminder",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Deleted it.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost/api/agent/turn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: "Delete the hydration reminder.",
+            source: "guardian",
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(database.getReminderById(reminder.id)).toBeNull();
+
+      const toolEntries = database
+        .listTranscriptEntries()
+        .filter((entry) => entry.kind === "tool" && entry.toolName === "delete_reminder");
+      const completedEntry = toolEntries.find((entry) => entry.toolStatus === "completed");
+      const resultMetadata = completedEntry?.metadata?.result as Record<string, unknown> | undefined;
+
+      expect(resultMetadata).toEqual({
+        deleted: true,
+        id: reminder.id,
+      });
+    } finally {
+      restore();
+      app.close();
+      database.close();
+    }
+  });
+
   test("reuses deterministic rerun workspaces for repeat merchant orders", async () => {
     const sessionBodies: Array<Record<string, unknown>> = [];
     let workspaceCreates = 0;
@@ -1151,6 +1370,120 @@ trailer <<>>
       }
     } finally {
       restore();
+    }
+  });
+
+  test("keeps wake-word listening active while speaking a conversation reply", async () => {
+    const { app, database } = createTestApp();
+    const events: string[] = [];
+    const privateApp = app as unknown as {
+      conversationState: "idle" | "conversation";
+      runConversationTurn: () => Promise<void>;
+      processVoiceAudio: (audio: Buffer) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+      ttsService: { synthesize: (text: string) => Promise<Buffer> };
+      audioService: {
+        recordUntilSilence: (options?: unknown) => Promise<Buffer>;
+        playAudio: (audio: Buffer) => Promise<void>;
+      };
+    };
+
+    privateApp.conversationState = "conversation";
+    privateApp.audioService.recordUntilSilence = async () => {
+      events.push("record");
+      return Buffer.from("user-audio");
+    };
+    privateApp.processVoiceAudio = async () => {
+      events.push("process");
+      return {
+        transcript: "Hello there",
+        replyText: "Hi back",
+        endConversation: true,
+      };
+    };
+    privateApp.ttsService.synthesize = async (text: string) => {
+      events.push(`tts:${text}`);
+      return Buffer.from("assistant-audio");
+    };
+    privateApp.audioService.playAudio = async () => {
+      events.push("play:start");
+      await Bun.sleep(20);
+      events.push("play:end");
+    };
+
+    try {
+      await privateApp.runConversationTurn();
+
+      expect(events).toEqual([
+        "record",
+        "process",
+        "tts:Hi back",
+        "play:start",
+        "play:end",
+      ]);
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("rejects voice capture start while the agent is already speaking", async () => {
+    const { app, database } = createTestApp();
+    const privateApp = app as unknown as {
+      interactionOwner: "conversation" | "voice-http" | "reminder" | null;
+      interactionPhase: "idle" | "user_listening" | "agent_thinking" | "agent_speaking";
+    };
+
+    privateApp.interactionOwner = "reminder";
+    privateApp.interactionPhase = "agent_speaking";
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost/api/agent/voice-start", {
+          method: "POST",
+        }),
+      );
+
+      expect(response.status).toBe(409);
+      const payload = (await response.json()) as { message?: string };
+      expect(String(payload.message ?? "")).toContain("Interaction locked by reminder while speaking");
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("waits for playback to finish before releasing spoken replies", async () => {
+    const { app, database } = createTestApp();
+    const events: string[] = [];
+    const privateApp = app as unknown as {
+      speakReplyText: (text: string, source: "voice" | "reminder") => Promise<void>;
+      ttsService: { synthesize: (text: string) => Promise<Buffer> };
+      audioService: { playAudio: (audio: Buffer) => Promise<void> };
+    };
+
+    privateApp.ttsService.synthesize = async (text: string) => {
+      events.push(`tts:${text}`);
+      return Buffer.from("assistant-audio");
+    };
+    privateApp.audioService.playAudio = async () => {
+      events.push("play:start");
+      await Bun.sleep(20);
+      events.push("play:end");
+    };
+
+    try {
+      await privateApp.speakReplyText("Please take your medicine.", "reminder");
+      events.push("after");
+
+      expect(events).toEqual([
+        "tts:Please take your medicine.",
+        "play:start",
+        "play:end",
+        "after",
+      ]);
+    } finally {
+      app.close();
+      database.close();
     }
   });
 

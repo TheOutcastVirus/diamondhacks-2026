@@ -1,6 +1,6 @@
 import type { TranscriptEntry, UserPrompt } from "./contracts";
 
-type TranscriptEventType = "transcript" | "tool" | "tts" | "prompt";
+type TranscriptEventType = "transcript" | "tool" | "tts" | "prompt" | "state";
 
 function encodeSseFrame(event: string, payload: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -22,6 +22,28 @@ export class TranscriptEventBus {
 
   publishPrompt(prompt: UserPrompt): void {
     const frame = encodeSseFrame("prompt", prompt as unknown as Record<string, unknown>);
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber.enqueue(frame);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
+    }
+  }
+
+  publishSessionReset(): void {
+    const frame = encodeSseFrame("session", { action: "reset" });
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber.enqueue(frame);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
+    }
+  }
+
+  publishState(conversationState: "idle" | "conversation"): void {
+    const frame = encodeSseFrame("state", { conversationState });
     for (const subscriber of this.subscribers) {
       try {
         subscriber.enqueue(frame);
