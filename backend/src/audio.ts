@@ -266,6 +266,97 @@ export class AudioService {
   private recordingPath: string | null = null;
   private recordingError: string | null = null;
 
+  // ── Persistent Silero VAD subprocess ──────────────────────────────────────
+  private vadProc: ReturnType<typeof spawn> | null = null;
+  private vadIsReady = false;
+  private vadStdoutBuf = "";
+  // Set at the start of each recording turn; cleared when the turn ends.
+  private vadTurnCallback: ((event: string) => void) | null = null;
+  // Shared in-flight promise so concurrent startPersistentVad() calls don't
+  // spawn duplicate processes.
+  private vadStartingPromise: Promise<void> | null = null;
+
+  private async resolveVadPaths(): Promise<{ python: string; vadScript: string }> {
+    const botDir   = resolvePath(import.meta.dir, "../../bot");
+    const vadScript = resolvePath(botDir, "silero_vad.py");
+    const venvPython = process.platform === "win32"
+      ? resolvePath(botDir, ".venv/Scripts/python.exe")
+      : resolvePath(botDir, ".venv/bin/python3");
+    const python = (await stat(venvPython).catch(() => null)) ? venvPython : "python3";
+    return { python, vadScript };
+  }
+
+  /** Start the Silero VAD subprocess and wait until the model is ready.
+   *  Safe to call multiple times — concurrent calls share the same spawn. */
+  async startPersistentVad(options?: { threshold?: number; silenceDuration?: number }): Promise<void> {
+    if (this.vadProc && this.vadIsReady) return;
+    // Return the in-flight promise if a spawn is already underway
+    if (this.vadStartingPromise) return this.vadStartingPromise;
+
+    const threshold       = options?.threshold       ?? 0.5;
+    const silenceDuration = options?.silenceDuration ?? 1.0;
+    const { python, vadScript } = await this.resolveVadPaths();
+
+    this.vadStartingPromise = new Promise<void>((resolve, reject) => {
+      const proc = spawn(python, [
+        vadScript,
+        "--threshold",        String(threshold),
+        "--silence-duration", String(silenceDuration),
+      ], { stdio: ["pipe", "pipe", "pipe"] });
+
+      this.vadIsReady   = false;
+      this.vadStdoutBuf = "";
+
+      proc.stderr?.on("data", (chunk: Buffer) => {
+        process.stderr.write(`[silero-vad] ${chunk.toString()}`);
+      });
+
+      proc.on("error", (err: Error) => {
+        this.vadProc = null;
+        reject(new Error(`Failed to start Silero VAD: ${err.message}`));
+      });
+
+      proc.stdout?.on("data", (chunk: Buffer) => {
+        this.vadStdoutBuf += chunk.toString();
+        const lines = this.vadStdoutBuf.split("\n");
+        this.vadStdoutBuf = lines[lines.length - 1] ?? "";
+
+        for (const line of lines.slice(0, -1)) {
+          const event = line.trim();
+          if (event === "READY") {
+            this.vadProc    = proc;
+            this.vadIsReady = true;
+            console.log("[silero-vad] Model ready.");
+            resolve();
+          } else {
+            this.vadTurnCallback?.(event);
+          }
+        }
+      });
+
+      proc.on("close", (code: number | null) => {
+        if (this.vadProc === proc) {
+          this.vadProc    = null;
+          this.vadIsReady = false;
+          console.log(`[silero-vad] Process exited (code=${code}).`);
+        }
+      });
+
+      const readyTimeout = setTimeout(() => {
+        if (!this.vadIsReady) {
+          reject(new Error("Silero VAD did not become ready in 30 s (model download may have failed)."));
+          try { proc.kill(); } catch { /* ignore */ }
+        }
+      }, 30_000);
+
+      proc.once("close", () => clearTimeout(readyTimeout));
+    }).finally(() => {
+      this.vadStartingPromise = null;
+    });
+
+    return this.vadStartingPromise;
+  }
+
   async startRecording(): Promise<void> {
     if (this.proc) {
       throw new Error("Already recording.");
@@ -476,7 +567,7 @@ export class AudioService {
     }
 
     const silenceDb       = options?.silenceDb       ?? -30;
-    const silenceDuration = options?.silenceDuration ?? 4;
+    const silenceDuration = options?.silenceDuration ?? 1;
     const maxDuration     = options?.maxDuration      ?? 30;
 
     const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
@@ -740,141 +831,92 @@ export class AudioService {
 
   /**
    * Records from the microphone on any platform, streams raw PCM s16le chunks
-   * (16 kHz, mono) to `onChunk`, and stops automatically when Silero VAD detects
-   * `silenceDuration` seconds of silence following a speech onset.
+   * (16 kHz, mono) to `onChunk`, and stops automatically when the persistent
+   * Silero VAD subprocess detects `silenceDuration` seconds of silence after
+   * a speech onset.  Call `startPersistentVad()` at startup to pre-warm the
+   * model; if the subprocess isn't running yet it is started lazily here.
    *
-   * A hard `maxDuration` cap prevents runaway recordings.  Falls back to the
-   * FFmpeg `silencedetect` filter if the Python/ONNX subprocess fails to start.
+   * A hard `maxDuration` cap prevents runaway recordings.
    */
   async recordPcmWithSileroVad(
     onChunk: (pcm: Buffer) => void,
-    options?: {
-      maxDuration?: number;
-      silenceDuration?: number;
-      speechThreshold?: number;
-    },
+    options?: { maxDuration?: number },
   ): Promise<void> {
     if (this.proc) {
       throw new Error("Already recording.");
     }
 
-    const maxDuration     = options?.maxDuration     ?? 10;
-    const silenceDuration = options?.silenceDuration ?? 1.0;
-    const speechThreshold = options?.speechThreshold ?? 0.5;
+    const maxDuration = options?.maxDuration ?? 10;
+
+    // Ensure the VAD subprocess is running (no-op if already warm)
+    if (!this.vadProc || !this.vadIsReady) {
+      await this.startPersistentVad();
+    }
 
     const { cmd: ffmpegCmd, args: ffmpegArgs } = await resolvePcmStreamingArgs();
 
-    // Resolve the venv Python and VAD script paths (same convention as wake_word)
-    const botDir    = resolvePath(import.meta.dir, "../../bot");
-    const vadScript = resolvePath(botDir, "silero_vad.py");
-    const venvPython = process.platform === "win32"
-      ? resolvePath(botDir, ".venv/Scripts/python.exe")
-      : resolvePath(botDir, ".venv/bin/python3");
-    const python = (await stat(venvPython).catch(() => null)) ? venvPython : "python3";
-
     return new Promise<void>((resolve, reject) => {
-      // ── Spawn Silero VAD subprocess first ─────────────────────────────────
-      // FFmpeg is started only after VAD emits READY so no audio is missed
-      // while the ONNX model loads.
-      const vadProc = spawn(python, [
-        vadScript,
-        "--threshold",        String(speechThreshold),
-        "--silence-duration", String(silenceDuration),
-      ], { stdio: ["pipe", "pipe", "pipe"] });
-
-      let vadStdoutBuf = "";
-      let stopped      = false;
-      let inSpeech     = false;
-      let ffmpeg: ReturnType<typeof spawn> | null = null;
+      let stopped  = false;
+      let inSpeech = false;
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
 
       const stop = () => {
         if (stopped) return;
         stopped = true;
         if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.vadTurnCallback = null;
         this.proc = null;
 
-        try { vadProc.stdin?.end(); } catch { /* ignore */ }
-        try { vadProc.kill("SIGTERM"); } catch { /* ignore */ }
+        // Send graceful quit then hard-kill after 300 ms.  We're streaming raw
+        // PCM so there is no output file to flush — we don't need FFmpeg to
+        // shut down cleanly, we just need it gone fast.
+        try {
+          ffmpeg.stdin?.write("q");
+          ffmpeg.stdin?.end();
+        } catch { /* ignore if stdin already closed */ }
+        ffmpeg.once("close", () => resolve());
+        setTimeout(() => { try { ffmpeg.kill(); } catch { /* ignore */ } resolve(); }, 300);
+      };
 
-        if (ffmpeg) {
-          ffmpeg.kill("SIGTERM");
-          ffmpeg.once("close", () => resolve());
-          setTimeout(resolve, 4000);
-        } else {
-          resolve();
+      // Register per-turn event handler on the persistent VAD stdout stream
+      this.vadTurnCallback = (event: string) => {
+        if (event === "speech_start") {
+          inSpeech = true;
+          process.stderr.write("[silero-vad] speech_start\n");
+        } else if (event === "speech_end" && inSpeech) {
+          process.stderr.write("[silero-vad] speech_end\n");
+          stop();
         }
       };
 
-      vadProc.stderr?.on("data", (chunk: Buffer) => {
-        process.stderr.write(`[silero-vad] ${chunk.toString()}`);
+      const ffmpeg = spawn(ffmpegCmd, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
+      this.proc = ffmpeg;
+
+      ffmpeg.on("error", (err: Error) => {
+        this.proc            = null;
+        this.vadTurnCallback = null;
+        reject(new Error(`Failed to start recording: ${err.message}`));
       });
 
-      vadProc.on("error", (err: Error) => {
-        reject(new Error(`Failed to start Silero VAD: ${err.message}`));
-      });
-
-      vadProc.stdout?.on("data", (chunk: Buffer) => {
-        vadStdoutBuf += chunk.toString();
-        const lines = vadStdoutBuf.split("\n");
-        vadStdoutBuf = lines[lines.length - 1] ?? "";
-
-        for (const line of lines.slice(0, -1)) {
-          const event = line.trim();
-
-          if (event === "READY") {
-            console.log("[silero-vad] Model ready — starting microphone capture.");
-            startFfmpeg();
-          } else if (event === "speech_start") {
-            inSpeech = true;
-            process.stderr.write("[silero-vad] speech_start\n");
-          } else if (event === "speech_end" && inSpeech) {
-            process.stderr.write("[silero-vad] speech_end\n");
-            stop();
-          }
+      ffmpeg.stderr?.on("data", () => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
         }
       });
 
-      // ── FFmpeg is started here once VAD is ready ─────────────────────────
-      const startFfmpeg = () => {
-        if (stopped) return;
+      ffmpeg.stdout?.on("data", (pcm: Buffer) => {
+        onChunk(pcm);
+        if (this.vadProc && this.vadIsReady) {
+          try { this.vadProc.stdin?.write(pcm); } catch { /* ignore */ }
+        }
+      });
 
-        const child = spawn(ffmpegCmd, ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
-        ffmpeg = child;
-        this.proc = child;
-
-        child.on("error", (err: Error) => {
-          this.proc = null;
-          reject(new Error(`Failed to start recording: ${err.message}`));
-        });
-
-        child.stderr?.on("data", () => {
-          // Use first stderr output as the signal that FFmpeg is running
-          if (!maxTimer && !stopped) {
-            maxTimer = setTimeout(stop, maxDuration * 1000);
-          }
-        });
-
-        child.stdout?.on("data", (pcm: Buffer) => {
-          onChunk(pcm);
-          try { vadProc.stdin?.write(pcm); } catch { /* ignore */ }
-        });
-
-        // Fallback: start max-duration timer even if FFmpeg stderr is slow
-        setTimeout(() => {
-          if (!maxTimer && !stopped) {
-            maxTimer = setTimeout(stop, maxDuration * 1000);
-          }
-        }, 600);
-      };
-
-      // Safety: if VAD never becomes ready, give up after 30 s (covers first-run download)
+      // Fallback: start max-duration timer even if FFmpeg stderr is slow
       setTimeout(() => {
-        if (!ffmpeg && !stopped) {
-          reject(new Error("Silero VAD did not become ready in time (model download may have failed)."));
-          try { vadProc.kill("SIGTERM"); } catch { /* ignore */ }
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
         }
-      }, 30_000);
+      }, 600);
     });
   }
 

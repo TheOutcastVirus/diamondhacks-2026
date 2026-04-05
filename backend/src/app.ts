@@ -580,7 +580,7 @@ export class GazabotApp {
       });
 
       const lines = entries
-        .filter((e) => e.role === "robot" || e.role === "resident")
+        .filter((e) => e.role === "robot" || e.role === "resident" || e.role === "guardian")
         .map((e) => {
           const speaker = e.role === "robot" ? "Gazabot" : "User";
           return `${speaker}: ${e.text}`;
@@ -624,6 +624,10 @@ export class GazabotApp {
     this.sttService = new SttService(config);
     this.ttsService = new TtsService(config);
     this.startWakeWordListener();
+    // Pre-warm the Silero VAD model so the first conversation turn has no load delay
+    this.audioService.startPersistentVad({ threshold: 0.5, silenceDuration: 1.0 }).catch((err) => {
+      console.warn(`[silero-vad] Pre-warm failed: ${err.message}`);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1136,37 +1140,20 @@ export class GazabotApp {
     let sttFinishedAt = recordingStartedAt;
     try {
       this.setInteractionPhase("conversation", "user_listening");
-      if (process.platform === "win32") {
-        const audioBuffer = await this.audioService.recordUntilSilence({
-          silenceDb: -30,
-          silenceDuration: 1,
-          maxDuration: 10,
-        });
-        recordingStoppedAt = Date.now();
-        console.log(
-          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
-        );
-        transcript = await this.sttService.transcribe(audioBuffer);
-        sttFinishedAt = Date.now();
-        console.log(
-          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
-        );
-      } else {
-        const session = await this.sttService.createRealtimeSession();
-        await this.audioService.recordPcmUntilSilence(
-          (chunk) => session.sendAudio(chunk),
-          { silenceDb: -30, silenceDuration: 1.2, maxDuration: 10 },
-        );
-        recordingStoppedAt = Date.now();
-        console.log(
-          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
-        );
-        transcript = await session.finalize();
-        sttFinishedAt = Date.now();
-        console.log(
-          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
-        );
-      }
+      const session = await this.sttService.createRealtimeSession();
+      await this.audioService.recordPcmWithSileroVad(
+        (chunk) => session.sendAudio(chunk),
+        { maxDuration: 10 },
+      );
+      recordingStoppedAt = Date.now();
+      console.log(
+        `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
+      );
+      transcript = await session.finalize();
+      sttFinishedAt = Date.now();
+      console.log(
+        `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
+      );
     } catch (err) {
       console.error("[conversation] Recording failed:", err);
       this.resetConversationTimer();
