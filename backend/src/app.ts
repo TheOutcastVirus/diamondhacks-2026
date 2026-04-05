@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config";
 import type {
+  AgentModel,
   AgentTurnRequest,
   AgentTurnResponse,
   ApiErrorPayload,
@@ -428,8 +429,32 @@ function parseAgentTurnRequest(payload: unknown): AgentTurnRequest {
   if (forceBrowser !== undefined) {
     request.forceBrowser = forceBrowser;
   }
+  const model = optionalString(record, "model");
+  if (model) {
+    if (model !== "imagine" && model !== "gemini-fast") {
+      throw new Error("Invalid field: model");
+    }
+    request.model = model;
+  }
 
   return request;
+}
+
+function parseOptionalAgentModel(value: string | File | undefined | null): AgentModel | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (trimmed === "imagine" || trimmed === "gemini-fast") {
+    return trimmed;
+  }
+
+  throw new Error("Invalid field: model");
 }
 
 function roleForSource(source: AgentTurnRequest["source"]): TranscriptRole {
@@ -697,7 +722,7 @@ export class GazabotApp {
       }
 
       if (request.method === "POST" && url.pathname === "/api/agent/voice-stop") {
-        return jsonResponse(request, this.config, await this.handleVoiceStop());
+        return jsonResponse(request, this.config, await this.handleVoiceStop(request));
       }
 
       if (request.method === "GET" && url.pathname === "/api/prompts") {
@@ -823,8 +848,14 @@ export class GazabotApp {
         if (error.message.includes("INFERENCE_CLOUD_API_KEY is not configured")) {
           return errorResponse(request, this.config, 503, error.message);
         }
+        if (error.message.includes("GOOGLE_AI_API_KEY is not configured")) {
+          return errorResponse(request, this.config, 503, error.message);
+        }
 
         if (error.message.startsWith("Imagine API error")) {
+          return errorResponse(request, this.config, 502, error.message);
+        }
+        if (error.message.startsWith("Gemini API error") || error.message.startsWith("Gemini request failed")) {
           return errorResponse(request, this.config, 502, error.message);
         }
 
@@ -881,28 +912,36 @@ export class GazabotApp {
     const stream = new ReadableStream<string>({
       start: (controller) => {
         void (async () => {
-          let reply = "";
-
           try {
             controller.enqueue(encodeSseFrame("ready", { source: payload.source }));
-            const reader = this.agentHarness.streamTurn(payload).getReader();
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                break;
-              }
+            const result = await this.agentHarness.collectTurn(payload);
 
-              reply += value;
-              controller.enqueue(encodeSseFrame("chunk", { delta: value, done: false }));
+            if (result.kind === "browser_task") {
+              controller.enqueue(
+                encodeSseFrame("done", {
+                  text: "",
+                  done: true,
+                  route: "browser_task",
+                  browserSessionId: result.browserSessionId,
+                  previewUrl: result.previewUrl,
+                }),
+              );
+              controller.close();
+              return;
             }
 
+            const reply = result.text;
             const robotEntry = this.database.createTranscriptEntry({
               kind: "message",
               role: "robot",
               text: reply,
             });
             this.transcriptBus.publish("transcript", robotEntry);
+            controller.enqueue(encodeSseFrame("chunk", { delta: reply, done: false }));
             controller.enqueue(encodeSseFrame("done", { text: reply, done: true }));
+            if (result.kind === "end_conversation") {
+              await this.archiveAndResetConversation();
+            }
             controller.close();
           } catch (error) {
             const message = error instanceof Error ? error.message : "Agent stream failed.";
@@ -918,6 +957,7 @@ export class GazabotApp {
 
   private async processTranscriptText(
     transcript: string,
+    model?: AgentModel,
   ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
     const userEntry = this.database.createTranscriptEntry({
       kind: "message",
@@ -929,6 +969,7 @@ export class GazabotApp {
     const result: AgentTurnResult = await this.agentHarness.collectTurn({
       message: transcript,
       source: "voice",
+      ...(model !== undefined ? { model } : {}),
     });
 
     let replyText: string;
@@ -951,12 +992,13 @@ export class GazabotApp {
 
   private async processVoiceAudio(
     audio: File | Blob | Buffer,
+    model?: AgentModel,
   ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
     const transcript = await this.sttService.transcribe(audio);
     if (!transcript.trim()) {
       throw Object.assign(new Error("No speech detected."), { noSpeech: true });
     }
-    return this.processTranscriptText(transcript);
+    return this.processTranscriptText(transcript, model);
   }
 
   // ── Wake word ──────────────────────────────────────────────────────────────
@@ -1174,6 +1216,7 @@ export class GazabotApp {
     if (result.endConversation) {
       console.log("[conversation] Agent ended conversation.");
       this.exitConversationMode();
+      await this.archiveAndResetConversation();
       this.releaseInteraction("conversation");
       return;
     }
@@ -1209,10 +1252,18 @@ export class GazabotApp {
       return errorResponse(request, this.config, 422, "Missing audio field.");
     }
 
+    let model: AgentModel | undefined;
+    try {
+      model = parseOptionalAgentModel(formData.get("model"));
+    } catch (error) {
+      this.releaseInteraction("voice-http");
+      return errorResponse(request, this.config, 422, error instanceof Error ? error.message : "Invalid field: model");
+    }
+
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       this.setInteractionPhase("voice-http", "agent_thinking");
-      result = await this.processVoiceAudio(audioField);
+      result = await this.processVoiceAudio(audioField, model);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
         this.releaseInteraction("voice-http");
@@ -1225,6 +1276,9 @@ export class GazabotApp {
     try {
       this.setInteractionPhase("voice-http", "agent_speaking");
       await this.speakReplyText(result.replyText, "voice");
+      if (result.endConversation) {
+        await this.archiveAndResetConversation();
+      }
       return jsonResponse(request, this.config, { ok: true, transcript: result.transcript });
     } finally {
       this.releaseInteraction("voice-http");
@@ -1245,7 +1299,7 @@ export class GazabotApp {
     }
   }
 
-  private async handleVoiceStop(): Promise<{ ok: boolean; transcript: string }> {
+  private async handleVoiceStop(request: Request): Promise<{ ok: boolean; transcript: string }> {
     if (this.interactionOwner !== "voice-http") {
       throw this.interactionBusyError("voice-http");
     }
@@ -1259,10 +1313,26 @@ export class GazabotApp {
     }
     console.log(`[voice] Recorded buffer size: ${audioBuffer.length} bytes`);
 
+    let model: AgentModel | undefined;
+    try {
+      const body = await parseJsonBody(request);
+      const record = asRecord(body);
+      const modelValue =
+        typeof record.model === "string" || record.model instanceof File ? record.model : undefined;
+      model = parseOptionalAgentModel(modelValue);
+    } catch (error) {
+      if (error instanceof Error && error.message === "Invalid request.") {
+        model = undefined;
+      } else {
+        this.releaseInteraction("voice-http");
+        throw error;
+      }
+    }
+
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       this.setInteractionPhase("voice-http", "agent_thinking");
-      result = await this.processVoiceAudio(audioBuffer);
+      result = await this.processVoiceAudio(audioBuffer, model);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
         this.releaseInteraction("voice-http");
@@ -1275,6 +1345,9 @@ export class GazabotApp {
     try {
       this.setInteractionPhase("voice-http", "agent_speaking");
       await this.speakReplyText(result.replyText, "voice");
+      if (result.endConversation) {
+        await this.archiveAndResetConversation();
+      }
       return { ok: true, transcript: result.transcript };
     } finally {
       this.releaseInteraction("voice-http");
@@ -1426,13 +1499,16 @@ export class GazabotApp {
     this.transcriptBus.publish("transcript", userEntry);
 
     const result = await this.agentHarness.collectTurn(payload);
-    if (result.kind === "text") {
+    if (result.kind === "text" || result.kind === "end_conversation") {
       const robotEntry = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",
         text: result.text,
       });
       this.transcriptBus.publish("transcript", robotEntry);
+    }
+    if (result.kind === "end_conversation") {
+      await this.archiveAndResetConversation();
     }
 
     return result;

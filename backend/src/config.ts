@@ -43,6 +43,7 @@ export type AppConfig = {
   googleAi: {
     apiKey?: string;
     model: string;
+    agentModel: string;
     baseUrl: string;
   };
 };
@@ -179,7 +180,8 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   }
 
   const googleAi: AppConfig["googleAi"] = {
-    model: source.GOOGLE_AI_MODEL?.trim() || "gemini-2.5-flash",
+    model: source.GOOGLE_AI_MODEL?.trim() || "gemini-3.1-flash-lite-preview",
+    agentModel: source.GOOGLE_AI_AGENT_MODEL?.trim() || "gemini-3-pro-preview",
     baseUrl: source.GOOGLE_AI_BASE_URL?.trim() || "https://generativelanguage.googleapis.com/v1beta",
   };
   const googleApiKey = source.GOOGLE_AI_API_KEY?.trim();

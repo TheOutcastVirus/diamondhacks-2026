@@ -1,9 +1,10 @@
 <script lang="ts">
   import { post } from '../api';
-  import type { RecordingState } from '../types';
+  import type { AgentModel, RecordingState } from '../types';
 
   let state: RecordingState = 'idle';
   let error = '';
+  export let agentModel: AgentModel = 'imagine';
 
   async function startRecording() {
     error = '';
@@ -18,7 +19,7 @@
   async function stopRecording() {
     state = 'processing';
     try {
-      await post('/api/agent/voice-stop');
+      await post('/api/agent/voice-stop', { model: agentModel });
     } catch (err) {
       error = err instanceof Error ? err.message : 'Failed to process voice input.';
     } finally {
