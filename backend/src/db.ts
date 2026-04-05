@@ -121,6 +121,21 @@ type ShoppingOrderRow = {
   created_at: string;
 };
 
+type UploadedFileRow = {
+  id: string;
+  name: string;
+  original_name: string;
+  storage_path: string;
+  mime_type: string;
+  size_bytes: number;
+  text_status: UploadedFileTextStatus;
+  extracted_text: string | null;
+  reminder_id: string | null;
+  prompt_id: string | null;
+  prompt_field_name: string | null;
+  created_at: string;
+};
+
 export type BrowserTaskSession = {
   id: string;
   previewUrl: string | null;
@@ -254,6 +269,21 @@ function serializeReminder(row: ReminderRow): Reminder {
     owner: row.owner,
     timezone: row.timezone,
     attachments: parseUploadedFileReferences(row.attachments_json),
+  };
+}
+
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    reminderId: row.reminder_id ?? undefined,
+    promptId: row.prompt_id ?? undefined,
+    promptFieldName: row.prompt_field_name ?? undefined,
   };
 }
 
@@ -529,6 +559,21 @@ export class GazabotDatabase {
         source_task TEXT NOT NULL,
         template_id TEXT REFERENCES browser_task_templates(id) ON DELETE SET NULL,
         browser_session_id TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        text_status TEXT NOT NULL,
+        extracted_text TEXT,
+        reminder_id TEXT,
+        prompt_id TEXT,
+        prompt_field_name TEXT,
         created_at TEXT NOT NULL
       ) STRICT;
 
