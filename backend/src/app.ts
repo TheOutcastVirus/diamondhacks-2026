@@ -12,6 +12,8 @@ import type {
   UploadedFile,
   UploadedFileReference,
 } from "./contracts";
+import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import { AgentHarness, type AgentTurnResult } from "./agent";
 import { AudioService } from "./audio";
 import { BrowserUseService } from "./browser-use";
@@ -484,6 +486,7 @@ export class GazabotApp {
     this.reminderScheduler.start();
     this.sttService = new SttService(config);
     this.ttsService = new TtsService(config);
+    this.startWakeWordListener();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -822,6 +825,94 @@ export class GazabotApp {
 
     return { transcript, replyText };
   }
+
+  // ── Wake word ──────────────────────────────────────────────────────────────
+
+  private startWakeWordListener(): void {
+    const botDir = resolve(import.meta.dir, "../../bot");
+    const script = resolve(botDir, "wake_word.py");
+    // Use the venv's Python if it exists, otherwise fall back to system python3
+    const venvPython = resolve(botDir, ".venv/bin/python3");
+    const python = Bun.file(venvPython).size > 0 ? venvPython : "python3";
+    let child: ReturnType<typeof spawn>;
+
+    const start = () => {
+      child = spawn(python, [script], { stdio: ["ignore", "pipe", "pipe"] });
+
+      // Forward Python stderr so wake_word startup logs appear in the Bun console
+      child.stderr?.on("data", (chunk: Buffer) => {
+        process.stderr.write(`[wake-word] ${chunk.toString()}`);
+      });
+
+      let buf = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines[lines.length - 1] ?? "";
+
+        for (const line of lines.slice(0, -1)) {
+          if (line.trim() === "WAKE") {
+            this.handleWakeWord().catch((err) => {
+              console.error("[wake-word] Error handling wake word:", err);
+            });
+          }
+        }
+      });
+
+      child.on("error", (err: Error) => {
+        // Python not installed or script missing — log and skip rather than crash
+        console.warn(`[wake-word] Could not start wake_word.py: ${err.message}`);
+      });
+
+      child.on("close", (code: number | null) => {
+        console.warn(`[wake-word] Process exited (code=${code}). Restarting in 3 s…`);
+        setTimeout(start, 3000);
+      });
+    };
+
+    start();
+  }
+
+  private async handleWakeWord(): Promise<void> {
+    if (this.audioService.isRecording) {
+      console.log("[wake-word] Already recording — ignoring trigger.");
+      return;
+    }
+
+    console.log("[wake-word] Wake word detected — recording command…");
+
+    let audioBuffer: Buffer;
+    try {
+      // Stop after 4 s of silence (-30 dB floor), hard cap at 30 s
+      audioBuffer = await this.audioService.recordUntilSilence({
+        silenceDb: -30,
+        silenceDuration: 4,
+        maxDuration: 30,
+      });
+    } catch (err) {
+      console.error("[wake-word] Recording failed:", err);
+      return;
+    }
+
+    let result: { transcript: string; replyText: string };
+    try {
+      result = await this.processVoiceAudio(audioBuffer);
+    } catch (err) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
+        console.log("[wake-word] No speech detected after wake word.");
+        return;
+      }
+      console.error("[wake-word] Processing failed:", err);
+      return;
+    }
+
+    console.log(`[wake-word] Command: "${result.transcript}"`);
+
+    const audioOut = await this.ttsService.synthesize(result.replyText);
+    await this.audioService.playAudio(audioOut);
+  }
+
+  // ── HTTP voice routes ───────────────────────────────────────────────────────
 
   private async handleVoiceTurn(request: Request): Promise<Response> {
     let formData: Awaited<ReturnType<Request["formData"]>>;
