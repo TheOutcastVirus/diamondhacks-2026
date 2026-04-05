@@ -58,6 +58,7 @@ function createTestApp(overrides: Record<string, string> = {}) {
   const config = loadConfig({
     APP_NAME: "Gazabot Backend Test",
     DATABASE_PATH: join(directory, "test.sqlite"),
+    UPLOADS_DIR: join(directory, "uploads"),
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
     BROWSER_USE_API_KEY: "test-browser-key",
     AGENT_CHUNK_DELAY_MS: "5",
@@ -326,6 +327,137 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("reuses deterministic rerun workspaces for repeat merchant orders", async () => {
+    const sessionBodies: Array<Record<string, unknown>> = [];
+    let workspaceCreates = 0;
+    let sessionCreates = 0;
+
+    const restore = withFetchStub(async (url, init) => {
+      if (url.endsWith("/workspaces")) {
+        workspaceCreates += 1;
+        expect(init?.method).toBe("POST");
+        return jsonResponse({ id: "ws_cvs_repeat" });
+      }
+
+      if (url.endsWith("/sessions")) {
+        sessionCreates += 1;
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        sessionBodies.push(body);
+
+        if (sessionCreates === 1) {
+          expect(body.workspaceId).toBe("ws_cvs_repeat");
+          expect(String(body.task)).toContain("Go to CVS and order @{{chips}}");
+          return jsonResponse({
+            id: "remote-order-1",
+            status: "running",
+            liveUrl: "https://browser-use.example/live/1",
+            workspaceId: "ws_cvs_repeat",
+          });
+        }
+
+        expect(body.workspaceId).toBe("ws_cvs_repeat");
+        expect(String(body.task)).toContain("Go to CVS and order @{{pretzels}}");
+        return jsonResponse({
+          id: "remote-order-2",
+          status: "running",
+          liveUrl: "https://browser-use.example/live/2",
+          workspaceId: "ws_cvs_repeat",
+        });
+      }
+
+      if (url.endsWith("/sessions/remote-order-1")) {
+        return jsonResponse({
+          id: "remote-order-1",
+          status: "completed",
+          output: "Ordered chips from CVS.",
+          title: "CVS checkout",
+          url: "https://www.cvs.com/",
+          workspaceId: "ws_cvs_repeat",
+          llmCostUsd: "0.21",
+        });
+      }
+
+      if (url.endsWith("/sessions/remote-order-2")) {
+        return jsonResponse({
+          id: "remote-order-2",
+          status: "completed",
+          output: "Ordered pretzels from CVS.",
+          title: "CVS checkout",
+          url: "https://www.cvs.com/",
+          workspaceId: "ws_cvs_repeat",
+          llmCostUsd: "0",
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        INFERENCE_CLOUD_API_KEY: "",
+      });
+
+      try {
+        const firstOrderResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Order chips from CVS",
+              source: "guardian",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(firstOrderResponse.status).toBe(200);
+        expect(workspaceCreates).toBe(1);
+        expect(sessionCreates).toBe(1);
+        await Bun.sleep(30);
+
+        const secondOrderResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Order pretzels from CVS",
+              source: "guardian",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(secondOrderResponse.status).toBe(200);
+        expect(workspaceCreates).toBe(1);
+        expect(sessionCreates).toBe(2);
+        expect(sessionBodies).toHaveLength(2);
+        await Bun.sleep(30);
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        expect(browserResponse.status).toBe(200);
+        const browserPayload = (await browserResponse.json()) as {
+          browser: { summary: string; recentActions: Array<{ detail: string }> };
+        };
+
+        expect(browserPayload.browser.summary).toContain("$0 LLM cost");
+        expect(browserPayload.browser.recentActions.some((action) => action.detail.includes("deterministic rerun"))).toBe(
+          true,
+        );
+
+        const orders = database.listShoppingOrders();
+        expect(orders).toHaveLength(2);
+        expect(orders[0]?.merchant).toBe("CVS");
+        expect(orders[0]?.itemName).toBe("pretzels");
+        expect(orders[1]?.itemName).toBe("chips");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("stores prompt responses and plain notes in the same memory surface", async () => {
     const { app, database } = createTestApp();
 
@@ -379,6 +511,135 @@ describe("Gazabot Bun backend", () => {
         uses_walker: true,
       });
       expect(profilePayload.entry.schema).toHaveLength(2);
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("uploads documents, extracts PDF text, and links files to reminders", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      const form = new FormData();
+      form.append(
+        "file",
+        new File(
+          [
+            `%PDF-1.4
+1 0 obj
+<< /Length 53 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Hello Prescription) Tj
+ET
+endstream
+endobj
+trailer <<>>
+%%EOF`,
+          ],
+          "prescription.pdf",
+          { type: "application/pdf" },
+        ),
+      );
+
+      const uploadResponse = await app.fetch(
+        new Request("http://localhost/api/files", {
+          method: "POST",
+          body: form,
+        }),
+      );
+
+      expect(uploadResponse.status).toBe(200);
+      const uploadPayload = (await uploadResponse.json()) as { file: Record<string, unknown> };
+      expect(uploadPayload.file.name).toBe("prescription.pdf");
+      expect(uploadPayload.file.textStatus).toBe("ready");
+      expect(String(uploadPayload.file.extractedText)).toContain("Hello");
+
+      const fileId = String(uploadPayload.file.id);
+
+      const reminderResponse = await app.fetch(
+        new Request("http://localhost/api/reminders", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Mail prescription",
+            instructions: "Mail the attached prescription to the pharmacy.",
+            cadence: "daily",
+            cron: "0 10 * * *",
+            scheduleLabel: "Every day at 10:00",
+            timezone: "America/Los_Angeles",
+            attachmentFileIds: [fileId],
+          }),
+        }),
+      );
+
+      expect(reminderResponse.status).toBe(200);
+      const reminderPayload = (await reminderResponse.json()) as Record<string, unknown>;
+      expect(Array.isArray(reminderPayload.attachments)).toBe(true);
+      expect((reminderPayload.attachments as Array<Record<string, unknown>>)[0]?.name).toBe("prescription.pdf");
+
+      const textResponse = await app.fetch(new Request(`http://localhost/api/files/${fileId}/text`));
+      expect(textResponse.status).toBe(200);
+      const textPayload = (await textResponse.json()) as Record<string, unknown>;
+      expect(textPayload.textStatus).toBe("ready");
+      expect(String(textPayload.text)).toContain("Hello");
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("accepts file fields in prompts and stores uploaded file references in structured memory", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      const prompt = database.createPrompt({
+        title: "Prescription upload",
+        description: "Attach the prescription that should be mailed.",
+        memoryKey: "prescription_packet",
+        fields: [
+          { name: "prescription_files", label: "Prescription", type: "file", required: true, accept: ".pdf" },
+          { name: "delivery_address", label: "Delivery address", type: "text", required: true },
+        ],
+      });
+
+      const form = new FormData();
+      form.append("promptId", prompt.id);
+      form.append("fieldName", "prescription_files");
+      form.append("file", new File(["doctor notes"], "rx.txt", { type: "text/plain" }));
+
+      const uploadResponse = await app.fetch(
+        new Request("http://localhost/api/files", {
+          method: "POST",
+          body: form,
+        }),
+      );
+
+      expect(uploadResponse.status).toBe(200);
+      const uploadPayload = (await uploadResponse.json()) as { file: Record<string, unknown> };
+
+      const respondResponse = await app.fetch(
+        new Request(`http://localhost/api/prompts/${prompt.id}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            response: {
+              prescription_files: [uploadPayload.file],
+              delivery_address: "123 Main St\nSpringfield, CA 90210",
+            },
+          }),
+        }),
+      );
+
+      expect(respondResponse.status).toBe(200);
+      const respondPayload = (await respondResponse.json()) as { memoryEntry: Record<string, unknown> };
+      const data = respondPayload.memoryEntry.data as Record<string, unknown>;
+      expect(Array.isArray(data.prescription_files)).toBe(true);
+      expect((data.prescription_files as Array<Record<string, unknown>>)[0]?.name).toBe("rx.txt");
+      expect((data.prescription_files as Array<Record<string, unknown>>)[0]?.textStatus).toBe("ready");
     } finally {
       app.close();
       database.close();

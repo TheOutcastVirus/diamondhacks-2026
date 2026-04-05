@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { createEventStream, get, post } from '../api';
-  import type { PromptField, UserMemoryEntry, UserPrompt } from '../types';
+  import { createEventStream, get, post, uploadFile } from '../api';
+  import type { PromptField, UploadedFile, UploadedFileReference, UserMemoryEntry, UserPrompt } from '../types';
 
   type FeedbackState = {
     tone: 'error' | 'success';
@@ -10,12 +10,15 @@
 
   let prompts: UserPrompt[] = [];
   let memoryEntries: UserMemoryEntry[] = [];
+  let uploadedFiles: UploadedFile[] = [];
   let isLoading = true;
   let loadError = '';
   let submitBusy: Record<string, boolean> = {};
   let submitFeedback: Record<string, FeedbackState | undefined> = {};
-  let formValues: Record<string, Record<string, string | number | boolean>> = {};
+  let uploadBusy: Record<string, boolean> = {};
+  let formValues: Record<string, Record<string, string | number | boolean | UploadedFileReference[]>> = {};
   let selectedMemoryTitle = '';
+  let selectedFileId = '';
   let eventSource: EventSource | null = null;
 
   function formatDate(value: string) {
@@ -28,7 +31,11 @@
         }).format(parsed);
   }
 
-  function getDefaultValue(field: PromptField): string | number | boolean {
+  function getDefaultValue(field: PromptField): string | number | boolean | UploadedFileReference[] {
+    if (field.type === 'file') {
+      return [];
+    }
+
     if (field.defaultValue !== undefined && field.defaultValue !== null) {
       return field.defaultValue;
     }
@@ -49,7 +56,7 @@
   }
 
   function ensurePromptState(prompt: UserPrompt) {
-    const nextValues: Record<string, string | number | boolean> = {
+    const nextValues: Record<string, string | number | boolean | UploadedFileReference[]> = {
       ...(formValues[prompt.id] ?? {}),
     };
 
@@ -74,12 +81,15 @@
         value.type === 'boolean' ||
         value.type === 'password' ||
         value.type === 'date' ||
-        value.type === 'select'
+        value.type === 'select' ||
+        value.type === 'file'
           ? value.type
           : 'string',
       required: Boolean(value.required),
       placeholder: value.placeholder ? String(value.placeholder) : undefined,
       description: value.description ? String(value.description) : undefined,
+      accept: value.accept ? String(value.accept) : undefined,
+      multiple: Boolean(value.multiple),
       options: Array.isArray(value.options)
         ? value.options.map((option, optionIndex) => {
             const item = typeof option === 'object' && option !== null ? (option as Record<string, unknown>) : {};
@@ -96,6 +106,21 @@
         typeof value.defaultValue === 'boolean'
           ? value.defaultValue
           : undefined,
+    };
+  }
+
+  function normalizeUploadedFileReference(raw: unknown): UploadedFileReference | null {
+    const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+    if (!value.id || !value.name || !value.mimeType) {
+      return null;
+    }
+
+    return {
+      id: String(value.id),
+      name: String(value.name),
+      mimeType: String(value.mimeType),
+      sizeBytes: Number(value.sizeBytes ?? 0),
+      textStatus: value.textStatus === 'ready' || value.textStatus === 'failed' ? value.textStatus : 'none',
     };
   }
 
@@ -118,6 +143,27 @@
     };
   }
 
+  function normalizeUploadedFile(raw: unknown, index: number): UploadedFile {
+    const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+    return {
+      id: String(value.id ?? `file_${index}`),
+      name: String(value.name ?? value.originalName ?? `Upload ${index + 1}`),
+      originalName: String(value.originalName ?? value.name ?? `upload_${index + 1}`),
+      mimeType: String(value.mimeType ?? 'application/octet-stream'),
+      sizeBytes: Number(value.sizeBytes ?? 0),
+      textStatus: value.textStatus === 'ready' || value.textStatus === 'failed' ? value.textStatus : 'none',
+      createdAt: String(value.createdAt ?? value.created_at ?? new Date().toISOString()),
+      promptId: value.promptId ? String(value.promptId) : value.prompt_id ? String(value.prompt_id) : undefined,
+      promptFieldName: value.promptFieldName
+        ? String(value.promptFieldName)
+        : value.prompt_field_name
+          ? String(value.prompt_field_name)
+          : undefined,
+      reminderId: value.reminderId ? String(value.reminderId) : value.reminder_id ? String(value.reminder_id) : undefined,
+      extractedText: value.extractedText ? String(value.extractedText) : undefined,
+    };
+  }
+
   function normalizeMemoryEntry(raw: unknown, index: number): UserMemoryEntry {
     const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
     return {
@@ -131,6 +177,21 @@
           ? (value.data as Record<string, unknown>)
           : undefined,
     };
+  }
+
+  function formatBytes(value: number) {
+    if (!Number.isFinite(value) || value <= 0) {
+      return '0 B';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
   }
 
   function setFeedback(promptId: string, tone: FeedbackState['tone'], text: string) {
@@ -152,13 +213,15 @@
     loadError = '';
 
     try {
-      const [promptPayload, memoryPayload] = await Promise.all([
+      const [promptPayload, memoryPayload, filePayload] = await Promise.all([
         get<{ prompts: unknown[] }>('prompts', { query: { status: 'all' } }),
         get<{ entries: unknown[] }>('memory'),
+        get<{ files: unknown[] }>('files'),
       ]);
 
       prompts = (promptPayload.prompts ?? []).map((prompt, index) => normalizePrompt(prompt, index));
       memoryEntries = (memoryPayload.entries ?? []).map((entry, index) => normalizeMemoryEntry(entry, index));
+      uploadedFiles = (filePayload.files ?? []).map((file, index) => normalizeUploadedFile(file, index));
 
       for (const prompt of prompts.filter((item) => item.status === 'pending')) {
         ensurePromptState(prompt);
@@ -169,10 +232,17 @@
       } else if (selectedMemoryTitle && !memoryEntries.some((entry) => entry.title === selectedMemoryTitle)) {
         selectedMemoryTitle = memoryEntries[0]?.title ?? '';
       }
+
+      if (!selectedFileId && uploadedFiles.length > 0) {
+        selectedFileId = uploadedFiles[0].id;
+      } else if (selectedFileId && !uploadedFiles.some((file) => file.id === selectedFileId)) {
+        selectedFileId = uploadedFiles[0]?.id ?? '';
+      }
     } catch (error) {
       loadError = error instanceof Error ? error.message : 'Unable to load requested information.';
       prompts = [];
       memoryEntries = [];
+      uploadedFiles = [];
     } finally {
       isLoading = false;
     }
@@ -190,7 +260,7 @@
     source.addEventListener('tool', handleEventRefresh);
   }
 
-  function setFieldValue(promptId: string, fieldName: string, value: string | number | boolean) {
+  function setFieldValue(promptId: string, fieldName: string, value: string | number | boolean | UploadedFileReference[]) {
     formValues = {
       ...formValues,
       [promptId]: {
@@ -198,6 +268,52 @@
         [fieldName]: value,
       },
     };
+  }
+
+  async function uploadPromptFile(prompt: UserPrompt, field: PromptField, files: FileList | null) {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    const uploadKey = `${prompt.id}:${field.name}`;
+    uploadBusy = { ...uploadBusy, [uploadKey]: true };
+
+    try {
+      const uploaded = await Promise.all(
+        Array.from(files).map(async (file) => {
+          const payload = await uploadFile('files', file, {
+            promptId: prompt.id,
+            fieldName: field.name,
+          });
+          return normalizeUploadedFile((payload as { file: unknown }).file, 0);
+        }),
+      );
+
+      const current = Array.isArray(formValues[prompt.id]?.[field.name])
+        ? ((formValues[prompt.id]?.[field.name] as UploadedFileReference[]) ?? [])
+        : [];
+      const nextValue = field.multiple ? [...current, ...uploaded] : uploaded.slice(0, 1);
+      setFieldValue(prompt.id, field.name, nextValue);
+      uploadedFiles = [...uploaded, ...uploadedFiles.filter((item) => !uploaded.some((entry) => entry.id === item.id))];
+      if (!selectedFileId && uploaded.length > 0) {
+        selectedFileId = uploaded[0].id;
+      }
+    } catch (error) {
+      setFeedback(prompt.id, 'error', error instanceof Error ? error.message : 'Unable to upload file.');
+    } finally {
+      uploadBusy = { ...uploadBusy, [uploadKey]: false };
+    }
+  }
+
+  function removePromptFile(promptId: string, fieldName: string, fileId: string) {
+    const current = Array.isArray(formValues[promptId]?.[fieldName])
+      ? ((formValues[promptId]?.[fieldName] as UploadedFileReference[]) ?? [])
+      : [];
+    setFieldValue(
+      promptId,
+      fieldName,
+      current.filter((file) => file.id !== fileId),
+    );
   }
 
   async function submitPrompt(prompt: UserPrompt) {
@@ -235,6 +351,7 @@
   $: completedPrompts = prompts.filter((prompt) => prompt.status === 'completed');
   $: selectedMemory =
     memoryEntries.find((entry) => entry.title === selectedMemoryTitle) ?? memoryEntries[0] ?? null;
+  $: selectedFile = uploadedFiles.find((file) => file.id === selectedFileId) ?? uploadedFiles[0] ?? null;
 </script>
 
 <section class="page-grid">
@@ -290,7 +407,7 @@
 
             <form class="dynamic-form" on:submit|preventDefault={() => submitPrompt(prompt)}>
               {#each prompt.fields as field}
-                <label class={`field ${field.type === 'text' ? 'field-span' : ''}`}>
+                <label class={`field ${field.type === 'text' || field.type === 'file' ? 'field-span' : ''}`}>
                   <span class="field-label">
                     {field.label}
                     {#if field.required}
@@ -325,6 +442,36 @@
                         <option value={option.value}>{option.label}</option>
                       {/each}
                     </select>
+                  {:else if field.type === 'file'}
+                    <div class="file-field">
+                      <input
+                        class="field-input file-input"
+                        type="file"
+                        accept={field.accept ?? undefined}
+                        multiple={field.multiple}
+                        on:change={(event) => uploadPromptFile(prompt, field, event.currentTarget.files)}
+                      />
+
+                      {#if Array.isArray(formValues[prompt.id]?.[field.name])}
+                        <div class="upload-chip-list">
+                          {#each (formValues[prompt.id]?.[field.name] as UploadedFileReference[]) ?? [] as file}
+                            <div class="upload-chip">
+                              <button class="file-link" type="button" on:click={() => (selectedFileId = file.id)}>
+                                {file.name}
+                              </button>
+                              <span class="field-note">{formatBytes(file.sizeBytes)} • {file.textStatus}</span>
+                              <button class="ghost chip-action" type="button" on:click={() => removePromptFile(prompt.id, field.name, file.id)}>
+                                Remove
+                              </button>
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+
+                      {#if uploadBusy[`${prompt.id}:${field.name}`]}
+                        <span class="field-note">Uploading file…</span>
+                      {/if}
+                    </div>
                   {:else}
                     <input
                       class="field-input"
@@ -399,7 +546,7 @@
       <section class="empty-state">
         <p class="panel-label">Memory</p>
         <h3 class="callout-heading">No memory entries</h3>
-        <p class="panel-copy">Normal notes and form-derived records will both appear here through the same memory surface.</p>
+        <p class="panel-copy">The robot's notes will appear here</p>
       </section>
     {:else}
       <div class="memory-layout">
@@ -462,6 +609,76 @@
         {/if}
       </div>
     {/if}
+
+    <section class="history-panel">
+      <div class="history-head">
+        <div>
+          <p class="panel-label">Uploaded Files</p>
+          <h3 class="callout-heading">Document Library</h3>
+        </div>
+      </div>
+
+      {#if uploadedFiles.length === 0}
+        <p class="panel-copy">Uploaded prescriptions, delivery instructions, and other documents will appear here.</p>
+      {:else}
+        <div class="memory-layout">
+          <div class="memory-list" role="tablist" aria-label="Uploaded files">
+            {#each uploadedFiles as file}
+              <button
+                class:active-memory={selectedFile?.id === file.id}
+                class="memory-item"
+                type="button"
+                on:click={() => (selectedFileId = file.id)}
+              >
+                <span class="memory-item-label">{file.name}</span>
+                <span class="memory-item-key">{file.mimeType}</span>
+              </button>
+            {/each}
+          </div>
+
+          {#if selectedFile}
+            <article class="memory-detail">
+              <div class="memory-detail-head">
+                <div>
+                  <p class="panel-label">Uploaded File</p>
+                  <h3 class="callout-heading">{selectedFile.name}</h3>
+                </div>
+                <span class="key-pill">{selectedFile.textStatus}</span>
+              </div>
+
+              <dl class="detail-grid">
+                <div>
+                  <dt class="detail-term">Uploaded</dt>
+                  <dd class="detail-value">{formatDate(selectedFile.createdAt)}</dd>
+                </div>
+                <div>
+                  <dt class="detail-term">Size</dt>
+                  <dd class="detail-value">{formatBytes(selectedFile.sizeBytes)}</dd>
+                </div>
+              </dl>
+
+              <section class="schema-panel">
+                <p class="panel-label">Metadata</p>
+                <div class="schema-chips">
+                  <span class="schema-chip">{selectedFile.mimeType}</span>
+                  {#if selectedFile.promptId}
+                    <span class="schema-chip">prompt {selectedFile.promptId}</span>
+                  {/if}
+                  {#if selectedFile.reminderId}
+                    <span class="schema-chip">reminder {selectedFile.reminderId}</span>
+                  {/if}
+                </div>
+              </section>
+
+              <section class="json-panel">
+                <p class="panel-label">Extracted Text</p>
+                <pre class="json-block">{selectedFile.extractedText ?? 'No extracted text available.'}</pre>
+              </section>
+            </article>
+          {/if}
+        </div>
+      {/if}
+    </section>
   </section>
 </section>
 
@@ -579,6 +796,23 @@
     gap: 0.5rem;
   }
 
+  div.file-field,
+  div.upload-chip-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  div.upload-chip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.8rem 0.9rem;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-panel);
+  }
+
   label.field-span {
     grid-column: 1 / -1;
   }
@@ -608,12 +842,17 @@
     font: inherit;
   }
 
+  input.file-input {
+    padding-block: 0.75rem;
+  }
+
   input.field-input:focus-visible,
   textarea.field-input:focus-visible,
   select.field-input:focus-visible,
   button.ghost:focus-visible,
   button.action:focus-visible,
-  button.memory-item:focus-visible {
+  button.memory-item:focus-visible,
+  button.file-link:focus-visible {
     outline: 1px solid color-mix(in srgb, var(--color-accent) 60%, transparent);
     outline-offset: 1px;
     border-color: var(--color-accent);
@@ -650,6 +889,21 @@
       transform 160ms ease,
       background 160ms ease,
       border-color 160ms ease;
+  }
+
+  button.file-link {
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--color-ink-strong);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  button.chip-action {
+    padding: 0.45rem 0.7rem;
+    white-space: nowrap;
   }
 
   button.action,
@@ -817,8 +1071,14 @@
 
     button.action,
     button.ghost,
-    button.memory-item {
+    button.memory-item,
+    button.chip-action {
       width: 100%;
+    }
+
+    div.upload-chip {
+      flex-direction: column;
+      align-items: flex-start;
     }
   }
 </style>

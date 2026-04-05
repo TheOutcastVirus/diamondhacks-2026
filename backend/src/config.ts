@@ -6,6 +6,7 @@ export type AppConfig = {
   host: string;
   port: number;
   databasePath: string;
+  uploadsDir: string;
   allowedOrigins: string[];
   reminders: {
     enabled: boolean;
@@ -108,6 +109,13 @@ function resolveDatabasePath(rawPath: string | undefined): string {
   return resolved;
 }
 
+function resolveUploadsDir(rawPath: string | undefined): string {
+  const configured = rawPath?.trim() || "data/uploads";
+  const resolved = resolve(process.cwd(), configured);
+  mkdirSync(resolved, { recursive: true });
+  return resolved;
+}
+
 function resolveBrowserUseModel(value: string | undefined): string {
   const configured = value?.trim();
   if (!configured) {
@@ -172,6 +180,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     host: source.HOST?.trim() || "127.0.0.1",
     port: parseInteger(source.PORT, 8000),
     databasePath: resolveDatabasePath(source.DATABASE_PATH),
+    uploadsDir: resolveUploadsDir(source.UPLOADS_DIR),
     allowedOrigins: parseOrigins(source.ALLOWED_ORIGINS),
     reminders: {
       enabled: parseBoolean(source.REMINDER_SCHEDULER_ENABLED, true),
