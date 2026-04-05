@@ -293,11 +293,8 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   // Locate the last plain user message (not a tool result) — this is the pivot
   let pivotIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (!message) {
-      continue;
-    }
-    if (message.role === "user" && !message.tool_call_id) {
+    const pivot = messages[i];
+    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
       pivotIdx = i;
       break;
     }
@@ -312,19 +309,14 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   let i = 0;
   while (i < toolChain.length) {
     const msg = toolChain[i];
-    if (!msg) {
-      i++;
-      continue;
-    }
+    if (!msg) break;
     if (msg.role === "assistant" && msg.tool_calls?.length) {
       const group: ChatMessage[] = [msg];
       i++;
       while (i < toolChain.length) {
-        const toolMessage = toolChain[i];
-        if (!toolMessage || toolMessage.role !== "tool") {
-          break;
-        }
-        group.push(toolMessage);
+        const toolMsg = toolChain[i];
+        if (!toolMsg || toolMsg.role !== "tool") break;
+        group.push(toolMsg);
         i++;
       }
       groups.push(group);

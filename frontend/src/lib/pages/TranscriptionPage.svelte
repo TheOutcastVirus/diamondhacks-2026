@@ -287,12 +287,7 @@
 
   $: messageCount = entries.filter((entry) => entry.kind === 'message').length;
   $: toolCount = entries.filter((entry) => entry.kind === 'tool').length;
-  $: filteredEntries = (
-    filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode)
-  ).slice().reverse();
-  $: if (typeof window !== 'undefined' && agentModelHydrated) {
-    window.localStorage.setItem(agentModelStorageKey, agentModel);
-  }
+  $: filteredEntries = filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode);
 </script>
 
 <section class="page-grid tx-console" aria-label="Live transcript">
