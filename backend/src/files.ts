@@ -1,6 +1,5 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { inflateSync } from "node:zlib";
 
 import type { AppConfig } from "./config";
 import type { UploadedFile } from "./contracts";
@@ -22,81 +21,9 @@ function sanitizeStoragePart(value: string): string {
     .slice(0, 80);
 }
 
-function decodePdfEscapes(input: string): string {
-  return input
-    .replace(/\\([nrtbf()\\])/g, (_match, token: string) => {
-      switch (token) {
-        case "n":
-          return "\n";
-        case "r":
-          return "\r";
-        case "t":
-          return "\t";
-        case "b":
-          return "\b";
-        case "f":
-          return "\f";
-        default:
-          return token;
-      }
-    })
-    .replace(/\\([0-7]{1,3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
-}
-
-function extractStringsFromPdfStream(stream: string): string[] {
-  const parts: string[] = [];
-  const pushLiteral = (value: string) => {
-    const normalized = decodePdfEscapes(value).replace(/\s+/g, " ").trim();
-    if (normalized) {
-      parts.push(normalized);
-    }
-  };
-
-  const literalRegex = /\((?:\\.|[^\\)])*\)\s*(?:Tj|TJ|')/g;
-  for (const match of stream.matchAll(literalRegex)) {
-    const value = match[0].replace(/\)\s*(?:Tj|TJ|')$/, "").slice(1);
-    pushLiteral(value);
-  }
-
-  const arrayRegex = /\[(.*?)\]\s*TJ/gs;
-  for (const match of stream.matchAll(arrayRegex)) {
-    const body = match[1] ?? "";
-    for (const nested of body.matchAll(/\((?:\\.|[^\\)])*\)/g)) {
-      pushLiteral(nested[0].slice(1, -1));
-    }
-  }
-
-  return parts;
-}
-
-function extractPdfText(buffer: Buffer): string {
-  const pdf = buffer.toString("latin1");
-  const textChunks: string[] = [];
-  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-
-  for (const match of pdf.matchAll(streamRegex)) {
-    const raw = match[1] ?? "";
-    let decoded: string;
-
-    try {
-      decoded = inflateSync(Buffer.from(raw, "latin1")).toString("latin1");
-    } catch {
-      decoded = raw;
-    }
-
-    textChunks.push(...extractStringsFromPdfStream(decoded));
-  }
-
-  return textChunks.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
 function extractTextByMimeType(buffer: Buffer, mimeType: string, filename: string): string | null {
   const lowerMime = mimeType.toLowerCase();
   const lowerName = filename.toLowerCase();
-
-  if (lowerMime === "application/pdf" || lowerName.endsWith(".pdf")) {
-    return extractPdfText(buffer) || null;
-  }
 
   if (
     lowerMime.startsWith("text/") ||
@@ -109,6 +36,39 @@ function extractTextByMimeType(buffer: Buffer, mimeType: string, filename: strin
   }
 
   return null;
+}
+
+function isPdfFile(mimeType: string, filename: string): boolean {
+  const lowerMime = mimeType.toLowerCase();
+  const lowerName = filename.toLowerCase();
+  return lowerMime === "application/pdf" || lowerName.endsWith(".pdf");
+}
+
+function isImageFile(mimeType: string, filename: string): boolean {
+  const lowerMime = mimeType.toLowerCase();
+  const lowerName = filename.toLowerCase();
+  return lowerMime.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(lowerName);
+}
+
+function isVideoFile(mimeType: string, filename: string): boolean {
+  const lowerMime = mimeType.toLowerCase();
+  const lowerName = filename.toLowerCase();
+  return lowerMime.startsWith("video/") || /\.(mp4|mov|m4v|avi|mkv|webm)$/i.test(lowerName);
+}
+
+function isAudioFile(mimeType: string, filename: string): boolean {
+  const lowerMime = mimeType.toLowerCase();
+  const lowerName = filename.toLowerCase();
+  return lowerMime.startsWith("audio/") || /\.(mp3|wav|ogg|flac|aac|m4a|opus|weba)$/i.test(lowerName);
+}
+
+function isMediaFile(mimeType: string, filename: string): boolean {
+  return isImageFile(mimeType, filename) || isVideoFile(mimeType, filename) || isAudioFile(mimeType, filename);
+}
+
+function normalizeGeminiText(value: string): string | null {
+  const trimmed = value.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return trimmed || null;
 }
 
 export class UploadedFileService {
@@ -159,10 +119,110 @@ export class UploadedFileService {
     }
 
     const buffer = await readFile(storagePath);
-    const extractedText = extractTextByMimeType(buffer, file.mimeType, file.originalName);
+    const mimeType = file.mimeType;
+    const originalName = file.originalName;
+
+    let extractedText: string | null = null;
+
+    if (isMediaFile(mimeType, originalName)) {
+      // Media files always go through Gemini for description + text extraction
+      extractedText = await this.extractMediaWithGoogleAi(buffer, mimeType, originalName);
+    } else if (isPdfFile(mimeType, originalName)) {
+      extractedText = await this.extractTextWithGoogleAi(buffer, mimeType, originalName);
+    } else {
+      extractedText = extractTextByMimeType(buffer, mimeType, originalName);
+    }
     return this.database.updateUploadedFileExtraction(fileId, {
       textStatus: extractedText ? "ready" : "failed",
       ...(extractedText ? { extractedText } : {}),
     });
+  }
+
+  private async callGoogleAi(buffer: Buffer, mimeType: string, prompt: string): Promise<string | null> {
+    if (!this.config.googleAi.apiKey?.trim()) {
+      return null;
+    }
+
+    const response = await fetch(
+      `${this.config.googleAi.baseUrl}/models/${encodeURIComponent(this.config.googleAi.model)}:generateContent?key=${encodeURIComponent(this.config.googleAi.apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: mimeType || "application/octet-stream",
+                    data: buffer.toString("base64"),
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Google AI extraction error ${response.status}: ${body}`);
+    }
+
+    const payload = (await response.json()) as {
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string }> };
+      }>;
+    };
+
+    const text =
+      payload.candidates
+        ?.flatMap((c) => c.content?.parts ?? [])
+        .map((p) => p.text ?? "")
+        .join("\n") ?? "";
+
+    return normalizeGeminiText(text);
+  }
+
+  private async extractTextWithGoogleAi(buffer: Buffer, mimeType: string, _filename: string): Promise<string | null> {
+    const prompt =
+      "Extract the useful readable text from this PDF into plain text for a text-only assistant. Preserve headings and line breaks when they help readability.";
+    return this.callGoogleAi(buffer, mimeType, prompt);
+  }
+
+  private async extractMediaWithGoogleAi(
+    buffer: Buffer,
+    mimeType: string,
+    filename: string,
+  ): Promise<string | null> {
+    let prompt: string;
+
+    if (isImageFile(mimeType, filename)) {
+      prompt =
+        "Analyze this image and respond in two clearly labeled sections:\n\n" +
+        "DESCRIPTION:\n" +
+        "Provide a very detailed description of the image. Include all subjects, objects, people, animals, text, colors, shapes, setting, spatial layout, actions, expressions, context, and any other observable details. Be thorough.\n\n" +
+        "EXTRACTED TEXT:\n" +
+        "List all text, numbers, labels, signs, captions, or any other readable content visible in the image, preserving their reading order. If no text is visible, write \"None.\"";
+    } else if (isVideoFile(mimeType, filename)) {
+      prompt =
+        "Analyze this video and respond in two clearly labeled sections:\n\n" +
+        "DESCRIPTION:\n" +
+        "Provide a very detailed description of the video. Cover all people, objects, settings, actions, events, camera movements, and visual context. Use concise timestamps when helpful. Be thorough.\n\n" +
+        "EXTRACTED TEXT:\n" +
+        "Transcribe all text visible on screen (titles, captions, signs, overlays) and all spoken dialogue or narration, with speaker labels and timestamps where possible. If none, write \"None.\"";
+    } else {
+      // Audio
+      prompt =
+        "Analyze this audio and respond in two clearly labeled sections:\n\n" +
+        "DESCRIPTION:\n" +
+        "Describe the audio in detail: what type of audio it is, who is speaking (if anyone), the tone, mood, language, background sounds, music, and overall context.\n\n" +
+        "TRANSCRIPT:\n" +
+        "Provide a full transcript of any spoken content, with speaker labels and timestamps where possible. If no speech is present, write \"None.\"";
+    }
+
+    return this.callGoogleAi(buffer, mimeType, prompt);
   }
 }

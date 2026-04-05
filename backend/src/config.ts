@@ -42,6 +42,11 @@ export type AppConfig = {
     apiKey: string;
     voiceId: string;
   };
+  googleAi: {
+    apiKey?: string;
+    model: string;
+    baseUrl: string;
+  };
 };
 
 type EnvSource = Record<string, string | undefined>;
@@ -110,7 +115,7 @@ function resolveDatabasePath(rawPath: string | undefined): string {
 }
 
 function resolveUploadsDir(rawPath: string | undefined): string {
-  const configured = rawPath?.trim() || "data/uploads";
+  const configured = rawPath?.trim() || "data/files";
   const resolved = resolve(process.cwd(), configured);
   mkdirSync(resolved, { recursive: true });
   return resolved;
@@ -175,6 +180,15 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     tts.endpoint = ttsEndpoint;
   }
 
+  const googleAi: AppConfig["googleAi"] = {
+    model: source.GOOGLE_AI_MODEL?.trim() || "gemini-2.5-flash",
+    baseUrl: source.GOOGLE_AI_BASE_URL?.trim() || "https://generativelanguage.googleapis.com/v1beta",
+  };
+  const googleApiKey = source.GOOGLE_AI_API_KEY?.trim();
+  if (googleApiKey) {
+    googleAi.apiKey = googleApiKey;
+  }
+
   return {
     appName: source.APP_NAME?.trim() || "Gazabot Backend",
     host: source.HOST?.trim() || "127.0.0.1",
@@ -198,5 +212,6 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
       apiKey: source.ELEVEN_LABS_API_KEY?.trim() || "",
       voiceId: source.ELEVEN_LABS_VOICE_ID?.trim() || "21m00Tcm4TlvDq8ikWAM",
     },
+    googleAi,
   };
 }

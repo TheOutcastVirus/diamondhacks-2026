@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { del, get, patch, post } from '../api';
-  import type { Reminder, ReminderCadence, ReminderStatus } from '../types';
+  import { del, get, patch, post, uploadFile } from '../api';
+  import type { Reminder, ReminderCadence, ReminderStatus, UploadedFileReference } from '../types';
 
   type ReminderEditorState = {
     title: string;
@@ -13,6 +13,7 @@
     customCron: string;
     customScheduleLabel: string;
     status: ReminderStatus;
+    attachments: UploadedFileReference[];
   };
 
   type FeedbackState = {
@@ -57,7 +58,42 @@
     },
   ];
 
-  const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const DEFAULT_REMINDER_TIMEZONE = 'America/Los_Angeles';
+  const FALLBACK_TIMEZONE_OPTIONS = [
+    'America/Los_Angeles',
+    'America/Phoenix',
+    'America/Denver',
+    'America/Chicago',
+    'America/New_York',
+    'America/Anchorage',
+    'Pacific/Honolulu',
+    'UTC',
+  ];
+
+  function getTimezoneOptions() {
+    const supportedValuesOf = (Intl as unknown as {
+      supportedValuesOf?: (key: string) => string[];
+    }).supportedValuesOf;
+    const values = supportedValuesOf?.('timeZone') ?? FALLBACK_TIMEZONE_OPTIONS;
+    const unique = Array.from(new Set([DEFAULT_REMINDER_TIMEZONE, ...values]));
+    return unique
+      .sort((left, right) => {
+        if (left === DEFAULT_REMINDER_TIMEZONE) return -1;
+        if (right === DEFAULT_REMINDER_TIMEZONE) return 1;
+        return left.localeCompare(right);
+      })
+      .map((value) => ({ value, label: formatTimezoneLabel(value) }));
+  }
+
+  function formatTimezoneLabel(value: string) {
+    if (value === DEFAULT_REMINDER_TIMEZONE) {
+      return 'Pacific Time (Los Angeles)';
+    }
+
+    return value.replaceAll('_', ' ');
+  }
+
+  const timezoneOptions = getTimezoneOptions();
 
   let reminders: Reminder[] = [];
   let isLoading = true;
@@ -69,6 +105,8 @@
   let createState = createEmptyEditorState();
   let editingId = '';
   let editState: ReminderEditorState | null = null;
+  let createUploadBusy = false;
+  let editUploadBusy = false;
   let rowBusy: Record<string, boolean> = {};
   let rowFeedback: Record<string, FeedbackState | undefined> = {};
 
@@ -79,11 +117,42 @@
       cadence: 'weekly',
       weekday: '5',
       time: '10:00',
-      timezone: detectedTimezone,
+      timezone: DEFAULT_REMINDER_TIMEZONE,
       customCron: '',
       customScheduleLabel: '',
       status: 'active',
+      attachments: [],
     };
+  }
+
+  function normalizeUploadedFileReference(raw: unknown): UploadedFileReference | null {
+    const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+    if (!value.id || !value.name || !value.mimeType) {
+      return null;
+    }
+
+    return {
+      id: String(value.id),
+      name: String(value.name),
+      mimeType: String(value.mimeType),
+      sizeBytes: Number(value.sizeBytes ?? 0),
+      textStatus: value.textStatus === 'ready' || value.textStatus === 'failed' ? value.textStatus : 'none',
+    };
+  }
+
+  function formatBytes(value: number) {
+    if (!Number.isFinite(value) || value <= 0) {
+      return '0 B';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
   }
 
   function padTimePart(value: string) {
@@ -146,10 +215,11 @@
         cadence: parsed.cadence,
         weekday: parsed.weekday,
         time: parsed.time,
-        timezone: reminder.timezone ?? detectedTimezone,
+        timezone: reminder.timezone ?? DEFAULT_REMINDER_TIMEZONE,
         customCron: reminder.cron,
         customScheduleLabel: reminder.scheduleLabel,
         status: reminder.status,
+        attachments: reminder.attachments ?? [],
       };
     }
 
@@ -159,10 +229,11 @@
       cadence: 'custom',
       weekday: '5',
       time: '10:00',
-      timezone: reminder.timezone ?? detectedTimezone,
+      timezone: reminder.timezone ?? DEFAULT_REMINDER_TIMEZONE,
       customCron: reminder.cron,
       customScheduleLabel: reminder.scheduleLabel,
       status: reminder.status,
+      attachments: reminder.attachments ?? [],
     };
   }
 
@@ -256,7 +327,12 @@
       nextRun: value.nextRun ? String(value.nextRun) : null,
       status: normalizeStatus(value.status),
       owner: value.owner ? String(value.owner) : 'Gazabot agent',
-      timezone: value.timezone ? String(value.timezone) : detectedTimezone,
+      timezone: value.timezone ? String(value.timezone) : DEFAULT_REMINDER_TIMEZONE,
+      attachments: Array.isArray(value.attachments)
+        ? value.attachments
+            .map((attachment) => normalizeUploadedFileReference(attachment))
+            .filter((attachment): attachment is UploadedFileReference => attachment !== null)
+        : [],
     };
   }
 
@@ -328,6 +404,75 @@
     submitError = '';
   }
 
+  async function uploadReminderAttachments(files: FileList | null, mode: 'create' | 'edit') {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    if (mode === 'create') {
+      createUploadBusy = true;
+      submitError = '';
+      submitSuccess = '';
+    } else if (editingId) {
+      editUploadBusy = true;
+      clearRowFeedback(editingId);
+    }
+
+    try {
+      const uploaded = await Promise.all(
+        Array.from(files).map(async (file) => {
+          const payload = await uploadFile('files', file);
+          return normalizeUploadedFileReference((payload as { file: unknown }).file);
+        }),
+      );
+
+      const references = uploaded.filter((entry): entry is UploadedFileReference => entry !== null);
+      if (mode === 'create') {
+        createState = {
+          ...createState,
+          attachments: [...createState.attachments, ...references],
+        };
+      } else if (editState && editingId) {
+        editState = {
+          ...editState,
+          attachments: [...editState.attachments, ...references],
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to upload attachment.';
+      if (mode === 'create') {
+        submitError = message;
+      } else if (editingId) {
+        setRowFeedback(editingId, 'error', message);
+      }
+    } finally {
+      if (mode === 'create') {
+        createUploadBusy = false;
+      } else {
+        editUploadBusy = false;
+      }
+    }
+  }
+
+  function removeAttachment(mode: 'create' | 'edit', fileId: string) {
+    if (mode === 'create') {
+      createState = {
+        ...createState,
+        attachments: createState.attachments.filter((file) => file.id !== fileId),
+      };
+      return;
+    }
+
+    if (!editState) {
+      return;
+    }
+
+    editState = {
+      ...editState,
+      attachments: editState.attachments.filter((file) => file.id !== fileId),
+    };
+  }
+
   async function createReminder() {
     isSubmitting = true;
     submitError = '';
@@ -349,6 +494,7 @@
       cron: resolvedCron,
       scheduleLabel: getScheduleLabelFromEditor(createState),
       timezone: createState.timezone.trim(),
+      attachmentFileIds: createState.attachments.map((file) => file.id),
     };
 
     try {
@@ -399,6 +545,7 @@
         scheduleLabel: getScheduleLabelFromEditor(editState),
         timezone: editState.timezone.trim(),
         status: editState.status,
+        attachmentFileIds: editState.attachments.map((file) => file.id),
       });
       updateReminderInList(normalizeReminder(updated, 0));
       setRowFeedback(reminderId, 'success', 'Reminder updated.');
@@ -514,7 +661,11 @@
 
         <label class="field">
           <span class="field-label">Time zone</span>
-          <input class="field-input" bind:value={createState.timezone} />
+          <select class="field-input" bind:value={createState.timezone}>
+            {#each timezoneOptions as option}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
         </label>
       </div>
 
@@ -550,10 +701,44 @@
         </div>
       {/if}
 
+      <label class="field">
+        <span class="field-label">Attachments</span>
+        <div class="file-field">
+          <input
+            class="field-input file-input"
+            type="file"
+            multiple
+            on:change={(event) => uploadReminderAttachments(event.currentTarget.files, 'create')}
+          />
+
+          {#if createState.attachments.length > 0}
+            <div class="upload-chip-list">
+              {#each createState.attachments as file}
+                <div class="upload-chip">
+                  <div class="upload-meta">
+                    <strong>{file.name}</strong>
+                    <span class="field-note">{formatBytes(file.sizeBytes)} | {file.textStatus}</span>
+                  </div>
+                  <button class="ghost chip-action" type="button" on:click={() => removeAttachment('create', file.id)}>
+                    Remove
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <span class="field-note">Upload documents to keep with this reminder.</span>
+          {/if}
+
+          {#if createUploadBusy}
+            <span class="field-note">Uploading attachment...</span>
+          {/if}
+        </div>
+      </label>
+
       <section class="callout">
         <p class="panel-label">Preview</p>
         <h3 class="callout-heading">{createPreview}</h3>
-        <p class="panel-copy">{createState.timezone}</p>
+        <p class="panel-copy">{formatTimezoneLabel(createState.timezone)}</p>
       </section>
 
       {#if submitError}
@@ -564,7 +749,7 @@
         <p class="feedback feedback-success">{submitSuccess}</p>
       {/if}
 
-      <button class="action" disabled={isSubmitting} type="submit">
+      <button class="action" disabled={isSubmitting || createUploadBusy} type="submit">
         {isSubmitting ? 'Saving...' : 'Save reminder'}
       </button>
     </form>
@@ -671,7 +856,11 @@
 
                 <label class="field field-span">
                   <span class="field-label">Time zone</span>
-                  <input class="field-input" bind:value={editState.timezone} />
+                  <select class="field-input" bind:value={editState.timezone}>
+                    {#each timezoneOptions as option}
+                      <option value={option.value}>{option.label}</option>
+                    {/each}
+                  </select>
                 </label>
 
                 {#if editState.cadence === 'custom'}
@@ -702,14 +891,48 @@
                   </label>
                 {/if}
 
+                <label class="field field-span">
+                  <span class="field-label">Attachments</span>
+                  <div class="file-field">
+                    <input
+                      class="field-input file-input"
+                      type="file"
+                      multiple
+                      on:change={(event) => uploadReminderAttachments(event.currentTarget.files, 'edit')}
+                    />
+
+                    {#if editState.attachments.length > 0}
+                      <div class="upload-chip-list">
+                        {#each editState.attachments as file}
+                          <div class="upload-chip">
+                            <div class="upload-meta">
+                              <strong>{file.name}</strong>
+                              <span class="field-note">{formatBytes(file.sizeBytes)} | {file.textStatus}</span>
+                            </div>
+                            <button class="ghost chip-action" type="button" on:click={() => removeAttachment('edit', file.id)}>
+                              Remove
+                            </button>
+                          </div>
+                        {/each}
+                      </div>
+                    {:else}
+                      <span class="field-note">No files attached to this reminder yet.</span>
+                    {/if}
+
+                    {#if editUploadBusy}
+                      <span class="field-note">Uploading attachment...</span>
+                    {/if}
+                  </div>
+                </label>
+
                 <section class="callout field-span">
                   <p class="panel-label">Updated schedule</p>
                   <h3 class="callout-heading">{getScheduleLabelFromEditor(editState) || 'Choose a schedule'}</h3>
-                  <p class="panel-copy">{editState.timezone}</p>
+                  <p class="panel-copy">{formatTimezoneLabel(editState.timezone)}</p>
                 </section>
 
                 <div class="editor-actions field-span">
-                  <button class="action" type="submit" disabled={rowBusy[reminder.id]}>
+                  <button class="action" type="submit" disabled={rowBusy[reminder.id] || editUploadBusy}>
                     {rowBusy[reminder.id] ? 'Saving...' : 'Save changes'}
                   </button>
                   <button class="ghost" type="button" disabled={rowBusy[reminder.id]} on:click={cancelEditing}>
@@ -731,9 +954,22 @@
                 </div>
                 <div>
                   <dt class="detail-term">Timezone</dt>
-                  <dd class="detail-value">{reminder.timezone ?? detectedTimezone}</dd>
+                  <dd class="detail-value">{formatTimezoneLabel(reminder.timezone ?? DEFAULT_REMINDER_TIMEZONE)}</dd>
                 </div>
               </dl>
+
+              {#if reminder.attachments && reminder.attachments.length > 0}
+                <div class="attachment-list">
+                  {#each reminder.attachments as file}
+                    <div class="upload-chip">
+                      <div class="upload-meta">
+                        <strong>{file.name}</strong>
+                        <span class="field-note">{formatBytes(file.sizeBytes)} | {file.textStatus}</span>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             {/if}
 
             {#if rowFeedback[reminder.id]}
@@ -838,6 +1074,15 @@
     gap: 0.5rem;
   }
 
+  div.file-field,
+  div.upload-chip-list,
+  div.attachment-list,
+  div.upload-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+  }
+
   label.field-span,
   section.field-span,
   div.field-span,
@@ -865,6 +1110,10 @@
     font: inherit;
     min-height: 3.2rem;
     box-sizing: border-box;
+  }
+
+  input.file-input {
+    padding-block: 0.75rem;
   }
 
   input.field-input:focus-visible,
@@ -976,6 +1225,21 @@
     display: flex;
     flex-direction: column;
     gap: 0.9rem;
+  }
+
+  div.upload-chip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.8rem 0.9rem;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-panel);
+  }
+
+  button.chip-action {
+    align-self: center;
+    padding: 0.55rem 0.8rem;
   }
 
   div.list-head,

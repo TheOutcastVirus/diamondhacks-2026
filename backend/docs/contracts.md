@@ -64,7 +64,8 @@ Response: single reminder object (same shape as above).
 Validation:
 - `cadence` must be `daily`, `weekly`, or `custom`
 - `cron` must be a valid five-field cron expression
-- `timezone` must be a valid IANA timezone name
+- `timezone` is optional; when omitted it defaults to `America/Los_Angeles`
+- if provided, `timezone` must be a valid IANA timezone name
 
 ---
 
@@ -357,6 +358,8 @@ Multipart form upload endpoint. Expected fields:
 - `fieldName` (optional)
 - `reminderId` (optional)
 
+By default, uploaded bytes are stored under `data/files` on the backend and a file record is persisted in the database. Reminder attachments are referenced both from the reminder record and from the uploaded file record.
+
 Response:
 ```json
 {
@@ -372,6 +375,11 @@ Response:
   }
 }
 ```
+
+Notes:
+- Text-like uploads (`.txt`, `.md`, `.json`, `.csv`, `.xml`, `.html`, and `text/*`) are stored directly and their text clone is read locally.
+- PDFs are always sent to Google AI to produce their text clone.
+- Images use Google AI extraction so the backend can store a plain-text clone for the text-only agent flow.
 
 ### `GET /api/files/:id`
 

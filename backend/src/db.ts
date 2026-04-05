@@ -22,6 +22,7 @@ import type {
   UserPrompt,
 } from "./contracts";
 import { computeNextRun } from "./cron";
+import { resolveReminderTimezone } from "./reminders";
 
 type ReminderRow = {
   id: string;
@@ -285,6 +286,21 @@ function serializeReminder(row: ReminderRow): Reminder {
     owner: row.owner,
     timezone: row.timezone,
     attachments: parseUploadedFileReferences(row.attachments_json),
+  };
+}
+
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    reminderId: row.reminder_id ?? undefined,
+    promptId: row.prompt_id ?? undefined,
+    promptFieldName: row.prompt_field_name ?? undefined,
   };
 }
 
@@ -563,6 +579,21 @@ export class GazabotDatabase {
         created_at TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        text_status TEXT NOT NULL,
+        extracted_text TEXT,
+        reminder_id TEXT,
+        prompt_id TEXT,
+        prompt_field_name TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
     `);
 
     this.ensureColumn("user_memory", "kind", "TEXT");
@@ -596,6 +627,7 @@ export class GazabotDatabase {
 
   createReminder(input: ReminderCreateInput): Reminder {
     const attachments = this.resolveUploadedFileReferences(input.attachmentFileIds);
+    const timezone = resolveReminderTimezone(input.timezone);
     const row: ReminderRow = {
       id: prefixedId("r"),
       title: input.title.trim(),
@@ -605,12 +637,12 @@ export class GazabotDatabase {
       schedule_label: input.scheduleLabel.trim(),
       next_run: nextRunForReminder({
         cron: input.cron.trim(),
-        timezone: input.timezone.trim(),
+        timezone,
         status: "active",
       }),
       status: "active",
       owner: "Gazabot agent",
-      timezone: input.timezone.trim(),
+      timezone,
       created_at: nowIso(),
       attachments_json: JSON.stringify(attachments),
     };
@@ -720,7 +752,7 @@ export class GazabotDatabase {
     const cadence = input.cadence ?? existing.cadence;
     const cron = input.cron === undefined ? existing.cron : input.cron.trim();
     const scheduleLabel = input.scheduleLabel === undefined ? existing.schedule_label : input.scheduleLabel.trim();
-    const timezone = input.timezone === undefined ? existing.timezone : input.timezone.trim();
+    const timezone = input.timezone === undefined ? existing.timezone : resolveReminderTimezone(input.timezone);
     const status = input.status ?? existing.status;
     const attachments =
       input.attachmentFileIds === undefined
