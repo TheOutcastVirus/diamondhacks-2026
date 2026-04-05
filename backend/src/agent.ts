@@ -293,21 +293,11 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   // Locate the last plain user message (not a tool result) — this is the pivot
   let pivotIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-<<<<<<< HEAD
-<<<<<<< HEAD
-    const pivot = messages[i];
-    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
-=======
     const message = messages[i];
     if (!message) {
       continue;
     }
     if (message.role === "user" && !message.tool_call_id) {
->>>>>>> origin/main
-=======
-    const pivot = messages[i];
-    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       pivotIdx = i;
       break;
     }
@@ -322,39 +312,19 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   let i = 0;
   while (i < toolChain.length) {
     const msg = toolChain[i];
-<<<<<<< HEAD
-<<<<<<< HEAD
-    if (!msg) break;
-=======
     if (!msg) {
       i++;
       continue;
     }
->>>>>>> origin/main
-=======
-    if (!msg) break;
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
     if (msg.role === "assistant" && msg.tool_calls?.length) {
       const group: ChatMessage[] = [msg];
       i++;
       while (i < toolChain.length) {
-<<<<<<< HEAD
-<<<<<<< HEAD
-        const toolMsg = toolChain[i];
-        if (!toolMsg || toolMsg.role !== "tool") break;
-        group.push(toolMsg);
-=======
         const toolMessage = toolChain[i];
         if (!toolMessage || toolMessage.role !== "tool") {
           break;
         }
         group.push(toolMessage);
->>>>>>> origin/main
-=======
-        const toolMsg = toolChain[i];
-        if (!toolMsg || toolMsg.role !== "tool") break;
-        group.push(toolMsg);
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
         i++;
       }
       groups.push(group);

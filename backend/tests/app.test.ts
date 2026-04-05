@@ -242,10 +242,6 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("crisis turn calls Bland and skips the model when family contact is saved", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url, init) => {
@@ -365,7 +361,52 @@ describe("Gazabot Bun backend", () => {
       if (url.includes("/chat/completions")) {
         return new Response("model should not be called for crisis escalation", { status: 500 });
       }
-=======
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        BLAND_API_KEY: "",
+        BLAND_PATHWAY_ID: "",
+      });
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm in trouble",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm trying to contact your family, but the calling system is not set up yet.",
+        });
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("routes gemini-fast dashboard turns through Google AI instead of Imagine", async () => {
     const restore = withFetchStub(async (url, init) => {
       if (url.includes("/chat/completions")) {
@@ -373,7 +414,7 @@ describe("Gazabot Bun backend", () => {
       }
 
       if (url.includes("generativelanguage.googleapis.com")) {
-        expect(url).toContain("/models/gemini-3-flash-preview:generateContent");
+        expect(url).toContain("/models/gemini-3-pro-preview:generateContent");
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
         expect(body.toolConfig).toEqual({
           functionCallingConfig: {
@@ -394,65 +435,31 @@ describe("Gazabot Bun backend", () => {
         });
       }
 
->>>>>>> origin/main
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
     try {
       const { app, database } = createTestApp({
-<<<<<<< HEAD
-        BLAND_API_KEY: "",
-        BLAND_PATHWAY_ID: "",
-      });
-      try {
-        database.writeMemory("family_contact_primary", JSON.stringify({
-          full_name: "Jane Doe",
-          relationship: "Daughter",
-          phone_number: "+14155551234",
-        }), {
-          data: {
-            full_name: "Jane Doe",
-            relationship: "Daughter",
-            phone_number: "+14155551234",
-          },
-        });
-
-=======
         GOOGLE_AI_API_KEY: "test-google-key",
       });
 
       try {
->>>>>>> origin/main
         const response = await app.fetch(
           new Request("http://localhost/api/agent/turn", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-<<<<<<< HEAD
-              message: "I'm in trouble",
-              source: "dashboard",
-=======
               message: "Say which model is active.",
               source: "dashboard",
               model: "gemini-fast",
->>>>>>> origin/main
             }),
           }),
         );
 
         expect(response.status).toBe(200);
-<<<<<<< HEAD
-        expect(await response.json()).toEqual({
-          route: "conversation",
-          reply: "I'm trying to contact your family, but the calling system is not set up yet.",
-<<<<<<< HEAD
-=======
         await expect(response.json()).resolves.toEqual({
           route: "conversation",
           reply: "Gemini is active.",
->>>>>>> origin/main
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
         });
       } finally {
         app.close();
@@ -463,10 +470,6 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url) => {
@@ -552,11 +555,6 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-<<<<<<< HEAD
-=======
->>>>>>> origin/main
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("updates browser state after a queued browser task", async () => {
     let completionRound = 0;
     let stopRequests = 0;
@@ -648,7 +646,7 @@ describe("Gazabot Bun backend", () => {
         expect(browserPayload.browser.status).toBe("idle");
         expect(Array.isArray(browserPayload.browser.recentActions)).toBe(true);
         expect(String(browserPayload.browser.summary)).toContain("Pharmacy hours");
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();
@@ -788,10 +786,6 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("surfaces Browser Use network failures as actionable browser status", async () => {
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
@@ -815,8 +809,63 @@ describe("Gazabot Bun backend", () => {
                 ],
               },
               finish_reason: "tool_calls",
-<<<<<<< HEAD
-=======
+            },
+          ],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        throw new TypeError("NetworkError when attempting to fetch resource.");
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Check the weather in the browser.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        expect(browserResponse.status).toBe(200);
+        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
+        expect(browserPayload.browser.status).toBe("blocked");
+        expect(String(browserPayload.browser.summary)).toContain("Browser Use is unreachable");
+
+        const transcriptResponse = await app.fetch(new Request("http://localhost/api/transcript"));
+        expect(transcriptResponse.status).toBe(200);
+        const transcriptPayload = (await transcriptResponse.json()) as {
+          entries: Array<{ text: string; role: string }>;
+        };
+        expect(
+          transcriptPayload.entries.some(
+            (entry) =>
+              entry.role === "robot" &&
+              entry.text.includes("I couldn't reach Browser Use right now."),
+          ),
+        ).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("archives and clears conversation when end_conversation is called", async () => {
     let completionRound = 0;
     const restore = withFetchStub(async (url) => {
@@ -851,27 +900,11 @@ describe("Gazabot Bun backend", () => {
             {
               message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
               finish_reason: "stop",
->>>>>>> origin/main
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
             },
           ],
         });
       }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
-      if (url.includes("browser-use.com")) {
-        throw new TypeError("NetworkError when attempting to fetch resource.");
-      }
-
-<<<<<<< HEAD
-=======
->>>>>>> origin/main
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -884,49 +917,13 @@ describe("Gazabot Bun backend", () => {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-<<<<<<< HEAD
-<<<<<<< HEAD
-              message: "Check the weather in the browser.",
-              source: "dashboard",
-=======
               message: "That's all, goodbye.",
-              source: "guardian",
->>>>>>> origin/main
-=======
-              message: "Check the weather in the browser.",
-              source: "dashboard",
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
+              source: "resident",
             }),
           }),
         );
 
         expect(response.status).toBe(200);
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
-        await new Promise((resolve) => setTimeout(resolve, 50));
-
-        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
-        expect(browserResponse.status).toBe(200);
-        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
-        expect(browserPayload.browser.status).toBe("blocked");
-        expect(String(browserPayload.browser.summary)).toContain("Browser Use is unreachable");
-
-        const transcriptResponse = await app.fetch(new Request("http://localhost/api/transcript"));
-        expect(transcriptResponse.status).toBe(200);
-        const transcriptPayload = (await transcriptResponse.json()) as {
-          entries: Array<{ text: string; role: string }>;
-        };
-        expect(
-          transcriptPayload.entries.some(
-            (entry) =>
-              entry.role === "robot" &&
-              entry.text.includes("I couldn't reach Browser Use right now."),
-          ),
-        ).toBe(true);
-<<<<<<< HEAD
-=======
         await expect(response.json()).resolves.toEqual({
           route: "conversation",
           reply: "Goodbye for now.",
@@ -938,9 +935,6 @@ describe("Gazabot Bun backend", () => {
         expect(memories[0]?.title).toStartWith("past_conversation_");
         expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
         expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
->>>>>>> origin/main
-=======
->>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       } finally {
         app.close();
         database.close();
@@ -1532,7 +1526,7 @@ trailer <<>>
           []) as Array<Record<string, unknown>>);
         const promptPart = parts.find((part) => typeof part.text === "string");
         expect(promptPart).toBeDefined();
-        expect(String(promptPart?.text)).toContain("Extract all clearly visible text and numbers from this image");
+        expect(String(promptPart?.text)).toContain("EXTRACTED TEXT:");
         expect(
           parts.some((part) => {
             const inlineData = part.inlineData as Record<string, unknown> | undefined;
@@ -1743,6 +1737,12 @@ trailer <<>>
           ],
         });
       }
+      if (url.includes("elevenlabs.io")) {
+        return new Response(new Uint8Array([0, 1, 2]), {
+          status: 200,
+          headers: { "Content-Type": "audio/mpeg" },
+        });
+      }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -1894,10 +1894,21 @@ trailer <<>>
     const privateApp = app as unknown as {
       conversationState: "idle" | "conversation";
       runConversationTurn: () => Promise<void>;
-      processVoiceAudio: (audio: Buffer) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+      processTranscriptText: (
+        transcript: string,
+        model?: unknown,
+      ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
       ttsService: { synthesize: (text: string) => Promise<Buffer> };
+      sttService: {
+        transcribe: (audio: Buffer) => Promise<string>;
+        createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
+      };
       audioService: {
         recordUntilSilence: (options?: unknown) => Promise<Buffer>;
+        recordPcmUntilSilence: (
+          send: (chunk: Buffer) => void,
+          options?: unknown,
+        ) => Promise<void>;
         playAudio: (audio: Buffer) => Promise<void>;
       };
     };
@@ -1907,7 +1918,15 @@ trailer <<>>
       events.push("record");
       return Buffer.from("user-audio");
     };
-    privateApp.processVoiceAudio = async () => {
+    privateApp.audioService.recordPcmUntilSilence = async () => {
+      events.push("record");
+    };
+    privateApp.sttService.transcribe = async () => "Hello there";
+    privateApp.sttService.createRealtimeSession = async () => ({
+      sendAudio: () => {},
+      finalize: async () => "Hello there",
+    });
+    privateApp.processTranscriptText = async () => {
       events.push("process");
       return {
         transcript: "Hello there",
@@ -2274,7 +2293,7 @@ trailer <<>>
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Completed after terminal status.");
         expect(sessionPollCount).toBeGreaterThan(1);
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();
