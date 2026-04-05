@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 
 type AudioCommand = {
@@ -200,10 +200,162 @@ async function resolveRecordingCommand(outputPath: string): Promise<AudioCommand
   return recordingArgsForPlatform(os, outputPath);
 }
 
+/**
+ * Returns ffmpeg args that stream raw PCM (s16le, 16 kHz, mono) to stdout on
+ * every platform — used by the Silero VAD recording path.
+ */
+async function resolvePcmStreamingArgs(): Promise<AudioCommand> {
+  const os = platform();
+  const pcmOutputArgs = ["-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"];
+
+  if (os === "darwin") {
+    return {
+      cmd: "ffmpeg",
+      args: ["-hide_banner", "-f", "avfoundation", "-i", ":0", ...pcmOutputArgs],
+    };
+  }
+
+  if (os === "linux") {
+    return {
+      cmd: "ffmpeg",
+      args: ["-hide_banner", "-f", "alsa", "-i", "default", ...pcmOutputArgs],
+    };
+  }
+
+  if (os === "win32") {
+    const openAlOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "openal", "-i", "dummy"]);
+    const openAlDevices = parseOpenAlCaptureDevices(openAlOutput);
+    if (openAlDevices.length > 0) {
+      return {
+        cmd: "ffmpeg",
+        args: [
+          "-hide_banner",
+          "-f", "openal",
+          "-channels", "1",
+          "-sample_size", "16",
+          "-sample_rate", "44100",
+          "-i", openAlDevices[0] ?? "",
+          ...pcmOutputArgs,
+        ],
+      };
+    }
+
+    const dshowOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+    const dshowDevices = parseDshowAudioDevices(dshowOutput);
+    if (dshowDevices.length > 0) {
+      return {
+        cmd: "ffmpeg",
+        args: [
+          "-hide_banner",
+          "-f", "dshow",
+          "-audio_buffer_size", "50",
+          "-i", `audio=${dshowDevices[0] ?? ""}`,
+          ...pcmOutputArgs,
+        ],
+      };
+    }
+
+    throw new Error("No Windows audio capture device found via ffmpeg (checked OpenAL and DirectShow).");
+  }
+
+  throw unsupportedPlatformError("recording", os);
+}
+
 export class AudioService {
   private proc: ReturnType<typeof spawn> | null = null;
   private recordingPath: string | null = null;
   private recordingError: string | null = null;
+
+  // ── Persistent Silero VAD subprocess ──────────────────────────────────────
+  private vadProc: ReturnType<typeof spawn> | null = null;
+  private vadIsReady = false;
+  private vadStdoutBuf = "";
+  // Set at the start of each recording turn; cleared when the turn ends.
+  private vadTurnCallback: ((event: string) => void) | null = null;
+  // Shared in-flight promise so concurrent startPersistentVad() calls don't
+  // spawn duplicate processes.
+  private vadStartingPromise: Promise<void> | null = null;
+
+  private async resolveVadPaths(): Promise<{ python: string; vadScript: string }> {
+    const botDir   = resolvePath(import.meta.dir, "../../bot");
+    const vadScript = resolvePath(botDir, "silero_vad.py");
+    const venvPython = process.platform === "win32"
+      ? resolvePath(botDir, ".venv/Scripts/python.exe")
+      : resolvePath(botDir, ".venv/bin/python3");
+    const python = (await stat(venvPython).catch(() => null)) ? venvPython : "python3";
+    return { python, vadScript };
+  }
+
+  /** Start the Silero VAD subprocess and wait until the model is ready.
+   *  Safe to call multiple times — concurrent calls share the same spawn. */
+  async startPersistentVad(options?: { threshold?: number; silenceDuration?: number }): Promise<void> {
+    if (this.vadProc && this.vadIsReady) return;
+    // Return the in-flight promise if a spawn is already underway
+    if (this.vadStartingPromise) return this.vadStartingPromise;
+
+    const threshold       = options?.threshold       ?? 0.5;
+    const silenceDuration = options?.silenceDuration ?? 1.0;
+    const { python, vadScript } = await this.resolveVadPaths();
+
+    this.vadStartingPromise = new Promise<void>((resolve, reject) => {
+      const proc = spawn(python, [
+        vadScript,
+        "--threshold",        String(threshold),
+        "--silence-duration", String(silenceDuration),
+      ], { stdio: ["pipe", "pipe", "pipe"] });
+
+      this.vadIsReady   = false;
+      this.vadStdoutBuf = "";
+
+      proc.stderr?.on("data", (chunk: Buffer) => {
+        process.stderr.write(`[silero-vad] ${chunk.toString()}`);
+      });
+
+      proc.on("error", (err: Error) => {
+        this.vadProc = null;
+        reject(new Error(`Failed to start Silero VAD: ${err.message}`));
+      });
+
+      proc.stdout?.on("data", (chunk: Buffer) => {
+        this.vadStdoutBuf += chunk.toString();
+        const lines = this.vadStdoutBuf.split("\n");
+        this.vadStdoutBuf = lines[lines.length - 1] ?? "";
+
+        for (const line of lines.slice(0, -1)) {
+          const event = line.trim();
+          if (event === "READY") {
+            this.vadProc    = proc;
+            this.vadIsReady = true;
+            console.log("[silero-vad] Model ready.");
+            resolve();
+          } else {
+            this.vadTurnCallback?.(event);
+          }
+        }
+      });
+
+      proc.on("close", (code: number | null) => {
+        if (this.vadProc === proc) {
+          this.vadProc    = null;
+          this.vadIsReady = false;
+          console.log(`[silero-vad] Process exited (code=${code}).`);
+        }
+      });
+
+      const readyTimeout = setTimeout(() => {
+        if (!this.vadIsReady) {
+          reject(new Error("Silero VAD did not become ready in 30 s (model download may have failed)."));
+          try { proc.kill(); } catch { /* ignore */ }
+        }
+      }, 30_000);
+
+      proc.once("close", () => clearTimeout(readyTimeout));
+    }).finally(() => {
+      this.vadStartingPromise = null;
+    });
+
+    return this.vadStartingPromise;
+  }
 
   async startRecording(): Promise<void> {
     if (this.proc) {
@@ -415,16 +567,22 @@ export class AudioService {
     }
 
     const silenceDb       = options?.silenceDb       ?? -30;
-    const silenceDuration = options?.silenceDuration ?? 4;
+    const silenceDuration = options?.silenceDuration ?? 1;
     const maxDuration     = options?.maxDuration      ?? 30;
 
     const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
-    const { cmd, args } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
+    const { cmd, args: baseArgs } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
+    // Append a second output so ffmpeg also streams raw PCM to stdout for dB monitoring.
+    const args = [...baseArgs, "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"];
 
     return new Promise<Buffer>((resolve, reject) => {
-      const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"] });
+      const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
       this.proc          = child;
       this.recordingPath = outPath;
+
+      const bytesPer800ms = 25600; // 16 kHz * 1 ch * 2 bytes * 0.8 s
+      let pcmTail = Buffer.alloc(0);
+      let pcmWindowIndex = 0;
 
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
@@ -478,8 +636,36 @@ export class AudioService {
         reject(new Error(`Failed to start recording: ${err.message}`));
       });
 
+      child.stdout?.on("data", (chunk: Buffer) => {
+        pcmTail = Buffer.concat([pcmTail, chunk]);
+        while (pcmTail.length >= bytesPer800ms) {
+          const frame = pcmTail.subarray(0, bytesPer800ms);
+          pcmTail = pcmTail.subarray(bytesPer800ms);
+          pcmWindowIndex += 1;
+
+          let sumSquares = 0;
+          const sampleCount = frame.length / 2;
+          for (let i = 0; i < frame.length; i += 2) {
+            const sample = frame.readInt16LE(i) / 32768;
+            sumSquares += sample * sample;
+          }
+
+          const rms = Math.sqrt(sumSquares / Math.max(sampleCount, 1));
+          const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+          const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
+          process.stderr.write(
+            `[audio:level:win] ${(pcmWindowIndex * 800).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+          );
+        }
+      });
+
       child.stderr?.on("data", (chunk: Buffer) => {
-        stderrTail += chunk.toString();
+        const text = chunk.toString();
+        stderrTail += text;
+
+        if (text.includes("silence_start") || text.includes("silence_end")) {
+          process.stderr.write(`[ffmpeg:silence:win] ${text}`);
+        }
 
         // Set the max-duration timer on first stderr output (ffmpeg is running)
         if (!maxTimer && !stopped) {
@@ -558,9 +744,14 @@ export class AudioService {
       this.proc          = child;
       this.recordingPath = null;
 
+      const bytesPer800ms = 25600; // 16 kHz * 1 ch * 2 bytes * 0.8 s
+      let pcmTail = Buffer.alloc(0);
+      let pcmWindowIndex = 0;
+
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
       let stderrTail = "";
+      let hasDetectedSpeech = false;
 
       const stop = () => {
         if (stopped) return;
@@ -574,6 +765,27 @@ export class AudioService {
 
       child.stdout?.on("data", (chunk: Buffer) => {
         onChunk(chunk);
+
+        pcmTail = Buffer.concat([pcmTail, chunk]);
+        while (pcmTail.length >= bytesPer800ms) {
+          const frame = pcmTail.subarray(0, bytesPer800ms);
+          pcmTail = pcmTail.subarray(bytesPer800ms);
+          pcmWindowIndex += 1;
+
+          let sumSquares = 0;
+          const sampleCount = frame.length / 2;
+          for (let i = 0; i < frame.length; i += 2) {
+            const sample = frame.readInt16LE(i) / 32768;
+            sumSquares += sample * sample;
+          }
+
+          const rms = Math.sqrt(sumSquares / Math.max(sampleCount, 1));
+          const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+          const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
+          process.stderr.write(
+            `[audio:level:mac] ${(pcmWindowIndex * 800).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+          );
+        }
       });
 
       child.on("error", (err) => {
@@ -586,14 +798,21 @@ export class AudioService {
         stderrTail += text;
 
         if (text.includes("silence_start") || text.includes("silence_end")) {
-          process.stderr.write(`[ffmpeg:silence] ${text}`);
+          process.stderr.write(`[ffmpeg:silence:mac] ${text}`);
         }
 
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
 
-        if (stderrTail.includes("silence_start")) {
+        // silence_end means audio went above the threshold — user has started speaking
+        if (stderrTail.includes("silence_end")) {
+          hasDetectedSpeech = true;
+        }
+
+        // Only stop on silence_start after speech was detected; otherwise the
+        // recording would end immediately if the environment starts quiet.
+        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
           stop();
         }
 
@@ -602,6 +821,97 @@ export class AudioService {
       });
 
       // Start the max-duration timer even if stderr is slow
+      setTimeout(() => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      }, 600);
+    });
+  }
+
+  /**
+   * Records from the microphone on any platform, streams raw PCM s16le chunks
+   * (16 kHz, mono) to `onChunk`, and stops automatically when the persistent
+   * Silero VAD subprocess detects `silenceDuration` seconds of silence after
+   * a speech onset.  Call `startPersistentVad()` at startup to pre-warm the
+   * model; if the subprocess isn't running yet it is started lazily here.
+   *
+   * A hard `maxDuration` cap prevents runaway recordings.
+   */
+  async recordPcmWithSileroVad(
+    onChunk: (pcm: Buffer) => void,
+    options?: { maxDuration?: number },
+  ): Promise<void> {
+    if (this.proc) {
+      throw new Error("Already recording.");
+    }
+
+    const maxDuration = options?.maxDuration ?? 10;
+
+    // Ensure the VAD subprocess is running (no-op if already warm)
+    if (!this.vadProc || !this.vadIsReady) {
+      await this.startPersistentVad();
+    }
+
+    const { cmd: ffmpegCmd, args: ffmpegArgs } = await resolvePcmStreamingArgs();
+
+    return new Promise<void>((resolve, reject) => {
+      let stopped  = false;
+      let inSpeech = false;
+      let maxTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.vadTurnCallback = null;
+        this.proc = null;
+
+        // Send graceful quit then hard-kill after 300 ms.  We're streaming raw
+        // PCM so there is no output file to flush — we don't need FFmpeg to
+        // shut down cleanly, we just need it gone fast.
+        try {
+          ffmpeg.stdin?.write("q");
+          ffmpeg.stdin?.end();
+        } catch { /* ignore if stdin already closed */ }
+        ffmpeg.once("close", () => resolve());
+        setTimeout(() => { try { ffmpeg.kill(); } catch { /* ignore */ } resolve(); }, 300);
+      };
+
+      // Register per-turn event handler on the persistent VAD stdout stream
+      this.vadTurnCallback = (event: string) => {
+        if (event === "speech_start") {
+          inSpeech = true;
+          process.stderr.write("[silero-vad] speech_start\n");
+        } else if (event === "speech_end" && inSpeech) {
+          process.stderr.write("[silero-vad] speech_end\n");
+          stop();
+        }
+      };
+
+      const ffmpeg = spawn(ffmpegCmd, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
+      this.proc = ffmpeg;
+
+      ffmpeg.on("error", (err: Error) => {
+        this.proc            = null;
+        this.vadTurnCallback = null;
+        reject(new Error(`Failed to start recording: ${err.message}`));
+      });
+
+      ffmpeg.stderr?.on("data", () => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      });
+
+      ffmpeg.stdout?.on("data", (pcm: Buffer) => {
+        onChunk(pcm);
+        if (this.vadProc && this.vadIsReady) {
+          try { this.vadProc.stdin?.write(pcm); } catch { /* ignore */ }
+        }
+      });
+
+      // Fallback: start max-duration timer even if FFmpeg stderr is slow
       setTimeout(() => {
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);

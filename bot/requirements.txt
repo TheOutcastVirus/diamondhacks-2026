@@ -2,4 +2,5 @@ openwakeword
 sounddevice
 numpy
 onnxruntime
+silero-vad
 faster-whisper

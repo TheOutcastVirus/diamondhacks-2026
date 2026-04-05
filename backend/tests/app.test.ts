@@ -470,23 +470,77 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
-  test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
-    let blandCalls = 0;
-    const restore = withFetchStub(async (url) => {
+  test("routes gemini-fast dashboard voice-stop turns through Google AI instead of Imagine", async () => {
+    const restore = withFetchStub(async (url, init) => {
       if (url.includes("/chat/completions")) {
-        return new Response("model should not be called for crisis escalation", { status: 500 });
+        return new Response("Imagine should not be called for gemini-fast voice-stop requests", { status: 500 });
       }
-      if (url.includes("/v1/calls")) {
-        blandCalls += 1;
-        if (blandCalls === 1) {
-          return new Response(JSON.stringify({ error: "provider down" }), { status: 500 });
-        }
-        return jsonResponse({ status: "success", call_id: `bland_call_${blandCalls}` });
+
+      if (url.includes("generativelanguage.googleapis.com")) {
+        expect(url).toContain("/models/gemini-3-pro-preview:generateContent");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.toolConfig).toEqual({
+          functionCallingConfig: {
+            mode: "AUTO",
+          },
+        });
+
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ text: "Gemini handled the voice turn." }],
+              },
+              finishReason: "STOP",
+            },
+          ],
+        });
       }
+
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
     try {
+<<<<<<< HEAD
+      const { app, database } = createTestApp({
+        GOOGLE_AI_API_KEY: "test-google-key",
+      });
+      const privateApp = app as unknown as {
+        interactionOwner: string | null;
+        interactionPhase: string;
+        sttService: { transcribe: (audio: File | Blob | Buffer) => Promise<string> };
+        ttsService: { synthesize: (text: string) => Promise<Buffer> };
+        audioService: {
+          stopRecording: () => Promise<Buffer>;
+          playAudio: (audio: Buffer) => Promise<void>;
+        };
+      };
+
+      privateApp.interactionOwner = "voice-http";
+      privateApp.interactionPhase = "user_listening";
+      privateApp.audioService.stopRecording = async () => Buffer.from("voice-audio");
+      privateApp.sttService.transcribe = async () => "Say which model is active.";
+      privateApp.ttsService.synthesize = async () => Buffer.from("tts-audio");
+      privateApp.audioService.playAudio = async () => {};
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/voice-stop", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "gemini-fast",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          ok: true,
+          transcript: "Say which model is active.",
+        });
+=======
       const { app, database } = createTestApp();
       try {
         database.writeMemory("family_contact_primary", JSON.stringify({
@@ -546,6 +600,7 @@ describe("Gazabot Bun backend", () => {
           reply: "I already contacted your family. Stay with me.",
         });
         expect(blandCalls).toBe(2);
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
       } finally {
         app.close();
         database.close();
@@ -1526,6 +1581,10 @@ trailer <<>>
           []) as Array<Record<string, unknown>>);
         const promptPart = parts.find((part) => typeof part.text === "string");
         expect(promptPart).toBeDefined();
+<<<<<<< HEAD
+        expect(String(promptPart?.text)).toContain("Analyze this image and respond in two clearly labeled sections");
+=======
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
         expect(String(promptPart?.text)).toContain("EXTRACTED TEXT:");
         expect(
           parts.some((part) => {
@@ -1788,6 +1847,14 @@ trailer <<>>
         const initialNextRun = String(firstCreated.nextRun);
         expect(String(secondCreated.nextRun)).toBe(initialNextRun);
 
+        (app as unknown as {
+          ttsService: { synthesize: (text: string) => Promise<Buffer> };
+          audioService: { playAudio: (audio: Buffer) => Promise<void> };
+        }).ttsService.synthesize = async () => Buffer.from("fake-audio");
+        (app as unknown as {
+          audioService: { playAudio: (audio: Buffer) => Promise<void> };
+        }).audioService.playAudio = async () => {};
+
         const executedCount = await app.runReminderSchedulerOnce(new Date(initialNextRun));
         expect(executedCount).toBe(2);
 
@@ -1805,7 +1872,9 @@ trailer <<>>
         expect(
           transcript.entries.filter((entry) => entry.toolName === "reminder-scheduler"),
         ).toHaveLength(4);
-        expect(transcript.entries.filter((entry) => entry.text === "Reminder handled.")).toHaveLength(2);
+        expect(
+          transcript.entries.filter((entry) => String(entry.text).startsWith("Reminder completed: ")),
+        ).toHaveLength(2);
 
         const remindersResponse = await app.fetch(new Request("http://localhost/api/reminders"));
         expect(remindersResponse.status).toBe(200);
@@ -1896,17 +1965,29 @@ trailer <<>>
       runConversationTurn: () => Promise<void>;
       processTranscriptText: (
         transcript: string,
+<<<<<<< HEAD
+      ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+      sttService: {
+        createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
+      };
+=======
         model?: unknown,
       ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
       ttsService: { synthesize: (text: string) => Promise<Buffer> };
       sttService: {
         transcribe: (audio: Buffer) => Promise<string>;
         createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
       };
       audioService: {
+<<<<<<< HEAD
+        recordPcmWithSileroVad: (
+          onChunk: (chunk: Buffer) => void,
+=======
         recordUntilSilence: (options?: unknown) => Promise<Buffer>;
         recordPcmUntilSilence: (
           send: (chunk: Buffer) => void,
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
           options?: unknown,
         ) => Promise<void>;
         playAudio: (audio: Buffer) => Promise<void>;
@@ -1914,10 +1995,16 @@ trailer <<>>
     };
 
     privateApp.conversationState = "conversation";
-    privateApp.audioService.recordUntilSilence = async () => {
+    privateApp.sttService.createRealtimeSession = async () => ({
+      sendAudio: () => {},
+      finalize: async () => "Hello there",
+    });
+    privateApp.audioService.recordPcmWithSileroVad = async (onChunk) => {
       events.push("record");
-      return Buffer.from("user-audio");
+      onChunk(Buffer.from("user-audio"));
     };
+<<<<<<< HEAD
+=======
     privateApp.audioService.recordPcmUntilSilence = async () => {
       events.push("record");
     };
@@ -1926,6 +2013,7 @@ trailer <<>>
       sendAudio: () => {},
       finalize: async () => "Hello there",
     });
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
     privateApp.processTranscriptText = async () => {
       events.push("process");
       return {
