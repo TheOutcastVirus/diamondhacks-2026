@@ -407,6 +407,69 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("routes gemini-fast dashboard turns through Google AI instead of Imagine", async () => {
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("Imagine should not be called for gemini-fast requests", { status: 500 });
+      }
+
+      if (url.includes("generativelanguage.googleapis.com")) {
+        expect(url).toContain("/models/gemini-3-pro-preview:generateContent");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.toolConfig).toEqual({
+          functionCallingConfig: {
+            mode: "AUTO",
+          },
+        });
+
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ text: "Gemini is active." }],
+              },
+              finishReason: "STOP",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        GOOGLE_AI_API_KEY: "test-google-key",
+      });
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Say which model is active.",
+              source: "dashboard",
+              model: "gemini-fast",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Gemini is active.",
+        });
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url) => {
@@ -583,7 +646,7 @@ describe("Gazabot Bun backend", () => {
         expect(browserPayload.browser.status).toBe("idle");
         expect(Array.isArray(browserPayload.browser.recentActions)).toBe(true);
         expect(String(browserPayload.browser.summary)).toContain("Pharmacy hours");
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();
@@ -794,6 +857,84 @@ describe("Gazabot Bun backend", () => {
               entry.text.includes("I couldn't reach Browser Use right now."),
           ),
         ).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("archives and clears conversation when end_conversation is called", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_end_1",
+                      type: "function",
+                      function: {
+                        name: "end_conversation",
+                        arguments: "{}",
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "That's all, goodbye.",
+              source: "resident",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Goodbye for now.",
+        });
+
+        expect(database.listTranscriptEntries()).toHaveLength(0);
+        const memories = database.listMemoryEntries();
+        expect(memories.length).toBeGreaterThan(0);
+        expect(memories[0]?.title).toStartWith("past_conversation_");
+        expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
+        expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
       } finally {
         app.close();
         database.close();
@@ -1385,7 +1526,7 @@ trailer <<>>
           []) as Array<Record<string, unknown>>);
         const promptPart = parts.find((part) => typeof part.text === "string");
         expect(promptPart).toBeDefined();
-        expect(String(promptPart?.text)).toContain("Extract all clearly visible text and numbers from this image");
+        expect(String(promptPart?.text)).toContain("EXTRACTED TEXT:");
         expect(
           parts.some((part) => {
             const inlineData = part.inlineData as Record<string, unknown> | undefined;
@@ -1596,6 +1737,12 @@ trailer <<>>
           ],
         });
       }
+      if (url.includes("elevenlabs.io")) {
+        return new Response(new Uint8Array([0, 1, 2]), {
+          status: 200,
+          headers: { "Content-Type": "audio/mpeg" },
+        });
+      }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -1747,10 +1894,21 @@ trailer <<>>
     const privateApp = app as unknown as {
       conversationState: "idle" | "conversation";
       runConversationTurn: () => Promise<void>;
-      processVoiceAudio: (audio: Buffer) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+      processTranscriptText: (
+        transcript: string,
+        model?: unknown,
+      ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
       ttsService: { synthesize: (text: string) => Promise<Buffer> };
+      sttService: {
+        transcribe: (audio: Buffer) => Promise<string>;
+        createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
+      };
       audioService: {
         recordUntilSilence: (options?: unknown) => Promise<Buffer>;
+        recordPcmUntilSilence: (
+          send: (chunk: Buffer) => void,
+          options?: unknown,
+        ) => Promise<void>;
         playAudio: (audio: Buffer) => Promise<void>;
       };
     };
@@ -1760,7 +1918,15 @@ trailer <<>>
       events.push("record");
       return Buffer.from("user-audio");
     };
-    privateApp.processVoiceAudio = async () => {
+    privateApp.audioService.recordPcmUntilSilence = async () => {
+      events.push("record");
+    };
+    privateApp.sttService.transcribe = async () => "Hello there";
+    privateApp.sttService.createRealtimeSession = async () => ({
+      sendAudio: () => {},
+      finalize: async () => "Hello there",
+    });
+    privateApp.processTranscriptText = async () => {
       events.push("process");
       return {
         transcript: "Hello there",
@@ -2127,7 +2293,7 @@ trailer <<>>
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Completed after terminal status.");
         expect(sessionPollCount).toBeGreaterThan(1);
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();
