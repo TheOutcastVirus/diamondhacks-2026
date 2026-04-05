@@ -16,6 +16,11 @@ console.log(
 console.log(
   `[startup] Browser Use → ${config.browserUse.baseUrl} (model=${config.browserUse.model}); when a task runs, watch for [browser-use] lines below`,
 );
+if (config.browserUse.profileId?.trim()) {
+  console.log(`[startup] Browser Use default profile → ${config.browserUse.profileId}`);
+} else {
+  console.log("[startup] Browser Use default profile → none configured; browser tasks will run without synced cookies unless a profileId is provided.");
+}
 
 const app = createApp(config);
 

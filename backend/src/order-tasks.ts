@@ -63,6 +63,7 @@ export function buildFoodOrderTask(params: FoodOrderParams): string {
     addressInfo,
     cardInfo,
     "Proceed through checkout. If any substitution, timing, or confirmation is needed, stop and report what is required.",
+    "When you have the final result, stop browsing and end the session (do not keep it open).",
     "Return JSON: { status: 'placed' | 'blocked', orderNumber?: string, total?: string, estimatedArrival?: string, blockedReason?: string }",
   ]
     .filter(Boolean)
@@ -93,6 +94,7 @@ export function buildCvsTask(params: CvsOrderParams): string {
     deliveryMode,
     cardInfo,
     "Complete checkout. If anything is missing, out of stock, or requires input, stop and report clearly.",
+    "When you have the final result, stop browsing and end the session (do not keep it open).",
     "Return JSON: { status: 'placed' | 'blocked', orderNumber?: string, total?: string, estimatedArrival?: string, blockedReason?: string }",
   ]
     .filter(Boolean)

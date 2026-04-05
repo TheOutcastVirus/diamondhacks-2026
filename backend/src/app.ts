@@ -17,7 +17,9 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { AgentHarness, type AgentTurnResult } from "./agent";
 import { AudioService } from "./audio";
+import { BlandService } from "./bland";
 import { BrowserUseService } from "./browser-use";
+import { detectCrisis } from "./crisis";
 import { GazabotDatabase } from "./db";
 import { UploadedFileService } from "./files";
 import { parseMultipartUpload } from "./multipart";
@@ -470,12 +472,37 @@ function encodeSseFrame(event: string, payload: Record<string, unknown>): string
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
+const FAMILY_CONTACT_MEMORY_KEY = "family_contact_primary";
+
+const FAMILY_CONTACT_PROMPT_FIELDS: PromptField[] = [
+  { name: "full_name", label: "Full Name", type: "string", required: true },
+  { name: "relationship", label: "Relationship", type: "string", required: true },
+  {
+    name: "phone_number",
+    label: "Phone Number",
+    type: "string",
+    required: true,
+    placeholder: "+14155551234",
+    description: "Store the number in E.164 format for automatic crisis calling.",
+  },
+  { name: "notes", label: "Notes", type: "text", required: false },
+];
+
+function redactPhoneNumber(phoneNumber: string): string {
+  if (phoneNumber.length <= 6) {
+    return `${phoneNumber.slice(0, 2)}***`;
+  }
+  return `${phoneNumber.slice(0, 5)}******${phoneNumber.slice(-2)}`;
+}
+
 export class GazabotApp {
   private readonly transcriptBus = new TranscriptEventBus();
 
   private readonly agentHarness: AgentHarness;
 
   private readonly browserUseService: BrowserUseService;
+
+  private readonly blandService: BlandService;
 
   private readonly reminderScheduler: ReminderScheduler;
 
@@ -604,6 +631,7 @@ export class GazabotApp {
     private readonly database: GazabotDatabase,
   ) {
     this.browserUseService = new BrowserUseService(config, database, this.transcriptBus);
+    this.blandService = new BlandService(config);
     this.uploadedFileService = new UploadedFileService(config, database);
     this.agentHarness = new AgentHarness(
       config,
@@ -623,7 +651,11 @@ export class GazabotApp {
     this.reminderScheduler.start();
     this.sttService = new SttService(config);
     this.ttsService = new TtsService(config);
-    this.startWakeWordListener();
+    if (config.wakeWord.enabled) {
+      this.startWakeWordListener();
+    } else {
+      console.log("[wake-word] Disabled (set WAKE_WORD_ENABLED=false).");
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -698,6 +730,10 @@ export class GazabotApp {
 
       if (request.method === "GET" && url.pathname === "/api/browser") {
         const browser = this.database.getCurrentBrowserContext();
+        const configuredProfileId = this.config.browserUse.profileId?.trim();
+        if (configuredProfileId) {
+          browser.configuredProfileId = configuredProfileId;
+        }
         return jsonResponse(request, this.config, { browser } satisfies { browser: BrowserContext });
       }
 
@@ -733,6 +769,12 @@ export class GazabotApp {
       if (request.method === "POST" && url.pathname.startsWith("/api/prompts/") && url.pathname.endsWith("/respond")) {
         const id = url.pathname.slice("/api/prompts/".length, -"/respond".length);
         return jsonResponse(request, this.config, await this.handlePromptRespond(request, id));
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/reset") {
+        this.database.resetSession();
+        console.log("[reset] Session data cleared (transcript, browser, prompts, orders).");
+        return jsonResponse(request, this.config, { status: "ok", message: "Session reset." });
       }
 
       if (request.method === "GET" && url.pathname === "/api/memory") {
@@ -908,6 +950,26 @@ export class GazabotApp {
       text: payload.message,
     });
     this.transcriptBus.publish("transcript", userEntry);
+
+    const crisisResult = await this.handleCrisisTurn(payload);
+    if (crisisResult?.kind === "text") {
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: crisisResult.text,
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+
+      const stream = new ReadableStream<string>({
+        start: (controller) => {
+          controller.enqueue(encodeSseFrame("ready", { source: payload.source }));
+          controller.enqueue(encodeSseFrame("chunk", { delta: crisisResult.text, done: false }));
+          controller.enqueue(encodeSseFrame("done", { text: crisisResult.text, done: true }));
+          controller.close();
+        },
+      });
+      return eventStreamResponse(request, this.config, stream);
+    }
 
     const stream = new ReadableStream<string>({
       start: (controller) => {
@@ -1411,6 +1473,36 @@ export class GazabotApp {
     });
     this.transcriptBus.publish("tool", responseEntry);
 
+    const hitlRequest = this.database.findPendingHitlByPromptId(promptId);
+    if (hitlRequest) {
+      this.database.resolveHitlRequest(hitlRequest.id);
+
+      const resumeEntry = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Resuming browser task with your information.",
+        toolName: "browser-use-hitl",
+        toolStatus: "started",
+        metadata: {
+          promptId: completed.id,
+          hitlRequestId: hitlRequest.id,
+          needKind: hitlRequest.needKind,
+          browserSessionId: hitlRequest.browserSessionId,
+        },
+      });
+      const robotResume = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: "Resuming the browser task with the information you provided.",
+      });
+      this.transcriptBus.publish("tool", resumeEntry);
+      this.transcriptBus.publish("transcript", robotResume);
+
+      void this.browserUseService.resumeHitlRequest(hitlRequest).catch((error) => {
+        console.error("[browser-use] Failed to resume HITL request:", error);
+      });
+    }
+
     return { prompt: completed, memoryEntry };
   }
 
@@ -1498,6 +1590,19 @@ export class GazabotApp {
     const userEntry = this.database.createTranscriptEntry(entryInput);
     this.transcriptBus.publish("transcript", userEntry);
 
+    const crisisResult = await this.handleCrisisTurn(payload);
+    if (crisisResult) {
+      if (crisisResult.kind === "text") {
+        const robotEntry = this.database.createTranscriptEntry({
+          kind: "message",
+          role: "robot",
+          text: crisisResult.text,
+        });
+        this.transcriptBus.publish("transcript", robotEntry);
+      }
+      return crisisResult;
+    }
+
     const result = await this.agentHarness.collectTurn(payload);
     if (result.kind === "text" || result.kind === "end_conversation") {
       const robotEntry = this.database.createTranscriptEntry({
@@ -1512,6 +1617,177 @@ export class GazabotApp {
     }
 
     return result;
+  }
+
+  private async handleCrisisTurn(payload: AgentTurnRequest): Promise<AgentTurnResult | null> {
+    if (!this.config.crisis.enabled) {
+      return null;
+    }
+
+    const detection = detectCrisis(payload.message);
+    if (!detection.triggered) {
+      return null;
+    }
+
+    const duplicate = this.findRecentCrisisEscalation(detection.normalizedMessage);
+    if (duplicate) {
+      return {
+        kind: "text",
+        text:
+          payload.source === "voice"
+            ? "I already contacted your family. Stay with me."
+            : "Crisis escalation already triggered recently for this request.",
+      };
+    }
+
+    const contactMemory = this.database.readMemory(FAMILY_CONTACT_MEMORY_KEY);
+    const contactData = contactMemory?.data;
+    const fullName = typeof contactData?.full_name === "string" ? contactData.full_name.trim() : "";
+    const relationship = typeof contactData?.relationship === "string" ? contactData.relationship.trim() : "";
+    const phoneNumber = typeof contactData?.phone_number === "string" ? contactData.phone_number.trim() : "";
+
+    const started = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "system",
+      text: "Calling tool: crisis-escalation",
+      toolName: "crisis-escalation",
+      toolStatus: "started",
+      metadata: {
+        matchedPhrases: detection.matchedPhrases,
+        normalizedMessage: detection.normalizedMessage,
+      },
+    });
+    this.transcriptBus.publish("tool", started);
+
+    if (!fullName || !relationship || !phoneNumber) {
+      this.ensureFamilyContactPrompt();
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Tool crisis-escalation failed: Missing family contact.",
+        toolName: "crisis-escalation",
+        toolStatus: "failed",
+        metadata: {
+          matchedPhrases: detection.matchedPhrases,
+          failureReason: "family_contact_missing",
+        },
+      });
+      this.transcriptBus.publish("tool", failed);
+      return {
+        kind: "text",
+        text: "I'm trying to contact your family, but I don't have their phone number saved yet.",
+      };
+    }
+
+    if (!this.blandService.isConfigured()) {
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Tool crisis-escalation failed: Bland is not configured.",
+        toolName: "crisis-escalation",
+        toolStatus: "failed",
+        metadata: {
+          matchedPhrases: detection.matchedPhrases,
+          targetName: fullName,
+          targetPhoneRedacted: redactPhoneNumber(phoneNumber),
+          failureReason: "bland_not_configured",
+        },
+      });
+      this.transcriptBus.publish("tool", failed);
+      return {
+        kind: "text",
+        text: "I'm trying to contact your family, but the calling system is not set up yet.",
+      };
+    }
+
+    try {
+      const blandCall = await this.blandService.placePathwayCall({ phoneNumber });
+      const completed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Tool crisis-escalation completed",
+        toolName: "crisis-escalation",
+        toolStatus: "completed",
+        metadata: {
+          matchedPhrases: detection.matchedPhrases,
+          targetName: fullName,
+          relationship,
+          targetPhoneRedacted: redactPhoneNumber(phoneNumber),
+          blandCallId: blandCall.callId,
+          normalizedMessage: detection.normalizedMessage,
+        },
+      });
+      this.transcriptBus.publish("tool", completed);
+      return {
+        kind: "text",
+        text:
+          payload.source === "voice"
+            ? "I'm contacting your family now. Stay with me."
+            : "Crisis escalation triggered. Calling the primary family contact now.",
+      };
+    } catch (error) {
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Tool crisis-escalation failed: ${error instanceof Error ? error.message : String(error)}`,
+        toolName: "crisis-escalation",
+        toolStatus: "failed",
+        metadata: {
+          matchedPhrases: detection.matchedPhrases,
+          targetName: fullName,
+          targetPhoneRedacted: redactPhoneNumber(phoneNumber),
+          failureReason: error instanceof Error ? error.message : String(error),
+        },
+      });
+      this.transcriptBus.publish("tool", failed);
+      return {
+        kind: "text",
+        text: "I couldn't place the family call automatically. Please call for help right away.",
+      };
+    }
+  }
+
+  private ensureFamilyContactPrompt(): void {
+    const pendingPrompt = this.database
+      .listPrompts("pending")
+      .find((prompt) => prompt.memoryKey === FAMILY_CONTACT_MEMORY_KEY);
+    if (pendingPrompt) {
+      return;
+    }
+
+    const prompt = this.database.createPrompt({
+      title: "Primary family contact",
+      description: "A crisis phrase was detected. Save the primary family contact so Gazabot can call them immediately.",
+      memoryKey: FAMILY_CONTACT_MEMORY_KEY,
+      memoryLabel: "Primary family contact",
+      fields: FAMILY_CONTACT_PROMPT_FIELDS,
+    });
+    this.transcriptBus.publishPrompt(prompt);
+  }
+
+  private findRecentCrisisEscalation(normalizedMessage: string): Record<string, unknown> | null {
+    const thresholdMs = this.config.crisis.callCooldownSeconds * 1000;
+    const now = Date.now();
+    const entries = this.database.listTranscriptEntries();
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry) {
+        continue;
+      }
+      if (entry.kind !== "tool" || entry.toolName !== "crisis-escalation" || entry.toolStatus !== "completed") {
+        continue;
+      }
+      const metadata = entry.metadata ?? {};
+      if (metadata.normalizedMessage !== normalizedMessage) {
+        continue;
+      }
+      const timestampMs = Date.parse(entry.timestamp);
+      if (Number.isNaN(timestampMs) || now - timestampMs > thresholdMs) {
+        continue;
+      }
+      return metadata;
+    }
+    return null;
   }
 
   private async executeReminderTurn(
