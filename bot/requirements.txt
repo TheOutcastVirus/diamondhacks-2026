@@ -1,0 +1,5 @@
+# brew install portaudio  ← required before pip install (macOS)
+openwakeword
+pyaudio
+numpy
+onnxruntime

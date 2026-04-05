@@ -47,6 +47,33 @@ function openAlRecordingArgs(deviceName: string, outputPath: string): AudioComma
   };
 }
 
+function inputArgs(): string[] {
+  return platform() === "darwin"
+    ? ["-f", "avfoundation", "-i", ":0"]
+    : ["-f", "alsa", "-i", "default"];
+}
+
+function recordingArgs(outputPath: string): { cmd: string; args: string[] } {
+  return {
+    cmd: "ffmpeg",
+    args: [...inputArgs(), "-ar", "16000", "-ac", "1", outputPath, "-y"],
+  };
+}
+
+function recordingArgsWithSilence(
+  outputPath: string,
+  silenceDb: number,
+  silenceDuration: number,
+): { cmd: string; args: string[] } {
+  // silencedetect logs "silence_start: <t>" to stderr when audio drops below
+  // the noise floor for the given duration; we parse that to auto-stop.
+  const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
+  return {
+    cmd: "ffmpeg",
+    args: [...inputArgs(), "-af", filter, "-ar", "16000", "-ac", "1", outputPath, "-y"],
+  };
+}
+
 function dshowRecordingArgs(deviceName: string, outputPath: string): AudioCommand {
   return {
     cmd: "ffmpeg",
@@ -361,6 +388,95 @@ export class AudioService {
 
     unlink(outPath).catch(() => {});
     return buf;
+  }
+
+  /**
+   * Start recording and automatically stop once ffmpeg detects `silenceDuration`
+   * consecutive seconds of audio below `silenceDb` dB.  A hard `maxDuration`
+   * cap prevents runaway recordings if silence is never reached.
+   */
+  async recordUntilSilence(options?: {
+    silenceDb?: number;
+    silenceDuration?: number;
+    maxDuration?: number;
+  }): Promise<Buffer> {
+    if (this.proc) {
+      throw new Error("Already recording.");
+    }
+
+    const silenceDb       = options?.silenceDb       ?? -30;
+    const silenceDuration = options?.silenceDuration ?? 4;
+    const maxDuration     = options?.maxDuration      ?? 30;
+
+    const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
+    const { cmd, args } = recordingArgsWithSilence(outPath, silenceDb, silenceDuration);
+
+    return new Promise<Buffer>((resolve, reject) => {
+      const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
+      this.proc          = child;
+      this.recordingPath = outPath;
+
+      let maxTimer: ReturnType<typeof setTimeout> | null = null;
+      let stopped = false;
+      let stderrTail = "";
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.proc          = null;
+        this.recordingPath = null;
+
+        child.kill("SIGTERM");
+
+        const afterClose = async () => {
+          try {
+            const buf = await readFile(outPath);
+            unlink(outPath).catch(() => {});
+            resolve(buf);
+          } catch (e) {
+            unlink(outPath).catch(() => {});
+            reject(e);
+          }
+        };
+
+        child.once("close", afterClose);
+        setTimeout(afterClose, 4000); // safety: don't wait forever
+      };
+
+      child.on("error", (err) => {
+        this.proc          = null;
+        this.recordingPath = null;
+        reject(new Error(`Failed to start recording: ${err.message}`));
+      });
+
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderrTail += chunk.toString();
+
+        // Set the max-duration timer on first stderr output (ffmpeg is running)
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+
+        // ffmpeg silencedetect emits "silence_start: <timestamp>" when the
+        // configured silence duration has elapsed.  Stop as soon as we see it.
+        if (stderrTail.includes("silence_start")) {
+          stop();
+        }
+
+        // Trim the buffer so it doesn't grow indefinitely
+        const nl = stderrTail.lastIndexOf("\n");
+        if (nl !== -1) stderrTail = stderrTail.slice(nl + 1);
+      });
+
+      // Fallback: treat ffmpeg as started after 600 ms even with no stderr
+      setTimeout(() => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      }, 600);
+    });
   }
 
   async playAudio(audioBuffer: Buffer): Promise<void> {
