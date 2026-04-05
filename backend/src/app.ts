@@ -902,12 +902,13 @@ export class GazabotApp {
       return;
     }
 
+    const silenceOpts = { silenceDb: -15, silenceDuration: 1, maxDuration: 10 };
+    console.log(`[wake-word] Recording with silenceDb=${silenceOpts.silenceDb} silenceDuration=${silenceOpts.silenceDuration}s maxDuration=${silenceOpts.maxDuration}s`);
+
     try {
-      // Stream PCM chunks directly to AssemblyAI while recording.
-      // Silence detection (-15 dB / 1 s) stops the mic; 10 s hard cap.
       await this.audioService.recordPcmUntilSilence(
         (chunk) => session.sendAudio(chunk),
-        { silenceDb: -15, silenceDuration: 1, maxDuration: 10 },
+        silenceOpts,
       );
     } catch (err) {
       console.error("[wake-word] Recording failed:", err);
