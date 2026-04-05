@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { parseDshowAudioDevices, parseOpenAlCaptureDevices, playbackArgsForPlatform, recordingArgsForPlatform } from "../src/audio";
+import { detectCrisis } from "../src/crisis";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
 import { GazabotDatabase } from "../src/db";
@@ -62,6 +63,8 @@ function createTestApp(overrides: Record<string, string> = {}) {
     UPLOADS_DIR: join(directory, "uploads"),
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
     BROWSER_USE_API_KEY: "test-browser-key",
+    BLAND_API_KEY: "test-bland-key",
+    BLAND_PATHWAY_ID: "pathway_test_123",
     AGENT_CHUNK_DELAY_MS: "5",
     BROWSER_USE_POLL_INTERVAL_MS: "5",
     REMINDER_SCHEDULER_ENABLED: "false",
@@ -84,6 +87,18 @@ afterEach(async () => {
 });
 
 describe("Gazabot Bun backend", () => {
+  test("detects crisis phrases conservatively", () => {
+    expect(detectCrisis("I'm hurt").triggered).toBe(true);
+    expect(detectCrisis("I'm in trouble and need my family").triggered).toBe(true);
+    expect(detectCrisis("Help me, call my daughter").triggered).toBe(true);
+    expect(detectCrisis("HELP!! I'M HURT").triggered).toBe(true);
+    expect(detectCrisis("im hurt and i need my family").triggered).toBe(true);
+
+    expect(detectCrisis("My shoulder hurt last week").triggered).toBe(false);
+    expect(detectCrisis("Can you tell my family I'm okay?").triggered).toBe(false);
+    expect(detectCrisis("I watched a movie called Trouble").triggered).toBe(false);
+  });
+
   test("supports reminder create, update, pause, and delete flow", async () => {
     const { app, database } = createTestApp();
 
@@ -218,6 +233,256 @@ describe("Gazabot Bun backend", () => {
         expect(transcript.entries[0]?.text).toBe("Please note this for later.");
         expect(transcript.entries[1]?.role).toBe("robot");
         expect(transcript.entries[1]?.text).toBe("Noted for later.");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn calls Bland and skips the model when family contact is saved", async () => {
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        expect(init?.method).toBe("POST");
+        expect(init?.headers).toMatchObject({
+          "Content-Type": "application/json",
+          authorization: "test-bland-key",
+        });
+        expect(JSON.parse(String(init?.body))).toEqual({
+          phone_number: "+14155551234",
+          pathway_id: "pathway_test_123",
+        });
+        return jsonResponse({ status: "success", call_id: "bland_call_1" });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          schema: [
+            { name: "full_name", label: "Full Name", type: "string", required: true },
+            { name: "relationship", label: "Relationship", type: "string", required: true },
+            { name: "phone_number", label: "Phone Number", type: "string", required: true },
+          ],
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt and I need my family",
+              source: "voice",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm contacting your family now. Stay with me.",
+        });
+        expect(blandCalls).toBe(1);
+
+        const transcript = database.listTranscriptEntries();
+        expect(transcript.some((entry) => entry.toolName === "crisis-escalation" && entry.toolStatus === "completed")).toBe(
+          true,
+        );
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn creates a setup prompt when family contact is missing", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        return new Response("bland should not be called without a saved contact", { status: 500 });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Help me, call my daughter",
+              source: "voice",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm trying to contact your family, but I don't have their phone number saved yet.",
+        });
+        const prompts = database.listPrompts("pending");
+        expect(prompts.some((prompt) => prompt.memoryKey === "family_contact_primary")).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn reports config issues when Bland is not configured", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        BLAND_API_KEY: "",
+        BLAND_PATHWAY_ID: "",
+      });
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm in trouble",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm trying to contact your family, but the calling system is not set up yet.",
+        });
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        if (blandCalls === 1) {
+          return new Response(JSON.stringify({ error: "provider down" }), { status: 500 });
+        }
+        return jsonResponse({ status: "success", call_id: `bland_call_${blandCalls}` });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const failedResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(failedResponse.status).toBe(200);
+        expect(await failedResponse.json()).toEqual({
+          route: "conversation",
+          reply: "I couldn't place the family call automatically. Please call for help right away.",
+        });
+
+        const successResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(successResponse.status).toBe(200);
+        expect(blandCalls).toBe(2);
+
+        const duplicateResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(duplicateResponse.status).toBe(200);
+        expect(await duplicateResponse.json()).toEqual({
+          route: "conversation",
+          reply: "I already contacted your family. Stay with me.",
+        });
+        expect(blandCalls).toBe(2);
       } finally {
         app.close();
         database.close();
