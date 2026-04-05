@@ -60,14 +60,24 @@ function recordingArgs(outputPath: string): { cmd: string; args: string[] } {
   };
 }
 
-function recordingArgsWithSilence(
+async function resolveRecordingCommandWithSilence(
   outputPath: string,
   silenceDb: number,
   silenceDuration: number,
-): { cmd: string; args: string[] } {
+): Promise<{ cmd: string; args: string[] }> {
   // silencedetect logs "silence_start: <t>" to stderr when audio drops below
   // the noise floor for the given duration; we parse that to auto-stop.
   const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
+
+  if (platform() === "win32") {
+    const base = await probeWindowsRecordingCommand(outputPath);
+    // Splice the silence filter before the output path args
+    const outputIdx = base.args.indexOf(outputPath);
+    const before = base.args.slice(0, outputIdx);
+    const after = base.args.slice(outputIdx);
+    return { cmd: base.cmd, args: [...before, "-af", filter, ...after] };
+  }
+
   return {
     cmd: "ffmpeg",
     args: [...inputArgs(), "-af", filter, "-ar", "16000", "-ac", "1", outputPath, "-y"],
@@ -409,7 +419,7 @@ export class AudioService {
     const maxDuration     = options?.maxDuration      ?? 30;
 
     const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
-    const { cmd, args } = recordingArgsWithSilence(outPath, silenceDb, silenceDuration);
+    const { cmd, args } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
 
     return new Promise<Buffer>((resolve, reject) => {
       const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });

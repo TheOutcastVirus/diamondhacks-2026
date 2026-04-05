@@ -837,7 +837,9 @@ export class GazabotApp {
     const botDir = resolve(import.meta.dir, "../../bot");
     const script = resolve(botDir, "wake_word.py");
     // Use the venv's Python if it exists, otherwise fall back to system python3
-    const venvPython = resolve(botDir, ".venv/bin/python3");
+    const venvPython = process.platform === "win32"
+      ? resolve(botDir, ".venv/Scripts/python.exe")
+      : resolve(botDir, ".venv/bin/python3");
     const python = Bun.file(venvPython).size > 0 ? venvPython : "python3";
     let child: ReturnType<typeof spawn>;
 
