@@ -15,6 +15,11 @@ export class SttService {
     });
 
     if (transcript.status === "error") {
+      // AssemblyAI returns this when the audio contains no speech — treat it
+      // the same as an empty transcript rather than a hard failure.
+      if (transcript.error?.includes("no spoken audio")) {
+        return "";
+      }
       throw new Error(transcript.error ?? "AssemblyAI transcription failed");
     }
 

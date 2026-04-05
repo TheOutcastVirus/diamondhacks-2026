@@ -894,7 +894,7 @@ export class GazabotApp {
       // Raise silenceDb toward -15 if it still runs long in noisy environments.
       audioBuffer = await this.audioService.recordUntilSilence({
         silenceDb: -20,
-        silenceDuration: 2,
+        silenceDuration: 1,
         maxDuration: 10,
       });
     } catch (err) {

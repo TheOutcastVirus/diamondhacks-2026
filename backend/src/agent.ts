@@ -128,13 +128,14 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "run_browser_task",
       description:
-        "Dispatch a browser automation task. Use for web searches, ordering items, checking websites, booking, or any task requiring internet browsing.",
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Before placing any order, ensure payment_card and delivery_address are stored in memory; if missing, call request_user_input first.",
       parameters: {
         type: "object",
         properties: {
           task: {
             type: "string",
-            description: "Detailed description of what to do in the browser",
+            description:
+              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
           },
         },
         required: ["task"],
@@ -382,7 +383,7 @@ export class AgentHarness {
         ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically, so do NOT call the speak tool. Keep your response to 1-3 sentences."
         : "\n\nUse the speak tool ONCE if you want to vocalize a reply.";
 
-    const systemPrompt = `You are Gazabot, a senior care assistant. You help with reminders, web tasks, and daily questions. Be warm, concise, and friendly.
+    const systemPrompt = `You are Gazabot, a senior care assistant specializing in reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
 
 Current date and time: ${new Date().toISOString()}
 
@@ -396,6 +397,11 @@ When you learn something worth remembering about the user or household, call wri
 When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
 Available uploaded files (call list_uploaded_files or read_uploaded_file for details):
 ${uploadedFileSummary}
+
+ORDERING CAPABILITIES:
+- Food ordering platforms: DoorDash, Uber Eats, Grubhub — use run_browser_task with the platform name in the task string.
+- Pharmacy: CVS.com — OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
+- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
 
 TOOL USE RULES - follow exactly:
 - Only call a tool if the user EXPLICITLY requests that action.
