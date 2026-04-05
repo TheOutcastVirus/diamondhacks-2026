@@ -883,11 +883,12 @@ export class GazabotApp {
 
     let audioBuffer: Buffer;
     try {
-      // Stop after 4 s of silence (-30 dB floor), hard cap at 30 s
+      // Stop after 2 s of silence (-20 dB floor), hard cap at 10 s.
+      // Raise silenceDb toward -15 if it still runs long in noisy environments.
       audioBuffer = await this.audioService.recordUntilSilence({
-        silenceDb: -30,
-        silenceDuration: 4,
-        maxDuration: 30,
+        silenceDb: -20,
+        silenceDuration: 2,
+        maxDuration: 10,
       });
     } catch (err) {
       console.error("[wake-word] Recording failed:", err);
