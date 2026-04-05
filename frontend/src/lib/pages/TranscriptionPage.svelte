@@ -288,6 +288,7 @@
   $: messageCount = entries.filter((entry) => entry.kind === 'message').length;
   $: toolCount = entries.filter((entry) => entry.kind === 'tool').length;
 <<<<<<< HEAD
+<<<<<<< HEAD
   $: filteredEntries = filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode);
 =======
   $: filteredEntries = (
@@ -297,6 +298,9 @@
     window.localStorage.setItem(agentModelStorageKey, agentModel);
   }
 >>>>>>> origin/main
+=======
+  $: filteredEntries = filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode);
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
 </script>
 
 <section class="page-grid tx-console" aria-label="Live transcript">

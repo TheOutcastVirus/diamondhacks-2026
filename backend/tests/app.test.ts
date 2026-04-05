@@ -243,6 +243,9 @@ describe("Gazabot Bun backend", () => {
   });
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("crisis turn calls Bland and skips the model when family contact is saved", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url, init) => {
@@ -442,11 +445,14 @@ describe("Gazabot Bun backend", () => {
         expect(await response.json()).toEqual({
           route: "conversation",
           reply: "I'm trying to contact your family, but the calling system is not set up yet.",
+<<<<<<< HEAD
 =======
         await expect(response.json()).resolves.toEqual({
           route: "conversation",
           reply: "Gemini is active.",
 >>>>>>> origin/main
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
         });
       } finally {
         app.close();
@@ -458,6 +464,9 @@ describe("Gazabot Bun backend", () => {
   });
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url) => {
@@ -543,8 +552,11 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+<<<<<<< HEAD
 =======
 >>>>>>> origin/main
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("updates browser state after a queued browser task", async () => {
     let completionRound = 0;
     let stopRequests = 0;
@@ -777,6 +789,9 @@ describe("Gazabot Bun backend", () => {
   });
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
   test("surfaces Browser Use network failures as actionable browser status", async () => {
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
@@ -800,6 +815,7 @@ describe("Gazabot Bun backend", () => {
                 ],
               },
               finish_reason: "tool_calls",
+<<<<<<< HEAD
 =======
   test("archives and clears conversation when end_conversation is called", async () => {
     let completionRound = 0;
@@ -836,18 +852,26 @@ describe("Gazabot Bun backend", () => {
               message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
               finish_reason: "stop",
 >>>>>>> origin/main
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
             },
           ],
         });
       }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       if (url.includes("browser-use.com")) {
         throw new TypeError("NetworkError when attempting to fetch resource.");
       }
 
+<<<<<<< HEAD
 =======
 >>>>>>> origin/main
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -861,18 +885,26 @@ describe("Gazabot Bun backend", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
 <<<<<<< HEAD
+<<<<<<< HEAD
               message: "Check the weather in the browser.",
               source: "dashboard",
 =======
               message: "That's all, goodbye.",
               source: "guardian",
 >>>>>>> origin/main
+=======
+              message: "Check the weather in the browser.",
+              source: "dashboard",
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
             }),
           }),
         );
 
         expect(response.status).toBe(200);
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
         await new Promise((resolve) => setTimeout(resolve, 50));
 
         const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
@@ -893,6 +925,7 @@ describe("Gazabot Bun backend", () => {
               entry.text.includes("I couldn't reach Browser Use right now."),
           ),
         ).toBe(true);
+<<<<<<< HEAD
 =======
         await expect(response.json()).resolves.toEqual({
           route: "conversation",
@@ -906,6 +939,8 @@ describe("Gazabot Bun backend", () => {
         expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
         expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
 >>>>>>> origin/main
+=======
+>>>>>>> 01e5c3da806756fec1af9f4cef42b6fddb1041eb
       } finally {
         app.close();
         database.close();
