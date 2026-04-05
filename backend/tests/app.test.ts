@@ -258,6 +258,11 @@ describe("Gazabot Bun backend", () => {
         expect(JSON.parse(String(init?.body))).toEqual({
           phone_number: "+14155551234",
           pathway_id: "pathway_test_123",
+          request_data: {
+            emergency_brief:
+              "This is an automated wellness alert from a home care assistant. Someone you support may be in distress or need urgent help. Please try to reach them right away, or ask someone nearby to check on them. Thank you for responding as quickly as you can.",
+            relationship_to_resident: "Daughter",
+          },
         });
         return jsonResponse({ status: "success", call_id: "bland_call_1" });
       }
@@ -502,7 +507,6 @@ describe("Gazabot Bun backend", () => {
     });
 
     try {
-<<<<<<< HEAD
       const { app, database } = createTestApp({
         GOOGLE_AI_API_KEY: "test-google-key",
       });
@@ -540,20 +544,49 @@ describe("Gazabot Bun backend", () => {
           ok: true,
           transcript: "Say which model is active.",
         });
-=======
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn retries bland after transient failure then dedupes repeated phrase", async () => {
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        if (blandCalls === 1) {
+          return new Response("transient bland error", { status: 500 });
+        }
+        return jsonResponse({ status: "success", call_id: `bland_call_${blandCalls}` });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
       const { app, database } = createTestApp();
       try {
-        database.writeMemory("family_contact_primary", JSON.stringify({
-          full_name: "Jane Doe",
-          relationship: "Daughter",
-          phone_number: "+14155551234",
-        }), {
-          data: {
+        database.writeMemory(
+          "family_contact_primary",
+          JSON.stringify({
             full_name: "Jane Doe",
             relationship: "Daughter",
             phone_number: "+14155551234",
+          }),
+          {
+            data: {
+              full_name: "Jane Doe",
+              relationship: "Daughter",
+              phone_number: "+14155551234",
+            },
           },
-        });
+        );
 
         const failedResponse = await app.fetch(
           new Request("http://localhost/api/agent/turn", {
@@ -600,7 +633,65 @@ describe("Gazabot Bun backend", () => {
           reply: "I already contacted your family. Stay with me.",
         });
         expect(blandCalls).toBe(2);
->>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("POST /api/emergency-family-call places bland call and records transcript", async () => {
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          phone_number: "+14155551234",
+          pathway_id: "pathway_test_123",
+          request_data: {
+            relationship_to_resident: "Daughter",
+          },
+        });
+        return jsonResponse({ status: "success", call_id: "manual_bland_1" });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory(
+          "family_contact_primary",
+          JSON.stringify({
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          }),
+          {
+            data: {
+              full_name: "Jane Doe",
+              relationship: "Daughter",
+              phone_number: "+14155551234",
+            },
+          },
+        );
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/emergency-family-call", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          }),
+        );
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ ok: true, callId: "manual_bland_1" });
+        expect(blandCalls).toBe(1);
+
+        const entries = database.listTranscriptEntries();
+        expect(entries.some((e) => e.toolName === "crisis-escalation" && e.toolStatus === "completed")).toBe(true);
+        expect(entries.some((e) => e.text?.includes("Guardian placed an emergency call"))).toBe(true);
       } finally {
         app.close();
         database.close();
@@ -1581,10 +1672,7 @@ trailer <<>>
           []) as Array<Record<string, unknown>>);
         const promptPart = parts.find((part) => typeof part.text === "string");
         expect(promptPart).toBeDefined();
-<<<<<<< HEAD
         expect(String(promptPart?.text)).toContain("Analyze this image and respond in two clearly labeled sections");
-=======
->>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
         expect(String(promptPart?.text)).toContain("EXTRACTED TEXT:");
         expect(
           parts.some((part) => {
@@ -1965,29 +2053,15 @@ trailer <<>>
       runConversationTurn: () => Promise<void>;
       processTranscriptText: (
         transcript: string,
-<<<<<<< HEAD
       ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
-      sttService: {
-        createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
-      };
-=======
-        model?: unknown,
-      ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
->>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
       ttsService: { synthesize: (text: string) => Promise<Buffer> };
       sttService: {
         transcribe: (audio: Buffer) => Promise<string>;
         createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
       };
       audioService: {
-<<<<<<< HEAD
         recordPcmWithSileroVad: (
           onChunk: (chunk: Buffer) => void,
-=======
-        recordUntilSilence: (options?: unknown) => Promise<Buffer>;
-        recordPcmUntilSilence: (
-          send: (chunk: Buffer) => void,
->>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
           options?: unknown,
         ) => Promise<void>;
         playAudio: (audio: Buffer) => Promise<void>;
@@ -2003,17 +2077,6 @@ trailer <<>>
       events.push("record");
       onChunk(Buffer.from("user-audio"));
     };
-<<<<<<< HEAD
-=======
-    privateApp.audioService.recordPcmUntilSilence = async () => {
-      events.push("record");
-    };
-    privateApp.sttService.transcribe = async () => "Hello there";
-    privateApp.sttService.createRealtimeSession = async () => ({
-      sendAudio: () => {},
-      finalize: async () => "Hello there",
-    });
->>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
     privateApp.processTranscriptText = async () => {
       events.push("process");
       return {
