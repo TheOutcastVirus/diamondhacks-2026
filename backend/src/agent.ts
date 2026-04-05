@@ -6,6 +6,7 @@ import type {
   ReminderCadence,
   ReminderUpdateInput,
 } from "./contracts";
+import { detectFoodPlatform, isCvsTask } from "./order-tasks";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
@@ -139,7 +140,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "run_browser_task",
       description:
-        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Before placing any order, ensure payment_card and delivery_address are stored in memory; if missing, call request_user_input first.",
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately — the browser agent will automatically pause and ask the user for payment or delivery details if needed during checkout.",
       parameters: {
         type: "object",
         properties: {
@@ -292,11 +293,8 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   // Locate the last plain user message (not a tool result) — this is the pivot
   let pivotIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (!message) {
-      continue;
-    }
-    if (message.role === "user" && !message.tool_call_id) {
+    const pivot = messages[i];
+    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
       pivotIdx = i;
       break;
     }
@@ -311,19 +309,14 @@ function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
   let i = 0;
   while (i < toolChain.length) {
     const msg = toolChain[i];
-    if (!msg) {
-      i++;
-      continue;
-    }
+    if (!msg) break;
     if (msg.role === "assistant" && msg.tool_calls?.length) {
       const group: ChatMessage[] = [msg];
       i++;
       while (i < toolChain.length) {
-        const toolMessage = toolChain[i];
-        if (!toolMessage || toolMessage.role !== "tool") {
-          break;
-        }
-        group.push(toolMessage);
+        const toolMsg = toolChain[i];
+        if (!toolMsg || toolMsg.role !== "tool") break;
+        group.push(toolMsg);
         i++;
       }
       groups.push(group);
@@ -694,6 +687,7 @@ Files and forms:
 - If the user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on contentText as the file content you can reason over. If the user asks to extract text from an image, you only have access to contentText. If the user explicitly wants to re-extract text, use extract_pdf_text.
 - When you need specific user data, such as credit card information, use request_user_input over asking for free-form prose.
 - When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
+- Whenever you call request_user_input, use the speak tool so the user knows to check the Requested Info panel in the web UI.
 
 Ending:
 - Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.
@@ -881,6 +875,7 @@ If you need any kind of context, feel free to call the tools and then respond.`;
 
         case "run_browser_task": {
           const task = String(args.task ?? "");
+
           const session = this.database.beginBrowserTask(task, profileId);
           const queuedEntry = this.database.createTranscriptEntry({
             kind: "tool",
@@ -1081,6 +1076,10 @@ If you need any kind of context, feel free to call the tools and then respond.`;
       if (browserTask) {
         return { kind: "browser_task", ...browserTask };
       }
+      return {
+        kind: "text",
+        text: "Could not start the browser task yet. For orders, save payment and delivery details in Memory, or finish any forms in Requested Info, then try again.",
+      };
     }
 
     const selectedModel = this.resolveRequestedModel(request);
@@ -1113,9 +1112,13 @@ If you need any kind of context, feel free to call the tools and then respond.`;
 
         let promptSent = false;
         let endConversation = false;
+        let dispatchedBrowser: { browserSessionId: string; previewUrl: string | null } | undefined;
         for (const toolCall of toolCalls) {
           const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
-          if (bt) browserTask = bt;
+          if (bt) {
+            browserTask = bt;
+            dispatchedBrowser = bt;
+          }
           if (toolCall.function.name === "request_user_input") promptSent = true;
           if (toolCall.function.name === "end_conversation") endConversation = true;
           messages.push({
@@ -1123,6 +1126,9 @@ If you need any kind of context, feel free to call the tools and then respond.`;
             tool_call_id: toolCall.id,
             content: JSON.stringify(result),
           });
+        }
+        if (dispatchedBrowser) {
+          return { kind: "browser_task", ...dispatchedBrowser };
         }
         // Stop looping once a user input form has been sent — further iterations would duplicate it
         if (promptSent) {

@@ -20,9 +20,29 @@ import type {
   UploadedFileTextStatus,
   UserMemoryEntry,
   UserPrompt,
+  HitlNeedKind,
+  HitlRequest,
+  HitlRequestStatus,
 } from "./contracts";
 import { computeNextRun } from "./cron";
 import { resolveReminderTimezone } from "./reminders";
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: string }).code;
+    if (
+      code === "SQLITE_BUSY" ||
+      code === "SQLITE_BUSY_RECOVERY" ||
+      code === "SQLITE_LOCKED"
+    ) {
+      return true;
+    }
+  }
+  if (error instanceof Error && /\b(locked|busy)\b/i.test(error.message)) {
+    return true;
+  }
+  return false;
+}
 
 type ReminderRow = {
   id: string;
@@ -357,6 +377,9 @@ function serializeBrowserContext(session: BrowserSessionRow | null, actions: Bro
   if (session.screenshot_url) {
     context.screenshotUrl = session.screenshot_url;
   }
+  if (session.profile_id) {
+    context.profileId = session.profile_id;
+  }
 
   return context;
 }
@@ -449,13 +472,52 @@ export class GazabotDatabase {
 
   constructor(path: string) {
     this.database = new Database(path, { create: true, strict: true });
-    this.database.exec("PRAGMA journal_mode = WAL;");
+    // Wait on contention instead of failing immediately (dev: duplicate `bun run dev`, DB GUIs, WAL recovery).
+    this.database.exec("PRAGMA busy_timeout = 10000;");
+    this.ensureWalMode(path);
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.initialize();
   }
 
+  private ensureWalMode(pathForHint: string): void {
+    const attempts = 12;
+    const pauseMs = 250;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        this.database.exec("PRAGMA journal_mode = WAL;");
+        return;
+      } catch (error) {
+        const last = i === attempts - 1;
+        if (!isSqliteBusyError(error) || last) {
+          const hint =
+            "If another `bun run dev` (or a SQLite GUI) has this file open, stop it or use one server instance.";
+          const wrapped =
+            error instanceof Error
+              ? new Error(`${error.message} (${pathForHint}). ${hint}`, { cause: error })
+              : error;
+          throw wrapped;
+        }
+        Bun.sleepSync(pauseMs);
+      }
+    }
+  }
+
   close(): void {
     this.database.close(false);
+  }
+
+  /**
+   * Wipe all session data — transcript, browser state, prompts, HITL requests,
+   * and shopping orders. Memory and reminders are preserved so the bot retains
+   * saved payment/address/preferences across resets.
+   */
+  resetSession(): void {
+    this.database.query("DELETE FROM transcript_entries").run();
+    this.database.query("DELETE FROM browser_actions").run();
+    this.database.query("DELETE FROM browser_sessions").run();
+    this.database.query("DELETE FROM browser_hitl_requests").run();
+    this.database.query("DELETE FROM user_prompts").run();
+    this.database.query("DELETE FROM shopping_orders").run();
   }
 
   subscribeReminderChanges(listener: () => void): () => void {
@@ -537,6 +599,19 @@ export class GazabotDatabase {
         response_json TEXT,
         created_at TEXT NOT NULL,
         responded_at TEXT
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS browser_hitl_requests (
+        id TEXT PRIMARY KEY NOT NULL,
+        browser_session_id TEXT NOT NULL,
+        remote_session_id TEXT NOT NULL,
+        prompt_id TEXT,
+        need_kind TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'resolved', 'expired')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        original_task TEXT NOT NULL,
+        profile_id TEXT
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS browser_task_templates (
@@ -1025,9 +1100,13 @@ export class GazabotDatabase {
     return serializeBrowserAction(row);
   }
 
+  /**
+   * Latest inserted session wins (rowid). Using last_updated would let a stale
+   * in-flight poll on an old session steal the UI from a newer task.
+   */
   getCurrentBrowserContext(): BrowserContext {
     const session = this.database
-      .query("SELECT * FROM browser_sessions ORDER BY last_updated DESC LIMIT 1")
+      .query("SELECT * FROM browser_sessions ORDER BY rowid DESC LIMIT 1")
       .get() as BrowserSessionRow | null;
     if (!session) {
       return {
@@ -1041,6 +1120,48 @@ export class GazabotDatabase {
       .all(session.id) as BrowserActionRow[];
 
     return serializeBrowserContext(session, actionRows.map(serializeBrowserAction));
+  }
+
+  /** Mark a session as replaced so it no longer competes with newer tasks (UI + polling). */
+  supersedeBrowserSession(browserSessionId: string): void {
+    const existing = this.database
+      .query("SELECT * FROM browser_sessions WHERE id = ?1")
+      .get(browserSessionId) as BrowserSessionRow | null;
+    if (!existing) {
+      return;
+    }
+
+    const lastUpdated = nowIso();
+    this.database
+      .query(
+        `
+          UPDATE browser_sessions
+          SET status = 'idle',
+              summary = ?2,
+              active_task = NULL,
+              preview_url = NULL,
+              screenshot_url = NULL,
+              last_updated = ?3
+          WHERE id = ?1
+        `,
+      )
+      .run(browserSessionId, "Stopped — a new browser task replaced this session.", lastUpdated);
+
+    this.database
+      .query(
+        `
+          INSERT INTO browser_actions (id, session_id, kind, detail, timestamp, status)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        `,
+      )
+      .run(
+        prefixedId("a"),
+        browserSessionId,
+        "superseded",
+        "This session was replaced by a newer browser task.",
+        lastUpdated,
+        "failed",
+      );
   }
 
   listMemoryTitles(): string[] {
@@ -1241,6 +1362,74 @@ export class GazabotDatabase {
       .query("SELECT * FROM shopping_orders ORDER BY created_at DESC")
       .all() as ShoppingOrderRow[];
     return rows.map(serializeShoppingOrder);
+  }
+
+  createHitlRequest(input: {
+    browserSessionId: string;
+    remoteSessionId: string;
+    promptId?: string;
+    needKind: HitlNeedKind;
+    originalTask: string;
+    profileId?: string;
+  }): HitlRequest {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    this.database
+      .query(
+        `INSERT INTO browser_hitl_requests (id, browser_session_id, remote_session_id, prompt_id, need_kind, status, created_at, original_task, profile_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.browserSessionId,
+        input.remoteSessionId,
+        input.promptId ?? null,
+        input.needKind,
+        now,
+        input.originalTask,
+        input.profileId ?? null,
+      );
+    return {
+      id,
+      browserSessionId: input.browserSessionId,
+      remoteSessionId: input.remoteSessionId,
+      promptId: input.promptId ?? null,
+      needKind: input.needKind as HitlNeedKind,
+      status: "pending",
+      createdAt: now,
+      resolvedAt: null,
+      originalTask: input.originalTask,
+      profileId: input.profileId ?? null,
+    };
+  }
+
+  findPendingHitlByPromptId(promptId: string): HitlRequest | null {
+    const row = this.database
+      .query(
+        `SELECT * FROM browser_hitl_requests WHERE prompt_id = ? AND status = 'pending' LIMIT 1`,
+      )
+      .get(promptId) as Record<string, unknown> | null;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      browserSessionId: String(row.browser_session_id),
+      remoteSessionId: String(row.remote_session_id),
+      promptId: row.prompt_id ? String(row.prompt_id) : null,
+      needKind: String(row.need_kind) as HitlNeedKind,
+      status: String(row.status) as HitlRequestStatus,
+      createdAt: String(row.created_at),
+      resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
+      originalTask: String(row.original_task),
+      profileId: row.profile_id ? String(row.profile_id) : null,
+    };
+  }
+
+  resolveHitlRequest(id: string): void {
+    this.database
+      .query(
+        `UPDATE browser_hitl_requests SET status = 'resolved', resolved_at = ? WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), id);
   }
 
   createPrompt(input: {

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { parseDshowAudioDevices, parseOpenAlCaptureDevices, playbackArgsForPlatform, recordingArgsForPlatform } from "../src/audio";
+import { detectCrisis } from "../src/crisis";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
 import { GazabotDatabase } from "../src/db";
@@ -62,6 +63,8 @@ function createTestApp(overrides: Record<string, string> = {}) {
     UPLOADS_DIR: join(directory, "uploads"),
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
     BROWSER_USE_API_KEY: "test-browser-key",
+    BLAND_API_KEY: "test-bland-key",
+    BLAND_PATHWAY_ID: "pathway_test_123",
     AGENT_CHUNK_DELAY_MS: "5",
     BROWSER_USE_POLL_INTERVAL_MS: "5",
     REMINDER_SCHEDULER_ENABLED: "false",
@@ -84,6 +87,18 @@ afterEach(async () => {
 });
 
 describe("Gazabot Bun backend", () => {
+  test("detects crisis phrases conservatively", () => {
+    expect(detectCrisis("I'm hurt").triggered).toBe(true);
+    expect(detectCrisis("I'm in trouble and need my family").triggered).toBe(true);
+    expect(detectCrisis("Help me, call my daughter").triggered).toBe(true);
+    expect(detectCrisis("HELP!! I'M HURT").triggered).toBe(true);
+    expect(detectCrisis("im hurt and i need my family").triggered).toBe(true);
+
+    expect(detectCrisis("My shoulder hurt last week").triggered).toBe(false);
+    expect(detectCrisis("Can you tell my family I'm okay?").triggered).toBe(false);
+    expect(detectCrisis("I watched a movie called Trouble").triggered).toBe(false);
+  });
+
   test("supports reminder create, update, pause, and delete flow", async () => {
     const { app, database } = createTestApp();
 
@@ -227,6 +242,171 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("crisis turn calls Bland and skips the model when family contact is saved", async () => {
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        expect(init?.method).toBe("POST");
+        expect(init?.headers).toMatchObject({
+          "Content-Type": "application/json",
+          authorization: "test-bland-key",
+        });
+        expect(JSON.parse(String(init?.body))).toEqual({
+          phone_number: "+14155551234",
+          pathway_id: "pathway_test_123",
+        });
+        return jsonResponse({ status: "success", call_id: "bland_call_1" });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          schema: [
+            { name: "full_name", label: "Full Name", type: "string", required: true },
+            { name: "relationship", label: "Relationship", type: "string", required: true },
+            { name: "phone_number", label: "Phone Number", type: "string", required: true },
+          ],
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt and I need my family",
+              source: "voice",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm contacting your family now. Stay with me.",
+        });
+        expect(blandCalls).toBe(1);
+
+        const transcript = database.listTranscriptEntries();
+        expect(transcript.some((entry) => entry.toolName === "crisis-escalation" && entry.toolStatus === "completed")).toBe(
+          true,
+        );
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn creates a setup prompt when family contact is missing", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        return new Response("bland should not be called without a saved contact", { status: 500 });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Help me, call my daughter",
+              source: "voice",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm trying to contact your family, but I don't have their phone number saved yet.",
+        });
+        const prompts = database.listPrompts("pending");
+        expect(prompts.some((prompt) => prompt.memoryKey === "family_contact_primary")).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("crisis turn reports config issues when Bland is not configured", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for crisis escalation", { status: 500 });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        BLAND_API_KEY: "",
+        BLAND_PATHWAY_ID: "",
+      });
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm in trouble",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          route: "conversation",
+          reply: "I'm trying to contact your family, but the calling system is not set up yet.",
+        });
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("routes gemini-fast dashboard turns through Google AI instead of Imagine", async () => {
     const restore = withFetchStub(async (url, init) => {
       if (url.includes("/chat/completions")) {
@@ -322,6 +502,7 @@ describe("Gazabot Bun backend", () => {
     });
 
     try {
+<<<<<<< HEAD
       const { app, database } = createTestApp({
         GOOGLE_AI_API_KEY: "test-google-key",
       });
@@ -359,6 +540,67 @@ describe("Gazabot Bun backend", () => {
           ok: true,
           transcript: "Say which model is active.",
         });
+=======
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory("family_contact_primary", JSON.stringify({
+          full_name: "Jane Doe",
+          relationship: "Daughter",
+          phone_number: "+14155551234",
+        }), {
+          data: {
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          },
+        });
+
+        const failedResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(failedResponse.status).toBe(200);
+        expect(await failedResponse.json()).toEqual({
+          route: "conversation",
+          reply: "I couldn't place the family call automatically. Please call for help right away.",
+        });
+
+        const successResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(successResponse.status).toBe(200);
+        expect(blandCalls).toBe(2);
+
+        const duplicateResponse = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "I'm hurt",
+              source: "voice",
+            }),
+          }),
+        );
+        expect(duplicateResponse.status).toBe(200);
+        expect(await duplicateResponse.json()).toEqual({
+          route: "conversation",
+          reply: "I already contacted your family. Stay with me.",
+        });
+        expect(blandCalls).toBe(2);
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
       } finally {
         app.close();
         database.close();
@@ -459,7 +701,7 @@ describe("Gazabot Bun backend", () => {
         expect(browserPayload.browser.status).toBe("idle");
         expect(Array.isArray(browserPayload.browser.recentActions)).toBe(true);
         expect(String(browserPayload.browser.summary)).toContain("Pharmacy hours");
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();
@@ -599,6 +841,86 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("surfaces Browser Use network failures as actionable browser status", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_1",
+                    type: "function",
+                    function: {
+                      name: "run_browser_task",
+                      arguments: JSON.stringify({
+                        task: "Check the weather in the browser.",
+                      }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        throw new TypeError("NetworkError when attempting to fetch resource.");
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Check the weather in the browser.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        expect(browserResponse.status).toBe(200);
+        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
+        expect(browserPayload.browser.status).toBe("blocked");
+        expect(String(browserPayload.browser.summary)).toContain("Browser Use is unreachable");
+
+        const transcriptResponse = await app.fetch(new Request("http://localhost/api/transcript"));
+        expect(transcriptResponse.status).toBe(200);
+        const transcriptPayload = (await transcriptResponse.json()) as {
+          entries: Array<{ text: string; role: string }>;
+        };
+        expect(
+          transcriptPayload.entries.some(
+            (entry) =>
+              entry.role === "robot" &&
+              entry.text.includes("I couldn't reach Browser Use right now."),
+          ),
+        ).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("archives and clears conversation when end_conversation is called", async () => {
     let completionRound = 0;
     const restore = withFetchStub(async (url) => {
@@ -651,7 +973,7 @@ describe("Gazabot Bun backend", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               message: "That's all, goodbye.",
-              source: "guardian",
+              source: "resident",
             }),
           }),
         );
@@ -921,6 +1243,29 @@ describe("Gazabot Bun backend", () => {
       });
 
       try {
+        database.writeMemory("payment_card", "Test card on file", {
+          data: {
+            cardholder_name: "Test User",
+            card_number: "4242424242424242",
+            exp_month: "12",
+            exp_year: "2030",
+            cvv: "123",
+            billing_zip: "94102",
+          },
+        });
+        database.writeMemory("delivery_address", "Test delivery address", {
+          data: {
+            full_name: "Test User",
+            line_1: "1 Market St",
+            line_2: "",
+            city: "San Francisco",
+            state_or_region: "CA",
+            postal_code: "94102",
+            country: "US",
+            phone_number: "5555555555",
+          },
+        });
+
         const firstOrderResponse = await app.fetch(
           new Request("http://localhost/api/agent/turn", {
             method: "POST",
@@ -972,6 +1317,88 @@ describe("Gazabot Bun backend", () => {
         expect(orders[0]?.merchant).toBe("CVS");
         expect(orders[0]?.itemName).toBe("pretzels");
         expect(orders[1]?.itemName).toBe("chips");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("defaults agent-created reminders to Los Angeles when timezone is omitted", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_1",
+                      type: "function",
+                      function: {
+                        name: "create_reminder",
+                        arguments: JSON.stringify({
+                          title: "Morning medication",
+                          instructions: "Prompt for the morning pills.",
+                          cadence: "daily",
+                          cron: "0 9 * * *",
+                          scheduleLabel: "Every day at 09:00",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Reminder saved.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Set a daily medication reminder for 9am.",
+              source: "guardian",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as Record<string, unknown>;
+        expect(payload.route).toBe("conversation");
+        expect(payload.reply).toBe("Reminder saved.");
+
+        const remindersResponse = await app.fetch(new Request("http://localhost/api/reminders"));
+        expect(remindersResponse.status).toBe(200);
+        const remindersPayload = (await remindersResponse.json()) as { reminders: Array<Record<string, unknown>> };
+        expect(remindersPayload.reminders).toHaveLength(1);
+        expect(remindersPayload.reminders[0]?.timezone).toBe("America/Los_Angeles");
       } finally {
         app.close();
         database.close();
@@ -1154,7 +1581,10 @@ trailer <<>>
           []) as Array<Record<string, unknown>>);
         const promptPart = parts.find((part) => typeof part.text === "string");
         expect(promptPart).toBeDefined();
+<<<<<<< HEAD
         expect(String(promptPart?.text)).toContain("Analyze this image and respond in two clearly labeled sections");
+=======
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
         expect(String(promptPart?.text)).toContain("EXTRACTED TEXT:");
         expect(
           parts.some((part) => {
@@ -1366,6 +1796,12 @@ trailer <<>>
           ],
         });
       }
+      if (url.includes("elevenlabs.io")) {
+        return new Response(new Uint8Array([0, 1, 2]), {
+          status: 200,
+          headers: { "Content-Type": "audio/mpeg" },
+        });
+      }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -1529,14 +1965,29 @@ trailer <<>>
       runConversationTurn: () => Promise<void>;
       processTranscriptText: (
         transcript: string,
+<<<<<<< HEAD
       ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
       sttService: {
         createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
       };
+=======
+        model?: unknown,
+      ) => Promise<{ transcript: string; replyText: string; endConversation: boolean }>;
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
       ttsService: { synthesize: (text: string) => Promise<Buffer> };
+      sttService: {
+        transcribe: (audio: Buffer) => Promise<string>;
+        createRealtimeSession: () => Promise<{ sendAudio: (chunk: Buffer) => void; finalize: () => Promise<string> }>;
+      };
       audioService: {
+<<<<<<< HEAD
         recordPcmWithSileroVad: (
           onChunk: (chunk: Buffer) => void,
+=======
+        recordUntilSilence: (options?: unknown) => Promise<Buffer>;
+        recordPcmUntilSilence: (
+          send: (chunk: Buffer) => void,
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
           options?: unknown,
         ) => Promise<void>;
         playAudio: (audio: Buffer) => Promise<void>;
@@ -1552,6 +2003,17 @@ trailer <<>>
       events.push("record");
       onChunk(Buffer.from("user-audio"));
     };
+<<<<<<< HEAD
+=======
+    privateApp.audioService.recordPcmUntilSilence = async () => {
+      events.push("record");
+    };
+    privateApp.sttService.transcribe = async () => "Hello there";
+    privateApp.sttService.createRealtimeSession = async () => ({
+      sendAudio: () => {},
+      finalize: async () => "Hello there",
+    });
+>>>>>>> 1e84c94cbd62ae2a00b1ef259ea1718b8f3da110
     privateApp.processTranscriptText = async () => {
       events.push("process");
       return {
@@ -1704,6 +2166,111 @@ trailer <<>>
         const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Example opened.");
+        // previewUrl is populated from liveUrl and no embed params are added when config is unset
+        expect(browserPayload.browser.previewUrl).toBe("https://live.example/session");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("applies live embed query params to previewUrl when BROWSER_USE_LIVE_THEME and BROWSER_USE_LIVE_UI are set", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_embed",
+                      type: "function",
+                      function: {
+                        name: "run_browser_task",
+                        arguments: JSON.stringify({ task: "Open example.com in the browser." }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          });
+        }
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Done." },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/sessions") && init?.method === "POST") {
+          return jsonResponse({ id: "embed-sess-1", status: "running", liveUrl: "https://live.example/embed-session" });
+        }
+        if (init?.method === "GET" && /\/sessions\/[^/]+$/.test(path) && !path.endsWith("/stop")) {
+          return jsonResponse({
+            id: "embed-sess-1",
+            status: "completed",
+            output: { summary: "Embed test done." },
+            title: "Embed Test",
+            url: "https://example.com",
+            liveUrl: "https://live.example/embed-session",
+          });
+        }
+        if (init?.method === "POST" && path.includes("/stop")) {
+          return jsonResponse({});
+        }
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        BROWSER_USE_LIVE_THEME: "dark",
+        BROWSER_USE_LIVE_UI: "false",
+      });
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Open example.com in the browser.",
+              source: "dashboard",
+              forceBrowser: true,
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+
+        await new Promise((resolve) => setTimeout(resolve, 750));
+
+        const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
+        const browserPayload = (await browserResponse.json()) as { browser: Record<string, unknown> };
+        expect(browserPayload.browser.status).toBe("idle");
+        // previewUrl should have embed params appended
+        const previewUrl = String(browserPayload.browser.previewUrl ?? "");
+        expect(previewUrl).toContain("theme=dark");
+        expect(previewUrl).toContain("ui=false");
+        expect(previewUrl).toContain("live.example/embed-session");
       } finally {
         app.close();
         database.close();
@@ -1814,7 +2381,7 @@ trailer <<>>
         expect(browserPayload.browser.status).toBe("idle");
         expect(browserPayload.browser.summary).toBe("Completed after terminal status.");
         expect(sessionPollCount).toBeGreaterThan(1);
-        expect(stopRequests).toBe(0);
+        expect(stopRequests).toBe(1);
       } finally {
         app.close();
         database.close();

@@ -68,6 +68,8 @@ export type BrowserContext = {
   summary: string;
   status: BrowserStatus;
   lastUpdated: string;
+  profileId?: string;
+  configuredProfileId?: string;
   activeTask?: string;
   tabLabel?: string;
   domSnippet?: string;
@@ -174,4 +176,26 @@ export type UserPrompt = {
 export type ApiErrorPayload = {
   message: string;
   details?: unknown;
+};
+
+export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "login" | "unknown";
+
+export type HitlNeed = {
+  kind: HitlNeedKind;
+  rawMessage: string;
+};
+
+export type HitlRequestStatus = "pending" | "resolved" | "expired";
+
+export type HitlRequest = {
+  id: string;
+  browserSessionId: string;
+  remoteSessionId: string;
+  promptId: string | null;
+  needKind: HitlNeedKind;
+  status: HitlRequestStatus;
+  createdAt: string;
+  resolvedAt: string | null;
+  originalTask: string;
+  profileId: string | null;
 };
