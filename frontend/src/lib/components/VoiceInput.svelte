@@ -1,42 +1,24 @@
 <script lang="ts">
-  import { postAudio } from '../api';
+  import { post } from '../api';
   import type { RecordingState } from '../types';
 
   let state: RecordingState = 'idle';
   let error = '';
-  let mediaRecorder: MediaRecorder | null = null;
-  let chunks: Blob[] = [];
 
   async function startRecording() {
     error = '';
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      chunks = [];
-      mediaRecorder = new MediaRecorder(stream);
-      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-      mediaRecorder.onstop = handleStop;
-      mediaRecorder.start();
+      await post('/api/agent/voice-start');
       state = 'recording';
-    } catch {
-      error = 'Microphone access denied.';
+    } catch (err) {
+      error = err instanceof Error ? err.message : 'Failed to start recording.';
     }
   }
 
-  function stopRecording() {
-    if (!mediaRecorder) return;
-    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
-    mediaRecorder.stop();
+  async function stopRecording() {
     state = 'processing';
-  }
-
-  async function handleStop() {
-    const blob = new Blob(chunks, { type: 'audio/webm' });
     try {
-      const buffer = await postAudio('/api/agent/voice-turn', blob);
-      const audioUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/mpeg' }));
-      const audio = new Audio(audioUrl);
-      audio.onended = () => URL.revokeObjectURL(audioUrl);
-      await audio.play();
+      await post('/api/agent/voice-stop');
     } catch (err) {
       error = err instanceof Error ? err.message : 'Failed to process voice input.';
     } finally {
