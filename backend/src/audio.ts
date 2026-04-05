@@ -419,6 +419,7 @@ export class AudioService {
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
       let stderrTail = "";
+      let hasDetectedSpeech = false;
 
       const stop = () => {
         if (stopped) return;
@@ -459,9 +460,14 @@ export class AudioService {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
 
-        // ffmpeg silencedetect emits "silence_start: <timestamp>" when the
-        // configured silence duration has elapsed.  Stop as soon as we see it.
-        if (stderrTail.includes("silence_start")) {
+        // silence_end means audio went above the threshold — user has started speaking
+        if (stderrTail.includes("silence_end")) {
+          hasDetectedSpeech = true;
+        }
+
+        // Only stop on silence_start after speech was detected; otherwise the
+        // recording would end immediately if the environment starts quiet.
+        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
           stop();
         }
 
