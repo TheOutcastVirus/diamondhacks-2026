@@ -825,6 +825,17 @@ export class GazabotDatabase {
     return rows.map(serializeTranscriptEntry);
   }
 
+  listMessageTranscriptEntries(): TranscriptEntry[] {
+    const rows = this.database
+      .query("SELECT * FROM transcript_entries WHERE kind = 'message' ORDER BY timestamp ASC")
+      .all() as TranscriptRow[];
+    return rows.map(serializeTranscriptEntry);
+  }
+
+  clearTranscriptEntries(): void {
+    this.database.query("DELETE FROM transcript_entries").run();
+  }
+
   createTranscriptEntry(input: {
     kind: TranscriptKind;
     role: TranscriptRole;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { createEventStream, get } from '../api';
-  import type { ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
+  import { createEventStream, get, post } from '../api';
+  import type { ConversationState, ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
   import VoiceInput from '../components/VoiceInput.svelte';
 
   type StreamState = 'connecting' | 'live' | 'offline';
@@ -15,6 +15,21 @@
   let autoScroll = true;
   let eventSource: EventSource | null = null;
   let expandedTools: Set<string> = new Set();
+  let conversationState: ConversationState = 'idle';
+  let newConversationBusy = false;
+
+  async function startNewConversation() {
+    if (newConversationBusy) return;
+    newConversationBusy = true;
+    try {
+      await post('/api/conversation/new');
+      // entries cleared via the 'session' SSE event
+    } catch {
+      // non-critical — the SSE event will still arrive if the server handled it
+    } finally {
+      newConversationBusy = false;
+    }
+  }
 
   function formatTimestamp(value: string) {
     const parsed = new Date(value);
@@ -107,6 +122,22 @@
     expandedTools = next;
   }
 
+  function hasMetadataField(entry: TranscriptEntry, key: string) {
+    return Boolean(entry.metadata && Object.prototype.hasOwnProperty.call(entry.metadata, key));
+  }
+
+  function formatDebugJson(value: unknown) {
+    if (value === undefined) {
+      return '';
+    }
+
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
   function appendEntries(nextEntries: TranscriptEntry[]) {
     if (nextEntries.length === 0) {
       return;
@@ -178,6 +209,28 @@
       processMessage('message', event as MessageEvent<string>),
     );
     source.addEventListener('tool', (event) => processMessage('tool', event as MessageEvent<string>));
+    source.addEventListener('state', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as { conversationState?: string };
+        if (payload.conversationState === 'conversation' || payload.conversationState === 'idle') {
+          conversationState = payload.conversationState;
+        }
+      } catch {
+        // ignore malformed state events
+      }
+    });
+
+    source.addEventListener('session', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as { action?: string };
+        if (payload.action === 'reset') {
+          entries = [];
+          isBootstrapping = false;
+        }
+      } catch {
+        // ignore
+      }
+    });
   }
 
   function disconnectStream() {
@@ -228,7 +281,23 @@
         </button>
       </div>
 
-    
+      <div class="toolbar-right">
+        {#if conversationState === 'conversation'}
+          <div class="convo-badge" role="status" aria-live="polite">
+            <span class="convo-dot" aria-hidden="true"></span>
+            Listening…
+          </div>
+        {/if}
+        <button
+          class="new-convo-btn"
+          type="button"
+          disabled={newConversationBusy}
+          on:click={startNewConversation}
+          title="Archive this conversation and start fresh"
+        >
+          {newConversationBusy ? '…' : 'New conversation'}
+        </button>
+      </div>
     </header>
 
     <div class="feed" data-transcript-feed>
@@ -318,8 +387,25 @@
                       {/if}
                     </span>
                   </div>
-                  {#if entry.metadata}
-                    <code class="meta">{JSON.stringify(entry.metadata, null, 2)}</code>
+                  {#if entry.metadata?.params && typeof entry.metadata.params === 'object' && Object.keys(entry.metadata.params).length > 0}
+                    <div class="tool-params">
+                      <span class="tool-params-label">Parameters</span>
+                      <code class="meta">{formatDebugJson(entry.metadata.params)}</code>
+                    </div>
+                  {:else if hasMetadataField(entry, 'params')}
+                    <div class="tool-params">
+                      <span class="tool-params-label">Parameters</span>
+                      <code class="meta">(none)</code>
+                    </div>
+                  {/if}
+                  {#if hasMetadataField(entry, 'result')}
+                    <div class="tool-params">
+                      <span class="tool-params-label">Result</span>
+                      <code class="meta">{formatDebugJson(entry.metadata?.['result'])}</code>
+                    </div>
+                  {/if}
+                  {#if entry.metadata && !hasMetadataField(entry, 'params') && !hasMetadataField(entry, 'result')}
+                    <code class="meta">{formatDebugJson(entry.metadata)}</code>
                   {/if}
                 </div>
               {/if}
@@ -470,6 +556,63 @@
     gap: 0.875rem 1rem;
     padding: 0.35rem 0;
     flex-shrink: 0;
+  }
+
+  div.toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+  }
+
+  button.new-convo-btn {
+    padding: 0.25rem 0.75rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-line-strong) 20%, transparent);
+    background: transparent;
+    color: var(--color-ink-soft);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+
+  button.new-convo-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-ink-strong) 6%, transparent);
+    color: var(--color-ink);
+    border-color: color-mix(in srgb, var(--color-line-strong) 40%, transparent);
+  }
+
+  button.new-convo-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  div.convo-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-accent) 25%, transparent);
+  }
+
+  span.convo-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--color-accent);
+    animation: convo-pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+
+  @keyframes convo-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.75); }
   }
 
   /* Segmented control: low-contrast track, lifted active pill (works light + dark) */
@@ -965,6 +1108,21 @@
     border-radius: var(--tx-r-sm);
     padding: 0.5rem 0.65rem;
     border: none;
+  }
+
+  div.tool-params {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  span.tool-params-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+    opacity: 0.7;
   }
 
   /* ── Unified sidebar card ───────────────────────────────────── */

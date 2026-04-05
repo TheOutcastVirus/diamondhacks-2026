@@ -24,6 +24,7 @@ export type AppConfig = {
   };
   agent: {
     chunkDelayMs: number;
+    conversationTimeoutSeconds: number;
   };
   imagine: {
     apiKey: string;
@@ -199,6 +200,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     browserUse,
     agent: {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
+      conversationTimeoutSeconds: parseInteger(source.CONVERSATION_TIMEOUT_SECONDS, 10),
     },
     imagine,
     tts,
