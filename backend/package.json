@@ -10,8 +10,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "assemblyai": "^4.29.0",
-    "browser-use-sdk": "^3.4.1",
+"browser-use-sdk": "^3.4.1",
     "cron-parser": "^5.5.0",
     "elevenlabs": "^1.59.0",
     "multer": "^2.1.1"
