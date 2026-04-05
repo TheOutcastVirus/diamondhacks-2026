@@ -1,4 +1,8 @@
-import { AssemblyAI } from "assemblyai";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join, resolve as pathResolve } from "node:path";
+import { writeFile, unlink } from "node:fs/promises";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { AppConfig } from "./config";
 
 export interface RealtimeSession {
@@ -6,71 +10,176 @@ export interface RealtimeSession {
   finalize: () => Promise<string>;
 }
 
-export class SttService {
-  private readonly client: AssemblyAI;
+function buildWavHeader(pcmByteLength: number): Buffer {
+  const header = Buffer.allocUnsafe(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcmByteLength, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);    // PCM
+  header.writeUInt16LE(1, 22);    // mono
+  header.writeUInt32LE(16000, 24);
+  header.writeUInt32LE(32000, 28); // byteRate = 16000 * 1 * 2
+  header.writeUInt16LE(2, 32);    // blockAlign = 1 * 2
+  header.writeUInt16LE(16, 34);   // bitsPerSample
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcmByteLength, 40);
+  return header;
+}
 
-  constructor(private readonly config: AppConfig) {
-    this.client = new AssemblyAI({ apiKey: config.assemblyAi.apiKey });
+export class SttService {
+  private proc: ChildProcessWithoutNullStreams | null = null;
+  private stdoutBuf = "";
+  private ready = false;
+  private readyPromise: Promise<void>;
+  private readyResolve!: () => void;
+  private readyReject!: (err: Error) => void;
+  private readonly pending: Array<{
+    resolve: (t: string) => void;
+    reject: (e: Error) => void;
+  }> = [];
+
+  // config is kept for interface compatibility but no API key is needed
+  constructor(_config: AppConfig) {
+    this.readyPromise = new Promise<void>((res, rej) => {
+      this.readyResolve = res;
+      this.readyReject = rej;
+    });
+    this._startSubprocess();
+  }
+
+  private _startSubprocess(): void {
+    const botDir = pathResolve(import.meta.dir, "../../bot");
+    const script = pathResolve(botDir, "whisper_stt.py");
+    const venvPython =
+      process.platform === "win32"
+        ? pathResolve(botDir, ".venv/Scripts/python.exe")
+        : pathResolve(botDir, ".venv/bin/python3");
+    const python = Bun.file(venvPython).size > 0 ? venvPython : "python3";
+
+    const child = spawn(python, ["-u", script], {
+      stdio: ["pipe", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
+
+    this.proc = child;
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(`[whisper-stt] ${chunk.toString()}`);
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      this.stdoutBuf += chunk.toString();
+      const lines = this.stdoutBuf.split("\n");
+      this.stdoutBuf = lines[lines.length - 1] ?? "";
+      for (const line of lines.slice(0, -1)) {
+        this._handleLine(line.trim());
+      }
+    });
+
+    child.on("error", (err) => {
+      console.error("[whisper-stt] Process error:", err.message);
+      if (!this.ready) this.readyReject(err);
+      this._drainPendingWithError(err);
+    });
+
+    child.on("close", (code) => {
+      console.warn(`[whisper-stt] Process exited (code=${code}). Restarting in 3 s…`);
+      this.proc = null;
+      this.ready = false;
+      this.readyPromise = new Promise<void>((res, rej) => {
+        this.readyResolve = res;
+        this.readyReject = rej;
+      });
+      this._drainPendingWithError(new Error(`whisper_stt.py exited (code=${code})`));
+      setTimeout(() => this._startSubprocess(), 3000);
+    });
+  }
+
+  private _handleLine(line: string): void {
+    if (!line) return;
+
+    if (!this.ready) {
+      if (line === "READY") {
+        this.ready = true;
+        this.readyResolve();
+      }
+      return;
+    }
+
+    const entry = this.pending.shift();
+    if (!entry) {
+      console.warn("[whisper-stt] Unexpected line from subprocess:", line);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(line) as { transcript?: string; error?: string };
+      if (parsed.error) {
+        entry.reject(new Error(parsed.error));
+      } else {
+        entry.resolve(parsed.transcript ?? "");
+      }
+    } catch {
+      entry.reject(new Error(`Malformed response from whisper_stt.py: ${line}`));
+    }
+  }
+
+  private _drainPendingWithError(err: Error): void {
+    let entry: (typeof this.pending)[number] | undefined;
+    while ((entry = this.pending.shift())) {
+      entry.reject(err);
+    }
+  }
+
+  private _sendToSubprocess(wavPath: string): Promise<string> {
+    if (!this.proc) {
+      return Promise.reject(new Error("whisper_stt.py subprocess is not running"));
+    }
+    return new Promise<string>((resolve, reject) => {
+      this.pending.push({ resolve, reject });
+      this.proc!.stdin.write(JSON.stringify({ path: wavPath }) + "\n");
+    });
   }
 
   async transcribe(audio: File | Blob | Buffer): Promise<string> {
-    const transcript = await this.client.transcripts.transcribe({
-      audio,
-      speech_models: ["universal-2"],
-    });
+    await this.readyPromise;
 
-    if (transcript.status === "error") {
-      // AssemblyAI returns this when the audio contains no speech — treat it
-      // the same as an empty transcript rather than a hard failure.
-      if (transcript.error?.includes("no spoken audio")) {
-        return "";
-      }
-      throw new Error(transcript.error ?? "AssemblyAI transcription failed");
+    const bytes: Buffer = Buffer.isBuffer(audio)
+      ? audio
+      : Buffer.from(await audio.arrayBuffer());
+
+    const isWav =
+      bytes.length >= 4 && bytes.toString("ascii", 0, 4) === "RIFF";
+
+    const wavBytes = isWav
+      ? bytes
+      : Buffer.concat([buildWavHeader(bytes.length), bytes]);
+
+    const tmpPath = join(
+      tmpdir(),
+      `stt-${Date.now()}-${Math.random().toString(36).slice(2)}.wav`
+    );
+
+    try {
+      await writeFile(tmpPath, wavBytes);
+      return await this._sendToSubprocess(tmpPath);
+    } finally {
+      unlink(tmpPath).catch(() => {});
     }
-
-    return transcript.text ?? "";
   }
 
-  /**
-   * Opens an AssemblyAI real-time streaming session.
-   * Call `sendAudio` with PCM s16le chunks (16 kHz, mono) as they arrive,
-   * then call `finalize` once recording stops to get the full transcript.
-   */
   async createRealtimeSession(): Promise<RealtimeSession> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const transcriber = (this.client.streaming as any).transcriber({
-      sampleRate: 16000,
-      encoding: "pcm_s16le",
-      apiKey: this.config.assemblyAi.apiKey,
-    });
-
-    const finalParts: string[] = [];
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    transcriber.on("turn", (turn: any) => {
-      if (turn.transcript?.trim()) {
-        finalParts.push(turn.transcript.trim());
-      }
-    });
-
-    transcriber.on("error", (err: Error) => {
-      console.error("[stt] Realtime error:", err.message);
-    });
-
-    await transcriber.connect();
+    const chunks: Buffer[] = [];
 
     return {
       sendAudio: (chunk: Buffer) => {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (transcriber.sendAudio as (data: any) => void)(chunk);
-        } catch {
-          // ignore sends after the session is already closing
-        }
+        chunks.push(chunk);
       },
-      finalize: async () => {
-        await transcriber.close();
-        return finalParts.join(" ");
+      finalize: async (): Promise<string> => {
+        if (chunks.length === 0) return "";
+        const pcm = Buffer.concat(chunks);
+        return this.transcribe(pcm);
       },
     };
   }

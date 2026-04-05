@@ -902,7 +902,7 @@ export class GazabotApp {
       return;
     }
 
-    const silenceOpts = { silenceDb: -15, silenceDuration: 1, maxDuration: 10 };
+    const silenceOpts = { silenceDb: -15, silenceDuration: 1.5, maxDuration: 10 };
     console.log(`[wake-word] Recording with silenceDb=${silenceOpts.silenceDb} silenceDuration=${silenceOpts.silenceDuration}s maxDuration=${silenceOpts.maxDuration}s`);
 
     try {
