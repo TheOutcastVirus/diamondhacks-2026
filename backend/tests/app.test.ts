@@ -3014,6 +3014,112 @@ trailer <<>>
     }
   });
 
+  test("speaks and resumes listening after a browser lifecycle completion hook", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_1",
+                      type: "function",
+                      function: {
+                        name: "run_browser_task",
+                        arguments: JSON.stringify({
+                          task: "Check whether the hook announces completion.",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [speakChoice("The browser task is finished.")],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/sessions") && init?.method === "POST") {
+          return jsonResponse({ id: "remote-sess-3", status: "running", liveUrl: "https://live.example/session3" });
+        }
+
+        if (init?.method === "GET" && /\/sessions\/[^/]+$/.test(path) && !path.endsWith("/stop")) {
+          return jsonResponse({
+            id: "remote-sess-3",
+            status: "completed",
+            output: { summary: "Completed with a spoken hook alert." },
+            title: "Browser hook test",
+            url: "https://example.com/hook",
+            liveUrl: "https://live.example/session3",
+          });
+        }
+
+        if (init?.method === "POST" && path.includes("/stop")) {
+          return jsonResponse({});
+        }
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      const synthesizeCalls: string[] = [];
+      let runConversationTurnCalls = 0;
+      const privateApp = app as unknown as {
+        ttsService: { synthesize: (text: string) => Promise<Buffer> };
+        audioService: { playAudio: (audio: Buffer) => Promise<void> };
+        runConversationTurn: () => Promise<void>;
+      };
+
+      privateApp.ttsService.synthesize = async (text: string) => {
+        synthesizeCalls.push(text);
+        return Buffer.from("hook-audio");
+      };
+      privateApp.audioService.playAudio = async () => {};
+      privateApp.runConversationTurn = async () => {
+        runConversationTurnCalls += 1;
+      };
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Check whether the hook announces completion.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(synthesizeCalls).toContain("The browser task is finished.");
+        expect(runConversationTurnCalls).toBe(1);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("invalid Browser Use model falls back to bu-max", () => {
     const config = loadConfig({
       APP_NAME: "Sodium Backend Test",

@@ -671,6 +671,12 @@ export class SodiumApp {
     return Object.assign(new Error(this.interactionBusyMessage(owner)), { conflict: true as const });
   }
 
+  private async waitForInteraction(owner: "conversation" | "voice-http" | "reminder"): Promise<void> {
+    while (!this.claimInteraction(owner)) {
+      await Bun.sleep(50);
+    }
+  }
+
   private enterConversationMode(): void {
     this.voiceConversationSession = true;
     if (this.conversationWaitingForExternalOutput()) {
@@ -1832,6 +1838,7 @@ export class SodiumApp {
   }
 
   private async continueAfterPromptResponse(prompt: { title: string; memoryKey: string }): Promise<void> {
+    await this.waitForInteraction("conversation");
     const resumeStarted = this.database.createTranscriptEntry({
       kind: "tool",
       role: "system",
@@ -1869,23 +1876,7 @@ export class SodiumApp {
           text: result.text,
         });
         this.transcriptBus.publish("transcript", robotEntry);
-
-        const shouldSpeakAloud =
-          result.kind === "text" || result.kind === "browser_task" || result.kind === "end_conversation";
-        if (shouldSpeakAloud && !result.playbackAlreadyDone) {
-          this.isSpeaking = true;
-          try {
-            if (this.interactionOwner === "conversation") {
-              this.setInteractionPhase("conversation", "agent_speaking");
-            }
-            await this.speakReplyText(result.text, "voice");
-          } catch (err) {
-            console.error("[prompt-hook] TTS failed:", err);
-          } finally {
-            await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
-            this.isSpeaking = false;
-          }
-        }
+        await this.speakAgentResultAloud(result, "prompt-hook");
       }
 
       const resumeCompleted = this.database.createTranscriptEntry({
@@ -1935,9 +1926,13 @@ export class SodiumApp {
   }
 
   private async handleBrowserTaskLifecycleEvent(event: BrowserTaskLifecycleEvent): Promise<void> {
+    await this.waitForInteraction("conversation");
+    this.enterConversationMode();
     try {
+      this.setInteractionPhase("conversation", "agent_thinking");
+      let result: AgentTurnResult;
       if (event.kind === "awaiting_input") {
-        await this.executeRecordedTurn(
+        result = await this.executeRecordedTurn(
           {
             message:
               `The browser task "${event.task}" is paused. A form titled "${event.promptTitle}" was sent to the user ` +
@@ -1953,24 +1948,35 @@ export class SodiumApp {
             source: "browser-use",
           },
         );
+      } else {
+        result = await this.executeRecordedTurn(
+          {
+            message:
+              `The browser task "${event.task}" ${event.failed ? "failed" : "completed"}. Summary: ${event.summary} ` +
+              `Tell the user the result in one concise message. Do not start another browser task.`,
+            source: "dashboard",
+          },
+          "system",
+          `Browser task ${event.failed ? "failed" : "completed"}: ${event.summary}`,
+          {
+            browserSessionId: event.browserSessionId,
+            previewUrl: event.previewUrl,
+            source: "browser-use",
+          },
+        );
+      }
+
+      await this.speakAgentResultAloud(result, "browser-use");
+      if (result.kind === "end_conversation") {
         return;
       }
 
-      await this.executeRecordedTurn(
-        {
-          message:
-            `The browser task "${event.task}" ${event.failed ? "failed" : "completed"}. Summary: ${event.summary} ` +
-            `Tell the user the result in one concise message. Do not start another browser task.`,
-          source: "dashboard",
-        },
-        "system",
-        `Browser task ${event.failed ? "failed" : "completed"}: ${event.summary}`,
-        {
-          browserSessionId: event.browserSessionId,
-          previewUrl: event.previewUrl,
-          source: "browser-use",
-        },
-      );
+      if (this.conversationWaitingForExternalOutput()) {
+        this.resetConversationTimerWhileWaiting();
+      } else {
+        this.resetConversationTimer();
+      }
+      void this.runConversationTurn();
     } catch (error) {
       console.error("[browser-use] Failed to continue browser lifecycle through agent:", error);
       const fallbackText =
@@ -1989,6 +1995,18 @@ export class SodiumApp {
         },
       });
       this.transcriptBus.publish("transcript", robotEntry);
+      try {
+        const fallbackResult: AgentTurnResult = { kind: "text", text: fallbackText };
+        await this.speakAgentResultAloud(fallbackResult, "browser-use");
+      } catch (ttsError) {
+        console.error("[browser-use] Fallback TTS failed:", ttsError);
+      }
+
+      if (this.conversationWaitingForExternalOutput()) {
+        this.resetConversationTimerWhileWaiting();
+      } else {
+        this.resetConversationTimer();
+      }
     }
   }
 
@@ -2671,6 +2689,29 @@ export class SodiumApp {
       `[${source === "voice" ? "conversation" : "reminder"}] TTS done          +${((Date.now() - ttsStartedAt) / 1000).toFixed(1)}s`,
     );
     await this.audioService.playAudio(audioOut);
+  }
+
+  private async speakAgentResultAloud(result: AgentTurnResult, context: "prompt-hook" | "browser-use"): Promise<void> {
+    const shouldSpeakAloud =
+      (result.kind === "text" || result.kind === "browser_task" || result.kind === "end_conversation") &&
+      result.text.trim().length > 0 &&
+      !result.playbackAlreadyDone;
+    if (!shouldSpeakAloud) {
+      return;
+    }
+
+    this.isSpeaking = true;
+    try {
+      if (this.interactionOwner === "conversation") {
+        this.setInteractionPhase("conversation", "agent_speaking");
+      }
+      await this.speakReplyText(result.text, "voice");
+    } catch (error) {
+      console.error(`[${context}] TTS failed:`, error);
+    } finally {
+      await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
+      this.isSpeaking = false;
+    }
   }
 }
 
