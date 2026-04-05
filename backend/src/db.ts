@@ -192,6 +192,21 @@ export type ShoppingOrder = {
   createdAt: string;
 };
 
+export type BrowserSessionSummary = {
+  id: string;
+  remoteSessionId: string | null;
+  profileId: string | null;
+  status: BrowserStatus;
+  currentUrl: string;
+  title: string;
+  summary: string;
+  activeTask: string | null;
+  tabLabel: string | null;
+  previewUrl: string | null;
+  screenshotUrl: string | null;
+  lastUpdated: string;
+};
+
 const IDLE_BROWSER_CONTEXT: BrowserContext = {
   url: "No page loaded",
   title: "Awaiting browser state",
@@ -1362,6 +1377,36 @@ export class GazabotDatabase {
       .query("SELECT * FROM shopping_orders ORDER BY created_at DESC")
       .all() as ShoppingOrderRow[];
     return rows.map(serializeShoppingOrder);
+  }
+
+  listBrowserSessionsSince(sinceIso: string, limit = 10): BrowserSessionSummary[] {
+    const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(50, limit)) : 10;
+    const rows = this.database
+      .query(
+        `
+          SELECT *
+          FROM browser_sessions
+          WHERE last_updated >= ?1
+          ORDER BY last_updated DESC
+          LIMIT ?2
+        `,
+      )
+      .all(sinceIso, safeLimit) as BrowserSessionRow[];
+
+    return rows.map((row) => ({
+      id: row.id,
+      remoteSessionId: row.remote_session_id,
+      profileId: row.profile_id,
+      status: row.status,
+      currentUrl: row.current_url,
+      title: row.title,
+      summary: row.summary,
+      activeTask: row.active_task,
+      tabLabel: row.tab_label,
+      previewUrl: row.preview_url,
+      screenshotUrl: row.screenshot_url,
+      lastUpdated: row.last_updated,
+    }));
   }
 
   createHitlRequest(input: {

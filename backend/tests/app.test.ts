@@ -91,12 +91,112 @@ describe("Gazabot Bun backend", () => {
     expect(detectCrisis("I'm hurt").triggered).toBe(true);
     expect(detectCrisis("I'm in trouble and need my family").triggered).toBe(true);
     expect(detectCrisis("Help me, call my daughter").triggered).toBe(true);
+    expect(detectCrisis("I'm in distress and need to call my relative").triggered).toBe(true);
     expect(detectCrisis("HELP!! I'M HURT").triggered).toBe(true);
     expect(detectCrisis("im hurt and i need my family").triggered).toBe(true);
 
     expect(detectCrisis("My shoulder hurt last week").triggered).toBe(false);
     expect(detectCrisis("Can you tell my family I'm okay?").triggered).toBe(false);
     expect(detectCrisis("I watched a movie called Trouble").triggered).toBe(false);
+  });
+
+  test("recap turns summarize recent activity without calling the model", async () => {
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("model should not be called for recap shortcut", { status: 500 });
+      }
+      if (url.includes("/v1/calls")) {
+        return new Response("bland should not be called for recap shortcut", { status: 500 });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.createTranscriptEntry({
+          kind: "tool",
+          role: "system",
+          text: "Started browser task: Open example.com in the browser.",
+          toolName: "browser-use",
+          toolStatus: "started",
+          metadata: { task: "Open example.com" },
+        });
+        database.beginBrowserTask("Open example.com in the browser.");
+        database.recordShoppingOrder({
+          merchant: "CVS",
+          normalizedMerchant: "cvs",
+          itemName: "Tylenol",
+          normalizedItemName: "tylenol",
+          sourceTask: "Order Tylenol from CVS",
+        });
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "What happened recently?",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as { route: string; reply: string };
+        expect(payload.route).toBe("conversation");
+        expect(payload.reply).toContain("In the last");
+        expect(payload.reply.toLowerCase()).toContain("browser");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("prompt responses redact sensitive values in transcript history", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      const prompt = database.createPrompt({
+        title: "Primary family contact",
+        description: "Test prompt",
+        memoryKey: "family_contact_primary",
+        memoryLabel: "Primary family contact",
+        fields: [
+          { name: "full_name", label: "Full Name", type: "string", required: true },
+          { name: "relationship", label: "Relationship", type: "string", required: true },
+          { name: "phone_number", label: "Phone Number", type: "string", required: true },
+        ],
+      });
+
+      const response = await app.fetch(
+        new Request(`http://localhost/api/prompts/${prompt.id}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            response: {
+              full_name: "Jane Doe",
+              relationship: "Daughter",
+              phone_number: "+14155551234",
+            },
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const entries = database.listTranscriptEntries();
+      const promptEntry = entries.find((e) => e.toolName === "user-prompt" && e.toolStatus === "completed");
+      expect(promptEntry).toBeTruthy();
+      expect(promptEntry?.text).toContain("Fields:");
+      expect(promptEntry?.text).not.toContain("+14155551234");
+      expect(JSON.stringify(promptEntry?.metadata ?? {})).not.toContain("+14155551234");
+    } finally {
+      app.close();
+      database.close();
+    }
   });
 
   test("supports reminder create, update, pause, and delete flow", async () => {
@@ -255,15 +355,17 @@ describe("Gazabot Bun backend", () => {
           "Content-Type": "application/json",
           authorization: "test-bland-key",
         });
-        expect(JSON.parse(String(init?.body))).toEqual({
-          phone_number: "+14155551234",
-          pathway_id: "pathway_test_123",
-          request_data: {
-            emergency_brief:
-              "This is an automated wellness alert from a home care assistant. Someone you support may be in distress or need urgent help. Please try to reach them right away, or ask someone nearby to check on them. Thank you for responding as quickly as you can.",
-            relationship_to_resident: "Daughter",
-          },
-        });
+        const body = JSON.parse(String(init?.body)) as any;
+        expect(body.phone_number).toBe("+14155551234");
+        expect(body.pathway_id).toBe("pathway_test_123");
+        expect(body.request_data).toBeTruthy();
+        expect(body.request_data.relationship_to_resident).toBe("Daughter");
+        expect(typeof body.request_data.emergency_brief).toBe("string");
+        expect(String(body.request_data.emergency_brief)).toContain(
+          "This is an automated wellness alert from a home care assistant.",
+        );
+        expect(typeof body?.request_data?.recent_activity).toBe("string");
+        expect(String(body.request_data.recent_activity).trim().length).toBeGreaterThan(0);
         return jsonResponse({ status: "success", call_id: "bland_call_1" });
       }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });

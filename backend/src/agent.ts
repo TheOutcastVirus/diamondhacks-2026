@@ -12,6 +12,7 @@ import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
 import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { TranscriptEventBus } from "./transcript-bus";
+import { buildRecentActivitySnapshot } from "./activity";
 
 // OpenAI-compatible types for Imagine API
 type ChatRole = "system" | "user" | "assistant" | "tool";
@@ -51,6 +52,28 @@ export type AgentTurnResult =
   | { kind: "end_conversation"; text: string };
 
 const TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "list_recent_activity",
+      description:
+        "Summarize recent activity across the household, including transcript messages, tool calls, and browser automation history. Use when the user asks what happened recently or wants a recap.",
+      parameters: {
+        type: "object",
+        properties: {
+          lookback_minutes: {
+            type: "number",
+            description: "How far back to look, in minutes. Defaults to 240 (4 hours).",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of activity items to return. Defaults to 30.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -639,7 +662,7 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences."
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
         : "";
 
     const systemPrompt = `You are Gazabot, a senior-care assistant for reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly. You are all capable, but not all-knowing. You are able to answer questions about a wide range of topics, but for anything that you are unsure of, you should first research the topic.
@@ -801,6 +824,19 @@ If you need any kind of context, feel free to call the tools and then respond.`;
       let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
       switch (name) {
+        case "list_recent_activity": {
+          const lookbackMinutes =
+            typeof args.lookback_minutes === "number"
+              ? args.lookback_minutes
+              : typeof args.lookbackMinutes === "number"
+                ? args.lookbackMinutes
+                : 240;
+          const limit =
+            typeof args.limit === "number" ? args.limit : typeof args.maxItems === "number" ? args.maxItems : 30;
+          result = buildRecentActivitySnapshot(this.database, { lookbackMinutes, limit });
+          break;
+        }
+
         case "list_reminders": {
           result = this.database.listReminders();
           break;
