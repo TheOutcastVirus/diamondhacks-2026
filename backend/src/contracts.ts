@@ -6,6 +6,7 @@ export type ToolStatus = "started" | "completed" | "failed";
 export type BrowserStatus = "idle" | "navigating" | "executing" | "blocked";
 export type BrowserActionStatus = "pending" | "completed" | "failed";
 export type AgentSource = "voice" | "dashboard" | "resident" | "guardian";
+export type AgentModel = "imagine" | "gemini-fast";
 
 export type Reminder = {
   id: string;
@@ -81,6 +82,7 @@ export type AgentTurnRequest = {
   source: AgentSource;
   profileId?: string;
   forceBrowser?: boolean;
+  model?: AgentModel;
 };
 
 export type AgentTurnResponse =
