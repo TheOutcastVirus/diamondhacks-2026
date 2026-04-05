@@ -83,7 +83,7 @@ export class BlandService {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: apiKey,
+        authorization: apiKey,
       },
       body: JSON.stringify(body),
     });

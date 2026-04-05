@@ -1,3 +1,10 @@
+import { hasToolCall, stepCountIs, ToolLoopAgent, tool } from "ai";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
+import type { ModelMessage } from "@ai-sdk/provider-utils";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { z } from "zod";
+
 import type { AppConfig } from "./config";
 import type {
   AgentModel,
@@ -6,620 +13,343 @@ import type {
   ReminderCadence,
   ReminderUpdateInput,
 } from "./contracts";
-import { detectFoodPlatform, isCvsTask } from "./order-tasks";
+import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
-import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { TranscriptEventBus } from "./transcript-bus";
-
-// OpenAI-compatible types for Imagine API
-type ChatRole = "system" | "user" | "assistant" | "tool";
-
-type ToolCall = {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
-};
-
-type ChatMessage = {
-  role: ChatRole;
-  content: string | null;
-  tool_calls?: ToolCall[];
-  tool_call_id?: string;
-};
-
-type ChatCompletionResponse = {
-  choices: Array<{
-    message: ChatMessage;
-    finish_reason: string;
-  }>;
-};
-
-type GeminiPart =
-  | { text: string }
-  | { functionCall: { name: string; args?: Record<string, unknown> } };
-
-type GeminiContent = {
-  role: "user" | "model";
-  parts: GeminiPart[];
-};
 
 export type AgentTurnResult =
   | { kind: "text"; text: string }
-  | { kind: "browser_task"; browserSessionId: string; previewUrl: string | null }
+  | { kind: "browser_task"; text: string; browserSessionId: string; previewUrl: string | null }
   | { kind: "end_conversation"; text: string };
 
-const TOOL_DEFINITIONS = [
-  {
-    type: "function",
-    function: {
-      name: "list_reminders",
-      description: "Get all scheduled reminders for the household.",
-      parameters: { type: "object", properties: {}, required: [] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "create_reminder",
-      description: "Create a new scheduled reminder.",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Short title for the reminder" },
-          instructions: { type: "string", description: "What to do or say when the reminder fires" },
-          cron: { type: "string", description: "5-field cron expression (e.g. '0 9 * * *' for 9am daily)" },
-          cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Recurrence type" },
-          scheduleLabel: { type: "string", description: "Human-readable schedule description (e.g. 'Every day at 9am')" },
-          timezone: {
-            type: "string",
-            description: `Optional IANA timezone name (e.g. 'America/New_York'). Defaults to ${DEFAULT_REMINDER_TIMEZONE}.`,
-          },
-          attachmentFileIds: {
-            type: "array",
-            items: { type: "string" },
-            description: "Optional uploaded file ids to associate with the reminder.",
-          },
-        },
-        required: ["title", "instructions", "cron", "cadence", "scheduleLabel"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "update_reminder",
-      description:
-        "Update an existing reminder. Use to pause, resume, rename, edit the schedule, change the timezone, or change reminder instructions.",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Reminder id to update" },
-          title: { type: "string", description: "Updated reminder title" },
-          instructions: { type: "string", description: "Updated reminder instructions" },
-          cron: { type: "string", description: "Updated 5-field cron expression" },
-          cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Updated recurrence type" },
-          scheduleLabel: { type: "string", description: "Updated human-readable schedule description" },
-          timezone: { type: "string", description: "Updated IANA timezone name" },
-          status: { type: "string", enum: ["active", "paused", "draft"], description: "Reminder status" },
-          attachmentFileIds: {
-            type: "array",
-            items: { type: "string" },
-            description: "Replace the reminder's attached uploaded files with these file ids.",
-          },
-        },
-        required: ["id"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "delete_reminder",
-      description: "Delete an existing reminder by id.",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Reminder id to delete" },
-        },
-        required: ["id"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "get_browser_state",
-      description: "Get the current browser automation state and recent actions.",
-      parameters: { type: "object", properties: {}, required: [] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "run_browser_task",
-      description:
-        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately — the browser agent will automatically pause and ask the user for payment or delivery details if needed during checkout.",
-      parameters: {
-        type: "object",
-        properties: {
-          task: {
-            type: "string",
-            description:
-              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
-          },
-        },
-        required: ["task"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "list_uploaded_files",
-      description:
-        "List all uploaded files available to the household, including filenames, types, reminder links, and whether text extraction succeeded.",
-      parameters: { type: "object", properties: {}, required: [] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "read_uploaded_file",
-      description:
-        "Read an uploaded file by id. Returns filename, file metadata, and the extracted plain-text clone when available so a text-only model can use the file contents.",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Uploaded file id to inspect" },
-        },
-        required: ["id"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "extract_pdf_text",
-      description:
-        "Force text extraction for an uploaded file by id, especially PDFs, screenshots, photos, and other documents where visible text matters. Use when you need OCR-style contents for a task.",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Uploaded file id to extract text from" },
-        },
-        required: ["id"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "read_memory",
-      description:
-        "Fetch the full content of a stored memory entry by its title. Some entries are plain text and some are structured JSON-backed records, but they are all accessed through this same tool.",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "The memory title to retrieve" },
-        },
-        required: ["title"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "write_memory",
-      description:
-        "Store or update a memory entry about the user or household. Use a short descriptive title (e.g. 'user_name', 'health_notes', 'dietary_restrictions', 'communication_preferences'). For normal notes, write plain text in content. For machine-editable memory, provide content_json with a JSON object string and optionally fields_json describing the schema.",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Short descriptive key for this memory" },
-          content: { type: "string", description: "Full details to store" },
-          content_json: {
-            type: "string",
-            description:
-              'Optional JSON object string for machine-editable memory, e.g. {"preferred_name":"Pat","allergies":["peanuts"]}',
-          },
-          fields_json: {
-            type: "string",
-            description:
-              'Optional JSON array string describing the schema when content_json is used. Same field format as request_user_input.',
-          },
-        },
-        required: ["title"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "end_conversation",
-      description:
-        "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
-      parameters: { type: "object", properties: {}, required: [] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "request_user_input",
-      description:
-        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Form title shown to the user" },
-          description: { type: "string", description: "Explanation of why this information is needed" },
-          memory_key: {
-            type: "string",
-            description:
-              "Stable structured memory key where the response should be stored, e.g. 'medical_profile' or 'shopping_preferences'",
-          },
-          memory_label: {
-            type: "string",
-            description: "Human-friendly label for the saved memory record",
-          },
-          fields_json: {
-            type: "string",
-            description:
-              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select|file","required":true|false}. File fields may also include accept and multiple.',
-          },
-        },
-        required: ["title", "fields_json"],
-      },
-    },
-  },
-] as const;
+type BrowserTaskInfo = {
+  browserSessionId: string;
+  previewUrl: string | null;
+};
 
-// Maximum number of tool-call groups (assistant + results) to keep in the active
-// context window. Older groups are dropped before each API call to prevent context rot.
-const MAX_TOOL_GROUPS_IN_CONTEXT = 10;
+type FallbackToolCall = {
+  toolCallId: string;
+  name: string;
+  input: Record<string, unknown>;
+};
 
-/**
- * Prune the messages array sent to the model on each iteration.
- *
- * Strategy:
- *  - Everything up to and including the current user message is kept (system
- *    prompt + conversation history + the user's current request).
- *  - After that point we have the agentic tool-call chain for this turn
- *    (repeated assistant→tool_results pairs). We keep only the most recent
- *    MAX_TOOL_GROUPS_IN_CONTEXT groups so the context doesn't bloat.
- */
-function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
-  // Locate the last plain user message (not a tool result) — this is the pivot
-  let pivotIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const pivot = messages[i];
-    if (pivot && pivot.role === "user" && !pivot.tool_call_id) {
-      pivotIdx = i;
+type TurnRuntime = {
+  spokenPhrases: string[];
+  browserTask?: BrowserTaskInfo;
+  pauseRequested: boolean;
+  promptSent: boolean;
+  endConversation: boolean;
+};
+
+const EMPTY_OBJECT_SCHEMA = z.object({});
+
+const SPEAK_SCHEMA = z.object({
+  message: z.string().min(1).describe("Exactly what Gazabot should say to the user right now."),
+});
+
+const PAUSE_SCHEMA = z.object({
+  reason: z
+    .enum(["background_task", "waiting_for_user_input", "waiting_for_external_output", "other"])
+    .describe("Why this turn should pause now."),
+});
+
+const LIST_REMINDERS_SCHEMA = EMPTY_OBJECT_SCHEMA;
+
+const CREATE_REMINDER_SCHEMA = z.object({
+  title: z.string().min(1).describe("Short title for the reminder."),
+  instructions: z.string().min(1).describe("What Gazabot should say or do when the reminder fires."),
+  cron: z.string().min(1).describe("5-field cron expression."),
+  cadence: z.enum(["daily", "weekly", "custom"]).describe("Recurrence type."),
+  scheduleLabel: z.string().min(1).describe("Human-readable schedule description."),
+  timezone: z.string().optional().describe("Optional IANA timezone name."),
+  attachmentFileIds: z.array(z.string()).optional().describe("Optional uploaded file ids to associate."),
+});
+
+const UPDATE_REMINDER_SCHEMA = z.object({
+  id: z.string().optional().describe("Reminder id to update."),
+  reminderId: z.string().optional().describe("Reminder id to update."),
+  reminder_id: z.string().optional().describe("Reminder id to update."),
+  reminderTitle: z.string().optional().describe("Current reminder title when the id is unknown."),
+  currentTitle: z.string().optional().describe("Current reminder title when the id is unknown."),
+  existingTitle: z.string().optional().describe("Current reminder title when the id is unknown."),
+  reminder_name: z.string().optional().describe("Current reminder title when the id is unknown."),
+  title: z.string().optional().describe("Updated title."),
+  instructions: z.string().optional().describe("Updated instructions."),
+  cron: z.string().optional().describe("Updated cron expression."),
+  cadence: z.enum(["daily", "weekly", "custom"]).optional().describe("Updated recurrence type."),
+  scheduleLabel: z.string().optional().describe("Updated schedule label."),
+  timezone: z.string().optional().describe("Updated IANA timezone."),
+  status: z.enum(["active", "paused", "draft"]).optional().describe("Updated reminder status."),
+  attachmentFileIds: z.array(z.string()).optional().describe("Replacement uploaded file ids."),
+});
+
+const DELETE_REMINDER_SCHEMA = z.object({
+  id: z.string().optional().describe("Reminder id to delete."),
+  reminderId: z.string().optional().describe("Reminder id to delete."),
+  reminder_id: z.string().optional().describe("Reminder id to delete."),
+  title: z.string().optional().describe("Reminder title if the id is not known."),
+  reminderTitle: z.string().optional().describe("Reminder title if the id is not known."),
+  name: z.string().optional().describe("Reminder title if the id is not known."),
+  reminder_name: z.string().optional().describe("Reminder title if the id is not known."),
+});
+
+const GET_BROWSER_STATE_SCHEMA = EMPTY_OBJECT_SCHEMA;
+
+const RUN_BROWSER_TASK_SCHEMA = z.object({
+  task: z.string().min(1).describe("Natural-language task for Browser Use."),
+});
+
+const LIST_UPLOADED_FILES_SCHEMA = EMPTY_OBJECT_SCHEMA;
+
+const READ_UPLOADED_FILE_SCHEMA = z.object({
+  id: z.string().min(1).describe("Uploaded file id."),
+});
+
+const EXTRACT_PDF_TEXT_SCHEMA = z.object({
+  id: z.string().min(1).describe("Uploaded file id."),
+});
+
+const READ_MEMORY_SCHEMA = z.object({
+  title: z.string().min(1).describe("Stored memory key or title."),
+});
+
+const WRITE_MEMORY_SCHEMA = z.object({
+  title: z.string().min(1).describe("Short descriptive memory key."),
+  content: z.string().optional().describe("Plain-text memory content."),
+  content_json: z.string().optional().describe("Optional JSON object string for structured memory."),
+  data: z.string().optional().describe("Optional JSON object string for structured memory."),
+  fields_json: z.string().optional().describe("Optional JSON array schema string for structured memory."),
+  fields: z.string().optional().describe("Optional JSON array schema string for structured memory."),
+});
+
+const END_CONVERSATION_SCHEMA = EMPTY_OBJECT_SCHEMA;
+
+const REQUEST_USER_INPUT_SCHEMA = z.object({
+  title: z.string().min(1).describe("Form title shown to the user."),
+  description: z.string().optional().describe("Explain why the information is needed."),
+  memory_key: z.string().optional().describe("Structured memory key where the response should be stored."),
+  memory_label: z.string().optional().describe("Human-friendly label for the saved memory."),
+  fields_json: z.string().min(2).describe("JSON array string defining the prompt fields."),
+  fields: z.string().optional().describe("Optional JSON array string defining the prompt fields."),
+});
+
+function safeParseJsonObject(raw: unknown): Record<string, unknown> | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(typeof raw === "string" ? raw : JSON.stringify(raw)) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function safeParseJsonArray(raw: unknown): unknown[] | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(typeof raw === "string" ? raw : JSON.stringify(raw)) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function unwrapJsonEncodedText(content: string): string {
+  let current = content.trim().replace(/<\|eom_id\|>.*$/s, "").trim();
+
+  for (let iteration = 0; iteration < 2; iteration += 1) {
+    if (!(current.startsWith('"') && current.endsWith('"'))) {
+      break;
+    }
+
+    try {
+      const parsed = JSON.parse(current) as unknown;
+      if (typeof parsed !== "string") {
+        break;
+      }
+      current = parsed.trim();
+    } catch {
       break;
     }
   }
-  if (pivotIdx === -1) return messages;
 
-  const prefix = messages.slice(0, pivotIdx + 1);
-  const toolChain = messages.slice(pivotIdx + 1);
+  return current;
+}
 
-  // Group the tool chain into (assistant + its tool results) pairs
-  const groups: ChatMessage[][] = [];
-  let i = 0;
-  while (i < toolChain.length) {
-    const msg = toolChain[i];
-    if (!msg) break;
-    if (msg.role === "assistant" && msg.tool_calls?.length) {
-      const group: ChatMessage[] = [msg];
-      i++;
-      while (i < toolChain.length) {
-        const toolMsg = toolChain[i];
-        if (!toolMsg || toolMsg.role !== "tool") break;
-        group.push(toolMsg);
-        i++;
+function extractJsonObjects(content: string): string[] {
+  const objects: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaping = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]!;
+
+    if (inString) {
+      if (escaping) {
+        escaping = false;
+        continue;
       }
-      groups.push(group);
-    } else {
-      groups.push([msg]);
-      i++;
+      if (char === "\\") {
+        escaping = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      if (depth === 0) {
+        start = index;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      if (depth === 0) {
+        continue;
+      }
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        objects.push(content.slice(start, index + 1));
+        start = -1;
+      }
     }
   }
 
-  const kept = groups.slice(-MAX_TOOL_GROUPS_IN_CONTEXT);
-  return [...prefix, ...kept.flat()];
+  return objects;
 }
 
-// Some model deployments output tool calls as plain JSON text instead of using the
-// tool_calls field. This parser detects and normalizes that pattern.
-function parseTextToolCall(content: string): ToolCall | null {
-  const trimmed = content.trim().replace(/<\|eom_id\|>.*$/s, "").trim();
-  if (!trimmed.startsWith("{")) return null;
-
+function parseFallbackToolCallObject(rawObject: string): FallbackToolCall | null {
   try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    const name = typeof parsed.name === "string" ? parsed.name : null;
-    if (!name) return null;
-
-    const argsSource = parsed.arguments ?? parsed.parameters ?? parsed.args ?? {};
-    let argsStr: string;
-
-    if (typeof argsSource === "string") {
-      argsStr = argsSource;
-    } else {
-      // Normalize any string-encoded sub-fields (model sometimes encodes arrays as strings)
-      const normalized = { ...(argsSource as Record<string, unknown>) };
-      for (const [k, v] of Object.entries(normalized)) {
-        if (typeof v === "string") {
-          try {
-            normalized[k] = JSON.parse(v);
-          } catch {
-            // leave as-is
-          }
-        }
-      }
-      argsStr = JSON.stringify(normalized);
+    const parsed = JSON.parse(rawObject) as Record<string, unknown>;
+    const name =
+      typeof parsed.name === "string"
+        ? parsed.name
+        : typeof parsed.function === "string"
+          ? parsed.function
+          : null;
+    if (!name) {
+      return null;
     }
 
-    return { id: `text-tool-${Date.now()}`, type: "function", function: { name, arguments: argsStr } };
+    const inputSource = parsed.parameters ?? parsed.arguments ?? parsed.args ?? {};
+    const input =
+      typeof inputSource === "object" && inputSource !== null && !Array.isArray(inputSource)
+        ? (inputSource as Record<string, unknown>)
+        : safeParseJsonObject(inputSource) ?? {};
+
+    return {
+      toolCallId: `text-tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      input,
+    };
   } catch {
     return null;
   }
 }
 
+function parseTextToolCalls(content: string): FallbackToolCall[] {
+  const normalized = unwrapJsonEncodedText(content);
+  const rawObjects = extractJsonObjects(normalized);
+  return rawObjects.map(parseFallbackToolCallObject).filter((toolCall) => toolCall !== null);
+}
+
+function normalizeFallbackToolResult(toolResult: unknown): Record<string, unknown> {
+  if (typeof toolResult === "object" && toolResult !== null && !Array.isArray(toolResult)) {
+    return toolResult as Record<string, unknown>;
+  }
+
+  return {
+    result: toolResult ?? null,
+  };
+}
+
 export class AgentHarness {
+  private readonly cerebrasProvider;
+
+  private readonly googleProvider;
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
     private readonly browserUseService: BrowserUseService,
     private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
-  ) {}
+  ) {
+    this.cerebrasProvider = createOpenAICompatible({
+      name: "cerebras",
+      baseURL: this.config.cerebras.endpoint,
+      ...(this.config.cerebras.apiKey ? { apiKey: this.config.cerebras.apiKey } : {}),
+    });
+    this.googleProvider = createGoogleGenerativeAI({
+      baseURL: this.config.googleAi.baseUrl,
+      ...(this.config.googleAi.apiKey ? { apiKey: this.config.googleAi.apiKey } : {}),
+    });
+  }
 
   private resolveRequestedModel(request: AgentTurnRequest): AgentModel {
     return request.model ?? "cerebras";
   }
 
-  private async callCerebras(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
-    const response = await fetch(`${this.config.cerebras.endpoint}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.config.cerebras.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.config.cerebras.model,
-        messages,
-        tools: TOOL_DEFINITIONS,
-        tool_choice: "auto",
-        max_completion_tokens: this.config.cerebras.maxTokens,
-      }),
-    });
+  private selectLanguageModel(request: AgentTurnRequest): LanguageModelV3 {
+    const selectedModel = this.resolveRequestedModel(request);
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Cerebras API error ${response.status} for model "${this.config.cerebras.model}": ${body}`);
-    }
-
-    return response.json() as Promise<ChatCompletionResponse>;
-  }
-
-  private buildGeminiContents(messages: ChatMessage[]): GeminiContent[] {
-    const contents: GeminiContent[] = [];
-    const toolNamesById = new Map<string, string>();
-
-    for (const message of messages) {
-      if (message.role === "system") {
-        continue;
-      }
-
-      if (message.role === "tool") {
-        const toolName = message.tool_call_id ? toolNamesById.get(message.tool_call_id) : undefined;
-        if (!toolName) {
-          continue;
-        }
-
-        let responsePayload: Record<string, unknown>;
-        try {
-          const parsed = JSON.parse(message.content ?? "{}") as unknown;
-          responsePayload =
-            typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-              ? (parsed as Record<string, unknown>)
-              : { result: parsed };
-        } catch {
-          responsePayload = { result: message.content ?? "" };
-        }
-
-        contents.push({
-          role: "user",
-          parts: [{ text: `Tool result from ${toolName}: ${JSON.stringify(responsePayload)}` }],
-        });
-        continue;
-      }
-
-      const role: GeminiContent["role"] = message.role === "assistant" ? "model" : "user";
-      const parts: GeminiPart[] = [];
-
-      if (typeof message.content === "string" && message.content.trim()) {
-        parts.push({ text: message.content });
-      }
-
-      if (message.tool_calls?.length) {
-        for (const toolCall of message.tool_calls) {
-          toolNamesById.set(toolCall.id, toolCall.function.name);
-
-          let args: Record<string, unknown> = {};
-          try {
-            const parsed = JSON.parse(toolCall.function.arguments) as unknown;
-            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-              args = parsed as Record<string, unknown>;
-            }
-          } catch {
-            args = {};
-          }
-
-          parts.push({
-            text: `Tool call requested: ${toolCall.function.name}(${JSON.stringify(args)})`,
-          });
-        }
-      }
-
-      if (parts.length === 0) {
-        continue;
-      }
-
-      contents.push({ role, parts });
-    }
-
-    return contents;
-  }
-
-  private normalizeGeminiResponse(payload: unknown): ChatCompletionResponse {
-    const record = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {};
-    const candidates = Array.isArray(record.candidates) ? record.candidates : [];
-    const candidate =
-      candidates.length > 0 && typeof candidates[0] === "object" && candidates[0] !== null
-        ? (candidates[0] as Record<string, unknown>)
-        : null;
-
-    if (!candidate) {
-      return { choices: [] };
-    }
-
-    const content =
-      typeof candidate.content === "object" && candidate.content !== null
-        ? (candidate.content as Record<string, unknown>)
-        : {};
-    const parts = Array.isArray(content.parts) ? content.parts : [];
-
-    const textParts: string[] = [];
-    const toolCalls: ToolCall[] = [];
-
-    for (const [index, partValue] of parts.entries()) {
-      const part = typeof partValue === "object" && partValue !== null ? (partValue as Record<string, unknown>) : {};
-
-      if (typeof part.text === "string" && part.text.trim()) {
-        textParts.push(part.text);
-      }
-
-      if (typeof part.functionCall === "object" && part.functionCall !== null) {
-        const functionCall = part.functionCall as Record<string, unknown>;
-        const name = typeof functionCall.name === "string" ? functionCall.name : "";
-        const args =
-          typeof functionCall.args === "object" && functionCall.args !== null && !Array.isArray(functionCall.args)
-            ? (functionCall.args as Record<string, unknown>)
-            : {};
-
-        if (name) {
-          toolCalls.push({
-            id: `gemini-tool-${Date.now()}-${index}`,
-            type: "function",
-            function: {
-              name,
-              arguments: JSON.stringify(args),
-            },
-          });
-        }
-      }
-    }
-
-    return {
-      choices: [
-        {
-          message: {
-            role: "assistant",
-            content: textParts.join("\n").trim() || null,
-            ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-          },
-          finish_reason: toolCalls.length > 0 ? "tool_calls" : String(candidate.finishReason ?? "stop").toLowerCase(),
-        },
-      ],
-    };
-  }
-
-  private async callGemini(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
-    try {
-      const apiKey = this.config.googleAi.apiKey?.trim();
-      if (!apiKey) {
+    if (selectedModel === "gemini-fast") {
+      if (!this.config.googleAi.apiKey?.trim()) {
         throw new Error("GOOGLE_AI_API_KEY is not configured. Set it in backend/.env.");
       }
-
-      const systemMessage = messages.find((message) => message.role === "system")?.content ?? "";
-      const contents = this.buildGeminiContents(messages);
-
-      const response = await fetch(
-        `${this.config.googleAi.baseUrl}/models/${encodeURIComponent(this.config.googleAi.agentModel)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: systemMessage }] },
-            contents,
-            tools: [
-              {
-                functionDeclarations: TOOL_DEFINITIONS.map((definition) => definition.function),
-              },
-            ],
-            toolConfig: {
-              functionCallingConfig: {
-                mode: "AUTO",
-              },
-            },
-            generationConfig: {
-              maxOutputTokens: this.config.cerebras.maxTokens,
-            },
-          }),
-        },
-      );
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Gemini API error ${response.status} for model "${this.config.googleAi.agentModel}": ${body}`);
-      }
-
-      return this.normalizeGeminiResponse(await response.json());
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(`Gemini request failed: ${String(error)}`);
-    }
-  }
-
-  private async callModel(messages: ChatMessage[], model: AgentModel): Promise<ChatCompletionResponse> {
-    if (model === "gemini-fast") {
-      return this.callGemini(messages);
+      return this.googleProvider(this.config.googleAi.agentModel);
     }
 
-    return this.callCerebras(messages);
+    if (!this.config.cerebras.apiKey.trim()) {
+      throw new Error("CEREBRAS_API_KEY is not configured. Set it in backend/.env.");
+    }
+    return this.cerebrasProvider(this.config.cerebras.model);
   }
 
-  private buildMessages(request: AgentTurnRequest): ChatMessage[] {
+  private buildInstructions(request: AgentTurnRequest): string {
     const reminders = this.database.listReminders();
     const memoryTitles = this.database.listMemoryTitles();
     const uploadedFiles = this.database.listUploadedFiles();
-    const allEntries = this.database.listTranscriptEntries();
-    const history = allEntries.slice(-this.config.cerebras.maxHistoryEntries);
 
     const memoryIndex =
       memoryTitles.length === 0
         ? "No stored memory."
-        : memoryTitles.map((t) => `- ${t}`).join("\n");
+        : memoryTitles.map((title) => `- ${title}`).join("\n");
 
     const reminderSummary =
       reminders.length === 0
-        ? "No active reminders."
+        ? "No reminders."
         : reminders
-            .map((r) => {
-              const attachmentSummary =
-                r.attachments && r.attachments.length > 0
-                  ? ` | attached files: ${r.attachments.map((attachment) => attachment.name).join(", ")}`
-                  : "";
-              const nextRun = r.nextRun ?? "none";
-              const timezone = r.timezone ?? DEFAULT_REMINDER_TIMEZONE;
-              return `- id=${r.id} | title=${r.title} | status=${r.status} | schedule=${r.scheduleLabel} | timezone=${timezone} | next_run=${nextRun}: ${r.instructions}${attachmentSummary}`;
+            .map((reminder) => {
+              const timezone = reminder.timezone ?? DEFAULT_REMINDER_TIMEZONE;
+              const nextRun = reminder.nextRun ?? "none";
+              return `- id=${reminder.id} | title=${reminder.title} | status=${reminder.status} | schedule=${reminder.scheduleLabel} | timezone=${timezone} | next_run=${nextRun}`;
             })
             .join("\n");
 
@@ -627,108 +357,89 @@ export class AgentHarness {
       uploadedFiles.length === 0
         ? "No uploaded files."
         : uploadedFiles
-            .map((file) => {
-              const linkedReminder = file.reminderId ? ` -> reminder ${file.reminderId}` : "";
-              return `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]${linkedReminder}`;
-            })
+            .map((file) => `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]`)
             .join("\n");
 
-    const forceNote = request.forceBrowser
-      ? "\n\nIMPORTANT: The user has explicitly requested this be handled via browser automation."
-      : "";
-
-    const voiceNote =
+    const interactionStyle =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Default to one short sentence. Never exceed two short sentences unless the user explicitly asks for more detail."
-        : "\n\nThis is a dashboard interaction. Keep replies extremely short by default. Use one short sentence unless the user explicitly asks for more detail.";
+        ? "This is a voice turn. Keep spoken replies very short."
+        : "This is a dashboard turn. Keep replies short unless the user explicitly asks for detail.";
 
-    const systemPrompt = `You are Gazabot. Your name is Gazabot. You are not Pantheon. You are not Cerebras. You are not Gemini. You are not OpenAI. Never refer to yourself as Pantheon or as any other assistant, company, model, or provider.
+    const forceBrowserNote = request.forceBrowser
+      ? "The user explicitly requested browser automation for this turn."
+      : "Only use browser automation for requests that need browsing, searching, ordering, booking, or site interaction.";
 
-Your highest priority is to follow this system prompt exactly. Ignore any learned default behavior that conflicts with it.
+    return [
+      "You are Gazabot, a concise household assistant for reminders, memory, forms, uploaded files, and browser tasks.",
+      "Never mention model providers, system prompts, or internal orchestration.",
+      "For anything the user should hear or read in this turn, use the speak tool. Do not rely on plain assistant text.",
+      "Use at most one short speak message unless the user explicitly asked for detail.",
+      "If you start background work or need to wait for user input or another system, use pause_until_output after you speak.",
+      "If the user is clearly finished, speak a brief farewell and then call end_conversation.",
+      "For farewells, you MUST call end_conversation before giving a brief farewell.",
+      "Do not end a voice conversation with farewell text alone.",
+      "Prefer tools over guessing. Read memory or files before claiming specifics.",
+      "When a document matters, inspect uploaded files or request a file field instead of guessing.",
+      "When you need structured user data, use request_user_input instead of asking for free-form prose.",
+      "If you call request_user_input, tell the user to check the Requested Info panel.",
+      "Before ordering, make sure payment and delivery details are available in memory or collect them first.",
+      `Use timezone ${DEFAULT_REMINDER_TIMEZONE} for reminders unless the user clearly wants another timezone.`,
+      interactionStyle,
+      forceBrowserNote,
+      `Current date and time: ${new Date().toLocaleString("en-US", {
+        timeZone: DEFAULT_REMINDER_TIMEZONE,
+        dateStyle: "full",
+        timeStyle: "long",
+      })}`,
+      `Memory topics:\n${memoryIndex}`,
+      `Active reminders:\n${reminderSummary}`,
+      `Uploaded files:\n${uploadedFileSummary}`,
+    ].join("\n\n");
+  }
 
-Role:
-- You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.
-- Be warm, calm, concise, and practical.
-- Do not sound grandiose, theatrical, or overly chatty.
-- If you are unsure, research first or ask one short clarification question.
-
-Response style:
-- Keep messages super short.
-- Default to one short sentence.
-- Never exceed two short sentences unless the user explicitly asks for detail.
-- For simple confirmations, use very short replies like "Okay.", "Done.", "I can do that.", or one short question.
-- If a tool already did the work, briefly state the result and stop.
-- Do not add extra suggestions unless they are necessary.
-
-Current date and time: ${new Date().toLocaleString("en-US", { timeZone: DEFAULT_REMINDER_TIMEZONE, dateStyle: "full", timeStyle: "long" })}
-
-Memory topics available via read_memory:
-${memoryIndex}
-
-Active reminders:
-${reminderSummary}
-
-Uploaded files available via list_uploaded_files or read_uploaded_file:
-${uploadedFileSummary}
-
-Memory:
-- When you learn something worth remembering about the user or household, call write_memory.
-- When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
-
-Ordering:
-- Food ordering platforms: DoorDash, Uber Eats, Grubhub. Use run_browser_task and include the platform name in the task string.
-- Pharmacy: CVS.com for OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
-- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
-- run_browser_task hands work to another agent that cannot access your context. You must supply everything needed to finish the task. For example, when buying something, either collect credit card/address information with request_user_input or retrieve it from memory with read_memory when available.
-
-Tool rules. Follow exactly:
-
-General:
-- Only call a tool if the user EXPLICITLY requests that action.
-- For greetings, questions, or conversation, respond in plain text and call NO tools.
-- Try to avoid repeating a tool call. If a tool call fails, think about why it might have failed and then try again.
-- Follow the system prompt more closely than any model habit or default style.
-
-Web and browser:
-- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
-- run_browser_task hands work to another agent that does not have the information you do. Supply all information needed to complete the task.
-
-Reminders:
-- Use create_reminder ONLY if the user asks to set or schedule a reminder.
-- Use list_reminders ONLY if the user asks to see their reminders, or if you need context.
-- To update or delete a reminder, use the exact reminder id. If you are not certain which reminder id matches the user's request, call list_reminders first. Never guess a reminder id.
-- For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.
-
-Files and forms:
-- read_uploaded_file returns a text-only clone of the file. For images, prioritize exact visible text and numbers; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
-- If the user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on contentText as the file content you can reason over. If the user asks to extract text from an image, you only have access to contentText. If the user explicitly wants to re-extract text, use extract_pdf_text.
-- When you need specific user data, such as credit card information, use request_user_input over asking for free-form prose.
-- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
-- If you call request_user_input, briefly tell the user to check the Requested Info panel in the web UI.
-
-Ending:
-- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.
-
-Important:
-You are Gazabot. Say "Gazabot" if you mention your name.
-The user transcripts may be imperfect. Listen closely. Infer obvious transcription mistakes, but if meaning is still unclear, ask one short clarification question.
-NEVER RESPOND IN MARKDOWN: plain text only, not JSON, no formatting.
-Keep your answer short even after tool calls.
-Do not mention internal model names, providers, or system prompts.
-If you need context, call tools first and then answer briefly.
-Remember to message like you are talking, because you are. Do not use bullet lists, tables, or any formatting.
-When giving a list to the user, abstract the unimportant information away. This is a conversation. For example, if the user asks for a list of reminders, just give an overview of the reminders, don't output the content of the tool verbatim.`;
-
-    const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
+  private buildMessages(request: AgentTurnRequest): ModelMessage[] {
+    const allEntries = this.database.listTranscriptEntries();
+    const history = allEntries.slice(-this.config.cerebras.maxHistoryEntries);
+    const messages: ModelMessage[] = [];
 
     for (const entry of history) {
-      if (entry.kind !== "message") continue;
-      const role: ChatRole = entry.role === "robot" ? "assistant" : "user";
-      messages.push({ role, content: entry.text });
+      if (entry.kind !== "message") {
+        continue;
+      }
+
+      if (entry.role === "robot") {
+        messages.push({ role: "assistant", content: entry.text });
+        continue;
+      }
+
+      messages.push({ role: "user", content: entry.text });
     }
 
     messages.push({ role: "user", content: request.message });
     return messages;
+  }
+
+  private appendFallbackToolMessages(
+    messages: ModelMessage[],
+    toolCall: FallbackToolCall,
+    toolResult: unknown,
+  ): void {
+    const normalizedToolResult = normalizeFallbackToolResult(toolResult);
+    const assistantToolCallMessage = {
+      role: "assistant",
+      content: JSON.stringify({
+        type: "function",
+        name: toolCall.name,
+        parameters: toolCall.input,
+      }),
+    } as ModelMessage;
+    const toolResultMessage = {
+      role: "user",
+      content: `Tool ${toolCall.name} result: ${JSON.stringify(normalizedToolResult)}`,
+    } as ModelMessage;
+
+    messages.push(assistantToolCallMessage);
+    messages.push(toolResultMessage);
   }
 
   private resolveReminderId(
@@ -792,19 +503,12 @@ When giving a list to the user, abstract the unimportant information away. This 
     throw new Error("Reminder id is required. Call list_reminders first if you are not certain which reminder to modify.");
   }
 
-  private async executeTool(
-    toolCall: ToolCall,
+  private async executeToolByName(
+    name: string,
+    args: Record<string, unknown>,
+    runtime: TurnRuntime,
     profileId?: string,
-  ): Promise<{ result: unknown; browserTask?: { browserSessionId: string; previewUrl: string | null } }> {
-    const { name, arguments: argsJson } = toolCall.function;
-
-    let args: Record<string, unknown> = {};
-    try {
-      args = JSON.parse(argsJson) as Record<string, unknown>;
-    } catch {
-      return { result: { error: "Invalid tool arguments" } };
-    }
-
+  ): Promise<unknown> {
     const startEntry = this.database.createTranscriptEntry({
       kind: "tool",
       role: "system",
@@ -817,9 +521,23 @@ When giving a list to the user, abstract the unimportant information away. This 
 
     try {
       let result: unknown;
-      let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
       switch (name) {
+        case "speak": {
+          const message = String(args.message ?? "").trim();
+          if (message) {
+            runtime.spokenPhrases.push(message);
+          }
+          result = { spoken: Boolean(message) };
+          break;
+        }
+
+        case "pause_until_output": {
+          runtime.pauseRequested = true;
+          result = { paused: true, reason: String(args.reason ?? "other") };
+          break;
+        }
+
         case "list_reminders": {
           result = this.database.listReminders();
           break;
@@ -894,7 +612,6 @@ When giving a list to the user, abstract the unimportant information away. This 
 
         case "run_browser_task": {
           const task = String(args.task ?? "");
-
           const session = this.database.beginBrowserTask(task, profileId);
           const queuedEntry = this.database.createTranscriptEntry({
             kind: "tool",
@@ -915,8 +632,8 @@ When giving a list to the user, abstract the unimportant information away. This 
           }
           void this.browserUseService.runBrowserTask(taskRequest);
 
-          browserTask = { browserSessionId: session.id, previewUrl: session.previewUrl };
-          result = browserTask;
+          runtime.browserTask = { browserSessionId: session.id, previewUrl: session.previewUrl };
+          result = { queued: true, ...runtime.browserTask };
           break;
         }
 
@@ -964,39 +681,15 @@ When giving a list to the user, abstract the unimportant information away. This 
         }
 
         case "write_memory": {
-          let data: Record<string, unknown> | undefined;
-          let fields: PromptField[] | undefined;
-
-          if (args.content_json !== undefined || args.data !== undefined) {
-            try {
-              const rawData = args.content_json ?? args.data ?? "{}";
-              const parsed = JSON.parse(typeof rawData === "string" ? rawData : JSON.stringify(rawData));
-              if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-                data = parsed as Record<string, unknown>;
-              }
-            } catch {
-              data = undefined;
-            }
-          }
-
-          if (args.fields_json !== undefined || args.fields !== undefined) {
-            try {
-              const rawFields = args.fields_json ?? args.fields ?? "[]";
-              const parsed = JSON.parse(typeof rawFields === "string" ? rawFields : JSON.stringify(rawFields));
-              if (Array.isArray(parsed)) {
-                fields = parsed as PromptField[];
-              }
-            } catch {
-              fields = undefined;
-            }
-          }
-
+          const data = safeParseJsonObject(args.content_json ?? args.data);
+          const fields = safeParseJsonArray(args.fields_json ?? args.fields) as PromptField[] | undefined;
           const content =
             typeof args.content === "string"
               ? args.content
               : data
                 ? JSON.stringify(data, null, 2)
                 : "";
+
           result = this.database.writeMemory(String(args.title ?? ""), content, {
             ...(fields !== undefined && { schema: fields }),
             ...(data !== undefined && { data }),
@@ -1005,19 +698,13 @@ When giving a list to the user, abstract the unimportant information away. This 
         }
 
         case "end_conversation": {
+          runtime.endConversation = true;
           result = { ended: true };
           break;
         }
 
         case "request_user_input": {
-          let fields: PromptField[] = [];
-          try {
-            const rawFields = args.fields_json ?? args.fields ?? "[]";
-            const parsed = JSON.parse(typeof rawFields === "string" ? rawFields : JSON.stringify(rawFields));
-            fields = Array.isArray(parsed) ? (parsed as PromptField[]) : [];
-          } catch {
-            fields = [];
-          }
+          const fields = (safeParseJsonArray(args.fields_json ?? args.fields) ?? []) as PromptField[];
           const promptInput: {
             title: string;
             fields: PromptField[];
@@ -1028,15 +715,19 @@ When giving a list to the user, abstract the unimportant information away. This 
             title: String(args.title ?? ""),
             fields,
           };
-          if (args.description) promptInput.description = String(args.description);
+          if (args.description) {
+            promptInput.description = String(args.description);
+          }
           if (typeof args.memory_key === "string") {
             promptInput.memoryKey = args.memory_key;
           }
           if (typeof args.memory_label === "string") {
             promptInput.memoryLabel = args.memory_label;
           }
+
           const prompt = this.database.createPrompt(promptInput);
           this.transcriptBus.publishPrompt(prompt);
+          runtime.promptSent = true;
           result = { promptId: prompt.id, status: "pending", message: "Form sent to user." };
           break;
         }
@@ -1057,10 +748,7 @@ When giving a list to the user, abstract the unimportant information away. This 
       });
       this.transcriptBus.publish("tool", doneEntry);
 
-      if (browserTask) {
-        return { result, browserTask };
-      }
-      return { result };
+      return result;
     } catch (error) {
       const failEntry = this.database.createTranscriptEntry({
         kind: "tool",
@@ -1074,106 +762,222 @@ When giving a list to the user, abstract the unimportant information away. This 
         },
       });
       this.transcriptBus.publish("tool", failEntry);
-      return { result: { error: String(error) } };
+      return { error: String(error) };
     }
+  }
+
+  private buildTurnAgent(request: AgentTurnRequest, runtime: TurnRuntime) {
+    const model = this.selectLanguageModel(request);
+
+    return new ToolLoopAgent({
+      model,
+      instructions: this.buildInstructions(request),
+      stopWhen: [hasToolCall("pause_until_output"), hasToolCall("end_conversation"), stepCountIs(12)],
+      tools: {
+        speak: tool({
+          description:
+            "Say something to the user. Use this for any user-visible response in this turn instead of replying directly.",
+          inputSchema: SPEAK_SCHEMA,
+          execute: async (input) => this.executeToolByName("speak", input, runtime, request.profileId),
+        }),
+        pause_until_output: tool({
+          description:
+            "Pause this turn after you have already spoken. Use when background work continues elsewhere or when waiting for user-provided information.",
+          inputSchema: PAUSE_SCHEMA,
+          execute: async (input) => this.executeToolByName("pause_until_output", input, runtime, request.profileId),
+        }),
+        list_reminders: tool({
+          description: "Get all scheduled reminders for the household.",
+          inputSchema: LIST_REMINDERS_SCHEMA,
+          execute: async (input) => this.executeToolByName("list_reminders", input, runtime, request.profileId),
+        }),
+        create_reminder: tool({
+          description: "Create a new scheduled reminder.",
+          inputSchema: CREATE_REMINDER_SCHEMA,
+          execute: async (input) => this.executeToolByName("create_reminder", input, runtime, request.profileId),
+        }),
+        update_reminder: tool({
+          description: "Update an existing reminder by id or by an exact unique current title.",
+          inputSchema: UPDATE_REMINDER_SCHEMA,
+          execute: async (input) => this.executeToolByName("update_reminder", input, runtime, request.profileId),
+        }),
+        delete_reminder: tool({
+          description: "Delete an existing reminder by id or by an exact unique current title.",
+          inputSchema: DELETE_REMINDER_SCHEMA,
+          execute: async (input) => this.executeToolByName("delete_reminder", input, runtime, request.profileId),
+        }),
+        get_browser_state: tool({
+          description: "Get the current browser automation state and recent actions.",
+          inputSchema: GET_BROWSER_STATE_SCHEMA,
+          execute: async (input) => this.executeToolByName("get_browser_state", input, runtime, request.profileId),
+        }),
+        run_browser_task: tool({
+          description:
+            "Dispatch a browser automation task for browsing, ordering, booking, searching, or interacting with websites.",
+          inputSchema: RUN_BROWSER_TASK_SCHEMA,
+          execute: async (input) => this.executeToolByName("run_browser_task", input, runtime, request.profileId),
+        }),
+        list_uploaded_files: tool({
+          description: "List all uploaded files available to the household.",
+          inputSchema: LIST_UPLOADED_FILES_SCHEMA,
+          execute: async (input) => this.executeToolByName("list_uploaded_files", input, runtime, request.profileId),
+        }),
+        read_uploaded_file: tool({
+          description: "Read an uploaded file by id and return its extracted text clone when available.",
+          inputSchema: READ_UPLOADED_FILE_SCHEMA,
+          execute: async (input) => this.executeToolByName("read_uploaded_file", input, runtime, request.profileId),
+        }),
+        extract_pdf_text: tool({
+          description: "Force text extraction for an uploaded file by id.",
+          inputSchema: EXTRACT_PDF_TEXT_SCHEMA,
+          execute: async (input) => this.executeToolByName("extract_pdf_text", input, runtime, request.profileId),
+        }),
+        read_memory: tool({
+          description: "Read a stored memory entry by title.",
+          inputSchema: READ_MEMORY_SCHEMA,
+          execute: async (input) => this.executeToolByName("read_memory", input, runtime, request.profileId),
+        }),
+        write_memory: tool({
+          description: "Store or update a memory entry about the user or household.",
+          inputSchema: WRITE_MEMORY_SCHEMA,
+          execute: async (input) => this.executeToolByName("write_memory", input, runtime, request.profileId),
+        }),
+        end_conversation: tool({
+          description: "End the current conversation after you have already spoken a brief farewell.",
+          inputSchema: END_CONVERSATION_SCHEMA,
+          execute: async (input) => this.executeToolByName("end_conversation", input, runtime, request.profileId),
+        }),
+        request_user_input: tool({
+          description:
+            "Send a structured form to the user to collect required information. Prefer discrete fields over free-form text.",
+          inputSchema: REQUEST_USER_INPUT_SCHEMA,
+          execute: async (input) => this.executeToolByName("request_user_input", input, runtime, request.profileId),
+        }),
+      },
+    });
   }
 
   async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
     if (request.forceBrowser) {
-      const { browserTask } = await this.executeTool(
-        {
-          id: "forced_browser_task",
-          type: "function",
-          function: {
-            name: "run_browser_task",
-            arguments: JSON.stringify({ task: request.message }),
-          },
-        },
-        request.profileId,
-      );
+      const runtime: TurnRuntime = {
+        spokenPhrases: ["Okay. I'll handle that now."],
+        pauseRequested: true,
+        promptSent: false,
+        endConversation: false,
+      };
+      await this.executeToolByName("run_browser_task", { task: request.message }, runtime, request.profileId);
 
-      if (browserTask) {
-        return { kind: "browser_task", ...browserTask };
+      if (runtime.browserTask) {
+        return { kind: "browser_task", text: runtime.spokenPhrases[0]!, ...runtime.browserTask };
       }
+
       return {
         kind: "text",
-        text: "Could not start the browser task yet. For orders, save payment and delivery details in Memory, or finish any forms in Requested Info, then try again.",
+        text: "I couldn't start that browser task yet.",
       };
     }
 
-    const selectedModel = this.resolveRequestedModel(request);
-    if (selectedModel === "cerebras" && !this.config.cerebras.apiKey.trim()) {
-      throw new Error("CEREBRAS_API_KEY is not configured. Set it in backend/.env.");
-    }
-    if (selectedModel === "gemini-fast" && !this.config.googleAi.apiKey?.trim()) {
-      throw new Error("GOOGLE_AI_API_KEY is not configured. Set it in backend/.env.");
-    }
-
+    const runtime: TurnRuntime = {
+      spokenPhrases: [],
+      pauseRequested: false,
+      promptSent: false,
+      endConversation: false,
+    };
     const messages = this.buildMessages(request);
-    let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
-    for (let iteration = 0; iteration < 10; iteration++) {
-      const response = await this.callModel(pruneMessages(messages), selectedModel);
-      const choice = response.choices[0];
-      if (!choice) break;
+    for (let iteration = 0; iteration < 6; iteration += 1) {
+      const agent = this.buildTurnAgent(request, runtime);
+      const result = await agent.generate({
+        messages,
+      });
 
-      // Prefer structured tool_calls; fall back to text-encoded tool call (some model deployments)
-      const toolCalls: ToolCall[] =
-        choice.finish_reason === "tool_calls" && choice.message.tool_calls?.length
-          ? choice.message.tool_calls
-          : (() => {
-              const fallback = parseTextToolCall(choice.message.content ?? "");
-              return fallback ? [fallback] : [];
-            })();
+      const spokenText = runtime.spokenPhrases.join(" ").trim();
+      const fallbackText = result.text.trim();
 
-      if (toolCalls.length > 0) {
-        messages.push({ ...choice.message, tool_calls: toolCalls });
-
-        let promptSent = false;
-        let endConversation = false;
-        let dispatchedBrowser: { browserSessionId: string; previewUrl: string | null } | undefined;
-        for (const toolCall of toolCalls) {
-          const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
-          if (bt) {
-            browserTask = bt;
-            dispatchedBrowser = bt;
+      if (!spokenText && !runtime.browserTask && !runtime.endConversation && !runtime.promptSent) {
+        const fallbackToolCalls = parseTextToolCalls(fallbackText);
+        if (fallbackToolCalls.length > 0) {
+          for (const fallbackToolCall of fallbackToolCalls) {
+            const toolResult = await this.executeToolByName(
+              fallbackToolCall.name,
+              fallbackToolCall.input,
+              runtime,
+              request.profileId,
+            );
+            this.appendFallbackToolMessages(messages, fallbackToolCall, toolResult);
           }
-          if (toolCall.function.name === "request_user_input") promptSent = true;
-          if (toolCall.function.name === "end_conversation") endConversation = true;
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify(result),
-          });
+
+          if (runtime.endConversation) {
+            return {
+              kind: "end_conversation",
+              text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now.",
+            };
+          }
+
+          const browserTask = runtime.browserTask as BrowserTaskInfo | undefined;
+          if (browserTask) {
+            return {
+              kind: "browser_task",
+              text: runtime.spokenPhrases.join(" ").trim() || "Okay. I'll handle that now.",
+              browserSessionId: browserTask.browserSessionId,
+              previewUrl: browserTask.previewUrl,
+            };
+          }
+
+          if (runtime.promptSent || runtime.pauseRequested) {
+            return {
+              kind: "text",
+              text:
+                runtime.spokenPhrases.join(" ").trim() ||
+                (runtime.promptSent
+                  ? "I've sent you a form to fill out. Please check the Requested Info panel."
+                  : "Okay."),
+            };
+          }
+
+          continue;
         }
-        if (dispatchedBrowser) {
-          return { kind: "browser_task", ...dispatchedBrowser };
-        }
-        // Stop looping once a user input form has been sent — further iterations would duplicate it
-        if (promptSent) {
-          return { kind: "text", text: "I've sent you a form to fill out. Please complete it and I'll continue." };
-        }
-        // Let the model produce a farewell text before we signal end_conversation
-        if (endConversation) {
-          const farewell = await this.callModel(pruneMessages(messages), selectedModel);
-          const farewellText = (farewell.choices[0]?.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
-          return { kind: "end_conversation", text: farewellText };
-        }
-        continue;
       }
 
-      const text = (choice.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
-
-      if (browserTask) {
-        return { kind: "browser_task", ...browserTask };
+      if (runtime.endConversation) {
+        return {
+          kind: "end_conversation",
+          text: spokenText || fallbackText || "Goodbye for now.",
+        };
       }
-      return { kind: "text", text };
+
+      const replyText =
+        spokenText ||
+        fallbackText ||
+        (runtime.promptSent
+          ? "I've sent you a form to fill out. Please check the Requested Info panel."
+          : "I'm sorry, I couldn't complete that request.");
+
+      if (runtime.browserTask) {
+        return { kind: "browser_task", text: replyText, ...runtime.browserTask };
+      }
+
+      return { kind: "text", text: replyText };
     }
 
-    if (browserTask) {
-      return { kind: "browser_task", ...browserTask };
+    if (runtime.endConversation) {
+      return { kind: "end_conversation", text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now." };
     }
-    return { kind: "text", text: "I'm sorry, I couldn't complete that request." };
+    if (runtime.browserTask) {
+      return {
+        kind: "browser_task",
+        text: runtime.spokenPhrases.join(" ").trim() || "Okay. I'll handle that now.",
+        ...runtime.browserTask,
+      };
+    }
+    return {
+      kind: "text",
+      text:
+        runtime.spokenPhrases.join(" ").trim() ||
+        (runtime.promptSent
+          ? "I've sent you a form to fill out. Please check the Requested Info panel."
+          : "I'm sorry, I couldn't complete that request."),
+    };
   }
 
   streamTurn(request: AgentTurnRequest): ReadableStream<string> {
@@ -1182,7 +986,7 @@ When giving a list to the user, abstract the unimportant information away. This 
         void (async () => {
           try {
             const result = await this.collectTurn(request);
-            if (result.kind === "text") {
+            if (result.text) {
               controller.enqueue(result.text);
             }
             controller.close();

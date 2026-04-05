@@ -1175,6 +1175,125 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("executes plain-text JSON function calls instead of returning them to the user", async () => {
+    let completionRound = 0;
+    const { app, database } = createTestApp();
+    database.createReminder({
+      title: "Hydration reminder",
+      instructions: "Prompt for water.",
+      cadence: "daily",
+      cron: "0 15 * * *",
+      scheduleLabel: "Every day at 15:00",
+      timezone: "America/Los_Angeles",
+    });
+
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: '{"type":"function","name":"list_reminders","parameters":{}}',
+                  tool_calls: undefined,
+                },
+                finish_reason: "stop",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "You have 1 reminder: Hydration reminder.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost/api/agent/turn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: "What are my reminders?",
+            source: "guardian",
+            forceBrowser: false,
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as Record<string, unknown>;
+      expect(payload.reply).toBe("You have 1 reminder: Hydration reminder.");
+      expect(completionRound).toBe(2);
+
+      const completedToolEntry = database
+        .listTranscriptEntries()
+        .find((entry) => entry.kind === "tool" && entry.toolName === "list_reminders" && entry.toolStatus === "completed");
+      expect(completedToolEntry).toBeDefined();
+    } finally {
+      restore();
+      app.close();
+      database.close();
+    }
+  });
+
+  test("executes multiple semicolon-separated plain-text tool calls in order", async () => {
+    const { app, database } = createTestApp();
+
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content:
+                  '{"type":"function","name":"speak","parameters":{"message":"I do not have anything else."}}; ' +
+                  '{"type":"function","name":"pause_until_output","parameters":{"reason":"other"}}; ' +
+                  '{"type":"function","name":"end_conversation","parameters":{}}',
+                tool_calls: undefined,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost/api/agent/turn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: "Anything else?",
+            source: "guardian",
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as Record<string, unknown>;
+      expect(payload.reply).toBe("I do not have anything else.");
+    } finally {
+      restore();
+      app.close();
+      database.close();
+    }
+  });
+
   test("deletes reminders from agent tool calls that pass the reminder title and records the JSON result", async () => {
     let completionRound = 0;
     const { app, database } = createTestApp();
@@ -2105,6 +2224,42 @@ trailer <<>>
         "play:start",
         "play:end",
       ]);
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("wake word reawakens after inactivity timeout returns the app to idle", async () => {
+    const { app, database } = createTestApp();
+    let runConversationTurnCalls = 0;
+    const privateApp = app as unknown as {
+      conversationState: "idle" | "conversation";
+      interactionOwner: "conversation" | "voice-http" | "reminder" | null;
+      interactionPhase: "idle" | "user_listening" | "agent_thinking" | "agent_speaking";
+      exitConversationMode: () => void;
+      handleWakeWord: () => Promise<void>;
+      runConversationTurn: () => Promise<void>;
+    };
+
+    privateApp.conversationState = "conversation";
+    privateApp.interactionOwner = "conversation";
+    privateApp.interactionPhase = "user_listening";
+    privateApp.runConversationTurn = async () => {
+      runConversationTurnCalls += 1;
+    };
+
+    try {
+      privateApp.exitConversationMode();
+
+      expect(String(privateApp.conversationState)).toBe("idle");
+      expect(privateApp.interactionOwner).toBeNull();
+      expect(String(privateApp.interactionPhase)).toBe("idle");
+
+      await privateApp.handleWakeWord();
+
+      expect(privateApp.conversationState).toBe("conversation");
+      expect(runConversationTurnCalls).toBe(1);
     } finally {
       app.close();
       database.close();

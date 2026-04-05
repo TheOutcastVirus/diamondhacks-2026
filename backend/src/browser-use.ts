@@ -574,7 +574,7 @@ export class BrowserUseService {
       const robotEntry = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",
-        text: summary,
+        text: failed ? `I couldn't finish that task. ${summary}` : `I just finished that task. ${summary}`,
       });
       this.transcriptBus.publish("tool", transcriptEntry);
       this.transcriptBus.publish("transcript", robotEntry);
@@ -1017,7 +1017,9 @@ export class BrowserUseService {
       const robot = this.database.createTranscriptEntry({
         kind: "message",
         role: "robot",
-        text: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
+        text: failed
+          ? `I couldn't finish that task. ${cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary}`
+          : `I just finished that task. ${cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary}`,
       });
       this.transcriptBus.publish("tool", completed);
       this.transcriptBus.publish("transcript", robot);

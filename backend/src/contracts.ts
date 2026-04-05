@@ -94,6 +94,7 @@ export type AgentTurnResponse =
     }
   | {
       route: "browser_task";
+      reply: string;
       browserSessionId: string;
       previewUrl: string | null;
       status: "queued";
