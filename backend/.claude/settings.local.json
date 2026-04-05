@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:inference-docs.cerebras.ai)",
+      "WebFetch(domain:docs.litellm.ai)",
+      "WebSearch"
+    ]
+  }
+}

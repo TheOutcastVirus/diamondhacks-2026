@@ -434,7 +434,7 @@ function parseAgentTurnRequest(payload: unknown): AgentTurnRequest {
   }
   const model = optionalString(record, "model");
   if (model) {
-    if (model !== "imagine" && model !== "gemini-fast") {
+    if (model !== "cerebras" && model !== "gemini-fast") {
       throw new Error("Invalid field: model");
     }
     request.model = model;
@@ -453,7 +453,7 @@ function parseOptionalAgentModel(value: string | File | undefined | null): Agent
     return undefined;
   }
 
-  if (trimmed === "imagine" || trimmed === "gemini-fast") {
+  if (trimmed === "cerebras" || trimmed === "gemini-fast") {
     return trimmed;
   }
 
@@ -940,7 +940,7 @@ export class GazabotApp {
           return errorResponse(request, this.config, 409, error.message);
         }
 
-        if (error.message.includes("INFERENCE_CLOUD_API_KEY is not configured")) {
+        if (error.message.includes("CEREBRAS_API_KEY is not configured")) {
           return errorResponse(request, this.config, 503, error.message);
         }
         if (error.message.includes("GOOGLE_AI_API_KEY is not configured")) {
