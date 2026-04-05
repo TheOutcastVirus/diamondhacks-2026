@@ -1552,6 +1552,19 @@ export class SodiumDatabase {
     return { prompt: updated, memoryEntry };
   }
 
+  findPendingPromptByMemoryKey(memoryKey: string): UserPrompt | null {
+    const row = this.database
+      .query("SELECT * FROM user_prompts WHERE memory_key = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1")
+      .get(memoryKey) as UserPromptRow | null;
+    return row ? serializePrompt(row) : null;
+  }
+
+  cancelPrompt(id: string): void {
+    this.database
+      .query("UPDATE user_prompts SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'")
+      .run(id);
+  }
+
   listUploadedFiles(): UploadedFile[] {
     const rows = this.database
       .query("SELECT * FROM uploaded_files ORDER BY created_at DESC, name ASC")
