@@ -511,6 +511,100 @@ export class AudioService {
     });
   }
 
+  /**
+   * Records from the microphone and streams raw PCM s16le chunks (16 kHz, mono)
+   * to `onChunk` in real-time.  Stops automatically once ffmpeg detects
+   * `silenceDuration` consecutive seconds below `silenceDb` dB, or after
+   * `maxDuration` seconds regardless.
+   *
+   * Use this with SttService.createRealtimeSession() so transcription runs in
+   * parallel with recording — by the time this resolves the transcript is ready.
+   */
+  async recordPcmUntilSilence(
+    onChunk: (pcm: Buffer) => void,
+    options?: { silenceDb?: number; silenceDuration?: number; maxDuration?: number },
+  ): Promise<void> {
+    if (this.proc) {
+      throw new Error("Already recording.");
+    }
+
+    const silenceDb       = options?.silenceDb       ?? -20;
+    const silenceDuration = options?.silenceDuration ?? 2;
+    const maxDuration     = options?.maxDuration      ?? 10;
+
+    const os = platform();
+    let micArgs: string[];
+    if (os === "darwin") {
+      micArgs = ["-f", "avfoundation", "-i", ":0"];
+    } else if (os === "linux") {
+      micArgs = ["-f", "alsa", "-i", "default"];
+    } else {
+      throw new Error(`Streaming PCM recording is not supported on ${os}.`);
+    }
+
+    const filter = `silencedetect=noise=${silenceDb}dB:duration=${silenceDuration}`;
+    const args = [
+      "-hide_banner",
+      ...micArgs,
+      "-af", filter,
+      "-ar", "16000",
+      "-ac", "1",
+      "-f", "s16le",  // raw signed-16-bit little-endian PCM
+      "pipe:1",       // write to stdout
+    ];
+
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.proc          = child;
+      this.recordingPath = null;
+
+      let maxTimer: ReturnType<typeof setTimeout> | null = null;
+      let stopped = false;
+      let stderrTail = "";
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+        this.proc = null;
+        child.kill("SIGTERM");
+        child.once("close", () => resolve());
+        setTimeout(resolve, 4000); // safety: don't block forever
+      };
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        onChunk(chunk);
+      });
+
+      child.on("error", (err) => {
+        this.proc = null;
+        reject(new Error(`Failed to start streaming recording: ${err.message}`));
+      });
+
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderrTail += chunk.toString();
+
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+
+        if (stderrTail.includes("silence_start")) {
+          stop();
+        }
+
+        const nl = stderrTail.lastIndexOf("\n");
+        if (nl !== -1) stderrTail = stderrTail.slice(nl + 1);
+      });
+
+      // Start the max-duration timer even if stderr is slow
+      setTimeout(() => {
+        if (!maxTimer && !stopped) {
+          maxTimer = setTimeout(stop, maxDuration * 1000);
+        }
+      }, 600);
+    });
+  }
+
   async playAudio(audioBuffer: Buffer): Promise<void> {
     const audioPath = join(tmpdir(), `voice-out-${Date.now()}.mp3`);
     await writeFile(audioPath, audioBuffer);

@@ -916,14 +916,9 @@ export class GazabotApp {
     return eventStreamResponse(request, this.config, stream);
   }
 
-  private async processVoiceAudio(
-    audio: File | Blob | Buffer,
+  private async processTranscriptText(
+    transcript: string,
   ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
-    const transcript = await this.sttService.transcribe(audio);
-    if (!transcript.trim()) {
-      throw Object.assign(new Error("No speech detected."), { noSpeech: true });
-    }
-
     const userEntry = this.database.createTranscriptEntry({
       kind: "message",
       role: "resident",
@@ -952,6 +947,16 @@ export class GazabotApp {
     }
 
     return { transcript, replyText, endConversation };
+  }
+
+  private async processVoiceAudio(
+    audio: File | Blob | Buffer,
+  ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
+    const transcript = await this.sttService.transcribe(audio);
+    if (!transcript.trim()) {
+      throw Object.assign(new Error("No speech detected."), { noSpeech: true });
+    }
+    return this.processTranscriptText(transcript);
   }
 
   // ── Wake word ──────────────────────────────────────────────────────────────
@@ -1083,16 +1088,35 @@ export class GazabotApp {
       this.conversationTimer = null;
     }
 
-    let audioBuffer: Buffer;
+    let transcript = "";
     try {
       this.setInteractionPhase("conversation", "user_listening");
-      audioBuffer = await this.audioService.recordUntilSilence({
-        silenceDb: -20,
-        silenceDuration: 1,
-        maxDuration: 10,
-      });
+      if (process.platform === "win32") {
+        const audioBuffer = await this.audioService.recordUntilSilence({
+          silenceDb: -20,
+          silenceDuration: 1,
+          maxDuration: 10,
+        });
+        transcript = await this.sttService.transcribe(audioBuffer);
+      } else {
+        const session = await this.sttService.createRealtimeSession();
+        await this.audioService.recordPcmUntilSilence(
+          (chunk) => session.sendAudio(chunk),
+          { silenceDb: -20, silenceDuration: 1, maxDuration: 10 },
+        );
+        transcript = await session.finalize();
+      }
     } catch (err) {
       console.error("[conversation] Recording failed:", err);
+      this.resetConversationTimer();
+      if (!ownsInteraction) {
+        this.releaseInteraction("conversation");
+      }
+      return;
+    }
+
+    if (!transcript.trim()) {
+      console.log("[conversation] No speech detected, waiting for activity…");
       this.resetConversationTimer();
       if (!ownsInteraction) {
         this.releaseInteraction("conversation");
@@ -1103,16 +1127,8 @@ export class GazabotApp {
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       this.setInteractionPhase("conversation", "agent_thinking");
-      result = await this.processVoiceAudio(audioBuffer);
+      result = await this.processTranscriptText(transcript);
     } catch (err) {
-      if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
-        console.log("[conversation] No speech detected, waiting for activity…");
-        this.resetConversationTimer();
-        if (!ownsInteraction) {
-          this.releaseInteraction("conversation");
-        }
-        return;
-      }
       console.error("[conversation] Processing failed:", err);
       this.resetConversationTimer();
       if (!ownsInteraction) {
