@@ -887,13 +887,14 @@ export class GazabotApp {
     }
 
     console.log("[wake-word] Wake word detected — recording command…");
+    const t0 = Date.now();
 
     let audioBuffer: Buffer;
     try {
-      // Stop after 2 s of silence (-20 dB floor), hard cap at 10 s.
-      // Raise silenceDb toward -15 if it still runs long in noisy environments.
+      // Stop after 1 s of silence (-15 dB floor), hard cap at 10 s.
+      // Raise silenceDb toward -10 if still runs long; lower toward -25 if cutting off mid-sentence.
       audioBuffer = await this.audioService.recordUntilSilence({
-        silenceDb: -15,      // raise toward -10 if still running long; lower toward -25 if cutting off mid-sentence
+        silenceDb: -15,
         silenceDuration: 1,
         maxDuration: 10,
       });
@@ -901,6 +902,9 @@ export class GazabotApp {
       console.error("[wake-word] Recording failed:", err);
       return;
     }
+
+    console.log(`[wake-word] Recording stopped  +${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    const t1 = Date.now();
 
     let result: { transcript: string; replyText: string };
     try {
@@ -914,7 +918,7 @@ export class GazabotApp {
       return;
     }
 
-    console.log(`[wake-word] Command: "${result.transcript}"`);
+    console.log(`[wake-word] STT + LLM done     +${((Date.now() - t1) / 1000).toFixed(1)}s  (command: "${result.transcript}"`);
 
     const audioOut = await this.ttsService.synthesize(result.replyText);
     await this.audioService.playAudio(audioOut);
