@@ -948,22 +948,32 @@ export class GazabotApp {
       return;
     }
 
+    // Suspend the inactivity timer for the duration of STT + agent processing.
+    // The round-trip can easily exceed the timeout window, and we must not drop
+    // out of conversation mode while a turn is still in flight.
+    if (this.conversationTimer) {
+      clearTimeout(this.conversationTimer);
+      this.conversationTimer = null;
+    }
+
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       result = await this.processVoiceAudio(audioBuffer);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
-        // No speech — let the inactivity timer decide when to exit
+        // No speech — restart the timer and wait for the next attempt
         console.log("[conversation] No speech detected, waiting for activity…");
+        this.resetConversationTimer();
         return;
       }
       console.error("[conversation] Processing failed:", err);
+      this.resetConversationTimer();
       return;
     }
 
     console.log(`[conversation] User: "${result.transcript}"`);
 
-    // User spoke — reset the inactivity timer
+    // Processing complete — restart the inactivity timer with a fresh window
     this.resetConversationTimer();
 
     this.isSpeaking = true;
