@@ -419,12 +419,18 @@ export class AudioService {
     const maxDuration     = options?.maxDuration      ?? 30;
 
     const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
-    const { cmd, args } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
+    const { cmd, args: baseArgs } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
+    // Append a second output so ffmpeg also streams raw PCM to stdout for dB monitoring.
+    const args = [...baseArgs, "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"];
 
     return new Promise<Buffer>((resolve, reject) => {
-      const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"] });
+      const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
       this.proc          = child;
       this.recordingPath = outPath;
+
+      const bytesPer20ms = 640; // 16 kHz * 1 ch * 2 bytes * 0.02 s
+      let pcmTail = Buffer.alloc(0);
+      let pcmWindowIndex = 0;
 
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
@@ -478,8 +484,36 @@ export class AudioService {
         reject(new Error(`Failed to start recording: ${err.message}`));
       });
 
+      child.stdout?.on("data", (chunk: Buffer) => {
+        pcmTail = Buffer.concat([pcmTail, chunk]);
+        while (pcmTail.length >= bytesPer20ms) {
+          const frame = pcmTail.subarray(0, bytesPer20ms);
+          pcmTail = pcmTail.subarray(bytesPer20ms);
+          pcmWindowIndex += 1;
+
+          let sumSquares = 0;
+          const sampleCount = frame.length / 2;
+          for (let i = 0; i < frame.length; i += 2) {
+            const sample = frame.readInt16LE(i) / 32768;
+            sumSquares += sample * sample;
+          }
+
+          const rms = Math.sqrt(sumSquares / Math.max(sampleCount, 1));
+          const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+          const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
+          process.stderr.write(
+            `[audio:level:win] ${(pcmWindowIndex * 20).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+          );
+        }
+      });
+
       child.stderr?.on("data", (chunk: Buffer) => {
-        stderrTail += chunk.toString();
+        const text = chunk.toString();
+        stderrTail += text;
+
+        if (text.includes("silence_start") || text.includes("silence_end")) {
+          process.stderr.write(`[ffmpeg:silence:win] ${text}`);
+        }
 
         // Set the max-duration timer on first stderr output (ffmpeg is running)
         if (!maxTimer && !stopped) {
@@ -558,9 +592,14 @@ export class AudioService {
       this.proc          = child;
       this.recordingPath = null;
 
+      const bytesPer20ms = 640; // 16 kHz * 1 ch * 2 bytes * 0.02 s
+      let pcmTail = Buffer.alloc(0);
+      let pcmWindowIndex = 0;
+
       let maxTimer: ReturnType<typeof setTimeout> | null = null;
       let stopped = false;
       let stderrTail = "";
+      let hasDetectedSpeech = false;
 
       const stop = () => {
         if (stopped) return;
@@ -574,6 +613,27 @@ export class AudioService {
 
       child.stdout?.on("data", (chunk: Buffer) => {
         onChunk(chunk);
+
+        pcmTail = Buffer.concat([pcmTail, chunk]);
+        while (pcmTail.length >= bytesPer20ms) {
+          const frame = pcmTail.subarray(0, bytesPer20ms);
+          pcmTail = pcmTail.subarray(bytesPer20ms);
+          pcmWindowIndex += 1;
+
+          let sumSquares = 0;
+          const sampleCount = frame.length / 2;
+          for (let i = 0; i < frame.length; i += 2) {
+            const sample = frame.readInt16LE(i) / 32768;
+            sumSquares += sample * sample;
+          }
+
+          const rms = Math.sqrt(sumSquares / Math.max(sampleCount, 1));
+          const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+          const label = Number.isFinite(dbfs) ? dbfs.toFixed(2) : "-inf";
+          process.stderr.write(
+            `[audio:level:mac] ${(pcmWindowIndex * 20).toString().padStart(5, " ")}ms ${label} dBFS\n`,
+          );
+        }
       });
 
       child.on("error", (err) => {
@@ -586,14 +646,21 @@ export class AudioService {
         stderrTail += text;
 
         if (text.includes("silence_start") || text.includes("silence_end")) {
-          process.stderr.write(`[ffmpeg:silence] ${text}`);
+          process.stderr.write(`[ffmpeg:silence:mac] ${text}`);
         }
 
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
 
-        if (stderrTail.includes("silence_start")) {
+        // silence_end means audio went above the threshold — user has started speaking
+        if (stderrTail.includes("silence_end")) {
+          hasDetectedSpeech = true;
+        }
+
+        // Only stop on silence_start after speech was detected; otherwise the
+        // recording would end immediately if the environment starts quiet.
+        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
           stop();
         }
 
