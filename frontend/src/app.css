@@ -302,3 +302,129 @@ article.action-card {
     align-items: flex-start;
   }
 }
+
+/* ─── Mobile bottom nav (hidden on large screens) ─── */
+nav.mobile-bottom-nav {
+  display: none;
+}
+
+button.mobile-header-toggle {
+  display: none;
+}
+
+/* ─── S25 / small phone layout (≤ 480px) ─── */
+@media (max-width: 480px) {
+  /* Prevent tap-zoom on inputs — ensure all field inputs use 16px+ */
+  input,
+  textarea,
+  select {
+    font-size: max(1rem, 16px) !important;
+  }
+
+  /* Hide the desktop sidebar entirely */
+  aside.sidebar {
+    display: none;
+  }
+
+  /* Shell becomes single column, full height */
+  div.app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr);
+    /* Reserve space for fixed bottom nav */
+    padding-bottom: calc(3.75rem + env(safe-area-inset-bottom, 0px));
+    min-height: 100dvh;
+  }
+
+  /* Workspace fills available height */
+  main.workspace {
+    min-height: 0;
+    max-height: none;
+    height: auto;
+    padding: 0.875rem 0.875rem 0;
+    overflow: hidden;
+  }
+
+  /* Compact page header */
+  header.page-header {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 0.6rem;
+    flex-shrink: 0;
+  }
+
+  h1.heading {
+    font-size: 1.6rem;
+    letter-spacing: -0.03em;
+  }
+
+  /* Show inline theme toggle in header on mobile */
+  button.mobile-header-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2rem;
+    padding: 0.5rem 0.65rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    border: var(--border-width) solid var(--color-line);
+    border-radius: 0;
+    background: var(--color-panel);
+    color: var(--color-ink-strong);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  /* Fixed bottom navigation bar */
+  nav.mobile-bottom-nav {
+    display: flex;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 200;
+    background: var(--color-panel);
+    border-top: var(--border-width) solid var(--color-line);
+    /* Safe area for S25 edge-to-edge display */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    height: calc(3.75rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  button.mobile-tab {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: var(--color-ink-soft);
+    cursor: pointer;
+    padding: 0.5rem 0.25rem;
+    min-height: 3.75rem;
+    font: inherit;
+    transition:
+      color 120ms ease,
+      background 120ms ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button.mobile-tab:active {
+    background: var(--color-panel-muted);
+  }
+
+  button.mobile-tab.active {
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  }
+
+  span.mobile-tab-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    line-height: 1;
+  }
+}
