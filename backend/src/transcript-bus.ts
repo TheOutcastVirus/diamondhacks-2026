@@ -1,4 +1,4 @@
-import type { TranscriptEntry, UserPrompt } from "./contracts";
+import type { ConversationDisplayState, TranscriptEntry, UserPrompt } from "./contracts";
 
 type TranscriptEventType = "transcript" | "tool" | "tts" | "prompt" | "state";
 
@@ -42,7 +42,7 @@ export class TranscriptEventBus {
     }
   }
 
-  publishState(conversationState: "idle" | "conversation"): void {
+  publishState(conversationState: ConversationDisplayState): void {
     const frame = encodeSseFrame("state", { conversationState });
     for (const subscriber of this.subscribers) {
       try {

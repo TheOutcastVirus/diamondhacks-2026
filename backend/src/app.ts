@@ -5,6 +5,7 @@ import type {
   AgentTurnResponse,
   ApiErrorPayload,
   BrowserContext,
+  ConversationDisplayState,
   PromptField,
   PromptFieldOption,
   ReminderCreateInput,
@@ -21,6 +22,7 @@ import { AudioService } from "./audio";
 import { BlandService } from "./bland";
 import { BrowserUseService, type BrowserTaskLifecycleEvent } from "./browser-use";
 import { detectCrisis } from "./crisis";
+import { buildEmergencyBlandRequestData, buildKeywordCallReason } from "./emergency-bland-context";
 import {
   buildRecentActivitySnapshot,
   formatRecentActivityForBland,
@@ -34,6 +36,7 @@ import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders"
 import { SttService } from "./stt";
 import { TtsService } from "./tts";
 import { TranscriptEventBus } from "./transcript-bus";
+import { decodeJsonStyleUnicodeEscapes } from "./text-normalize";
 
 
 function corsHeaders(request: Request, config: AppConfig): Record<string, string> {
@@ -171,6 +174,7 @@ function normalizePromptField(value: unknown): PromptField {
   if (
     type !== "string" &&
     type !== "text" &&
+    type !== "number" &&
     type !== "int" &&
     type !== "float" &&
     type !== "boolean" &&
@@ -268,6 +272,11 @@ function normalizePromptResponseValue(field: PromptField, value: unknown): unkno
       break;
     }
     case "float": {
+      const parsed = typeof value === "number" ? value : Number.parseFloat(String(value));
+      if (!Number.isNaN(parsed)) return parsed;
+      break;
+    }
+    case "number": {
       const parsed = typeof value === "number" ? value : Number.parseFloat(String(value));
       if (!Number.isNaN(parsed)) return parsed;
       break;
@@ -501,23 +510,6 @@ function redactPhoneNumber(phoneNumber: string): string {
   return `${phoneNumber.slice(0, 5)}******${phoneNumber.slice(-2)}`;
 }
 
-/** Copy for Bland `request_data` — use in the pathway as variables (e.g. {{emergency_brief}}) so the voice agent sounds human and clear. */
-function emergencyCallRequestData(relationship: string, recentActivity?: string): Record<string, string> {
-  const activitySuffix = recentActivity ? ` Recent activity: ${recentActivity}` : "";
-  const requestData: Record<string, string> = {
-    emergency_brief:
-      "This is an automated wellness alert from a home care assistant. Someone you support may be in distress or need urgent help. Please try to reach them right away, or ask someone nearby to check on them. Thank you for responding as quickly as you can.",
-    relationship_to_resident: relationship,
-  };
-  if (activitySuffix) {
-    requestData.emergency_brief = `${requestData.emergency_brief}${activitySuffix}`;
-  }
-  if (recentActivity) {
-    requestData.recent_activity = recentActivity;
-  }
-  return requestData;
-}
-
 function formatTranscriptSnippet(entry: { role: TranscriptRole; text: string }): string {
   const speaker = entry.role === "robot" ? "Assistant" : entry.role === "guardian" ? "Guardian" : "Resident";
   return `${speaker}: ${entry.text}`;
@@ -595,7 +587,10 @@ export class SodiumApp {
   private readonly audioService = new AudioService();
 
   // ── Conversation state ─────────────────────────────────────────────────────
-  private conversationState: "idle" | "conversation" = "idle";
+  /** Wake-word / runConversationTurn session (distinct from HTTP voice or reminder-only turns). */
+  private voiceConversationSession = false;
+  /** True after `pause_until_output` until the next agent result clears it (mirrors DB-backed pending prompts). */
+  private voiceAwaitingPauseOutput = false;
   private conversationTimer: ReturnType<typeof setTimeout> | null = null;
   private isSpeaking = false;
   private lastActivityAt: Date | null = null;
@@ -630,6 +625,33 @@ export class SodiumApp {
   ): void {
     if (this.interactionOwner === owner) {
       this.interactionPhase = phase;
+      this.syncAgentUiStateFromInteractionPhase(owner, phase);
+    }
+  }
+
+  private publishAgentUiState(state: ConversationDisplayState): void {
+    this.transcriptBus.publishState(state);
+  }
+
+  private syncPauseOutputFromAgentResult(result: AgentTurnResult): void {
+    this.voiceAwaitingPauseOutput = result.kind === "text" && result.pauseRequested === true;
+  }
+
+  private syncAgentUiStateFromInteractionPhase(
+    owner: "conversation" | "voice-http" | "reminder",
+    phase: "user_listening" | "agent_thinking" | "agent_speaking",
+  ): void {
+    if (phase === "agent_thinking" || phase === "agent_speaking") {
+      this.publishAgentUiState("speaking");
+      return;
+    }
+    if (owner === "conversation" && this.voiceConversationSession) {
+      const waiting = this.conversationWaitingForExternalOutput();
+      this.publishAgentUiState(waiting ? "waiting" : "listening");
+      return;
+    }
+    if (owner === "voice-http" || owner === "reminder") {
+      this.publishAgentUiState("listening");
     }
   }
 
@@ -650,21 +672,27 @@ export class SodiumApp {
   }
 
   private enterConversationMode(): void {
-    this.conversationState = "conversation";
-    this.resetConversationTimer();
-    this.transcriptBus.publishState("conversation");
+    this.voiceConversationSession = true;
+    if (this.conversationWaitingForExternalOutput()) {
+      this.resetConversationTimerWhileWaiting();
+    } else {
+      this.resetConversationTimer();
+    }
+    const waiting = this.conversationWaitingForExternalOutput();
+    this.publishAgentUiState(waiting ? "waiting" : "listening");
     console.log("[conversation] Entered conversation mode.");
   }
 
   private exitConversationMode(): void {
-    if (this.conversationState === "idle") return;
-    this.conversationState = "idle";
+    if (!this.voiceConversationSession) return;
+    this.voiceConversationSession = false;
+    this.voiceAwaitingPauseOutput = false;
     if (this.conversationTimer) {
       clearTimeout(this.conversationTimer);
       this.conversationTimer = null;
     }
     this.releaseInteraction("conversation");
-    this.transcriptBus.publishState("idle");
+    this.publishAgentUiState("idle");
     console.log("[conversation] Returned to idle (inactivity timeout).");
   }
 
@@ -676,7 +704,33 @@ export class SodiumApp {
     );
   }
 
+  /** While a voice-issued form is pending, the user may be silent at the mic but active on the dashboard. */
+  private hasPendingAgentResumePrompt(): boolean {
+    return this.database.listPrompts("pending").some((p) => p.resumeAgentAfter === true);
+  }
+
+  /** Mic loop is paused until tool output, form hook, etc.; user can still break out with the wake word. */
+  private conversationWaitingForExternalOutput(): boolean {
+    return this.voiceAwaitingPauseOutput || this.hasPendingAgentResumePrompt();
+  }
+
+  /**
+   * While "waiting" for tool output or a dashboard form — use a long timeout, or none if config is 0.
+   */
+  private resetConversationTimerWhileWaiting(): void {
+    if (this.conversationTimer) {
+      clearTimeout(this.conversationTimer);
+      this.conversationTimer = null;
+    }
+    const seconds = this.config.agent.conversationWaitingTimeoutSeconds;
+    if (seconds <= 0) {
+      return;
+    }
+    this.conversationTimer = setTimeout(() => this.exitConversationMode(), seconds * 1000);
+  }
+
   async archiveAndResetConversation(): Promise<void> {
+    this.exitConversationMode();
     const entries = this.database.listMessageTranscriptEntries();
 
     if (entries.length > 0) {
@@ -702,6 +756,15 @@ export class SodiumApp {
 
     this.database.clearTranscriptEntries();
     this.lastActivityAt = null;
+    this.voiceConversationSession = false;
+    if (this.conversationTimer) {
+      clearTimeout(this.conversationTimer);
+      this.conversationTimer = null;
+    }
+    if (this.interactionOwner === "conversation") {
+      this.releaseInteraction("conversation");
+    }
+    this.publishAgentUiState("idle");
     this.transcriptBus.publishSessionReset();
     console.log("[session] Transcript cleared — new session started.");
   }
@@ -724,6 +787,7 @@ export class SodiumApp {
       this.browserUseService,
       this.uploadedFileService,
       this.transcriptBus,
+      (input) => this.runAgentEmergencyFamilyCall(input.reason),
     );
     this.reminderScheduler = new ReminderScheduler(
       config,
@@ -863,6 +927,7 @@ export class SodiumApp {
       }
 
       if (request.method === "POST" && url.pathname === "/api/reset") {
+        this.browserUseService.cancelActiveRun();
         this.database.resetSession();
         console.log("[reset] Session data cleared (transcript, browser, prompts, orders).");
         return jsonResponse(request, this.config, { status: "ok", message: "Session reset." });
@@ -1144,7 +1209,7 @@ export class SodiumApp {
   private async processTranscriptText(
     transcript: string,
     model?: AgentModel,
-  ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
+  ): Promise<{ transcript: string; replyText: string; endConversation: boolean; playbackAlreadyDone?: boolean }> {
     const userEntry = this.database.createTranscriptEntry({
       kind: "message",
       role: "resident",
@@ -1156,7 +1221,16 @@ export class SodiumApp {
       message: transcript,
       source: "voice",
       ...(model !== undefined ? { model } : {}),
+      onSpeakChunk: async (chunk) => {
+        this.setInteractionPhase(
+          this.interactionOwner === "conversation" ? "conversation" : "voice-http",
+          "agent_speaking",
+        );
+        await this.speakReplyText(chunk, "voice");
+        await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
+      },
     });
+    this.syncPauseOutputFromAgentResult(result);
 
     let replyText: string;
     const endConversation = result.kind === "end_conversation";
@@ -1181,13 +1255,18 @@ export class SodiumApp {
       this.transcriptBus.publish("transcript", robotEntry);
     }
 
-    return { transcript, replyText, endConversation };
+    return {
+      transcript,
+      replyText,
+      endConversation,
+      ...(result.playbackAlreadyDone === true ? { playbackAlreadyDone: true as const } : {}),
+    };
   }
 
   private async processVoiceAudio(
     audio: File | Blob | Buffer,
     model?: AgentModel,
-  ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
+  ): Promise<{ transcript: string; replyText: string; endConversation: boolean; playbackAlreadyDone?: boolean }> {
     const transcript = await this.sttService.transcribe(audio);
     if (!transcript.trim()) {
       throw Object.assign(new Error("No speech detected."), { noSpeech: true });
@@ -1311,11 +1390,34 @@ export class SodiumApp {
       return;
     }
 
+    if (this.interactionPhase === "agent_thinking") {
+      console.log("[wake-word] Agent is thinking — ignoring trigger.");
+      return;
+    }
+
+    if (this.audioService.isRecording) {
+      console.log("[wake-word] Already recording — ignoring trigger.");
+      return;
+    }
+
+    // Waiting for tool/form output: conversation lock is held but mic is idle — wake opens the next listen turn.
     if (
-      this.interactionOwner !== null ||
-      (this.conversationState === "conversation" && this.audioService.isRecording)
+      this.voiceConversationSession &&
+      this.interactionOwner === "conversation" &&
+      this.conversationWaitingForExternalOutput()
     ) {
-      // Already in a conversation turn or another voice interaction, ignore duplicate triggers
+      console.log("[wake-word] Resuming from waiting state.");
+      this.voiceAwaitingPauseOutput = false;
+      if (this.conversationWaitingForExternalOutput()) {
+        this.resetConversationTimerWhileWaiting();
+      } else {
+        this.resetConversationTimer();
+      }
+      await this.runConversationTurn();
+      return;
+    }
+
+    if (this.interactionOwner !== null) {
       return;
     }
 
@@ -1336,7 +1438,7 @@ export class SodiumApp {
 
   private async runConversationTurn(): Promise<void> {
     const ownsInteraction = this.interactionOwner === "conversation";
-    if (this.conversationState !== "conversation" || this.audioService.isRecording || this.isSpeaking) {
+    if (!this.voiceConversationSession || this.audioService.isRecording || this.isSpeaking) {
       return;
     }
     if (!ownsInteraction && !this.claimInteraction("conversation")) {
@@ -1383,14 +1485,23 @@ export class SodiumApp {
 
     if (!transcript.trim()) {
       console.log("[conversation] No speech detected, waiting for activity…");
-      this.resetConversationTimer();
+      if (this.conversationWaitingForExternalOutput()) {
+        this.resetConversationTimerWhileWaiting();
+      } else {
+        this.resetConversationTimer();
+      }
       if (!ownsInteraction) {
         this.releaseInteraction("conversation");
       }
       return;
     }
 
-    let result: { transcript: string; replyText: string; endConversation: boolean };
+    let result: {
+      transcript: string;
+      replyText: string;
+      endConversation: boolean;
+      playbackAlreadyDone?: boolean;
+    };
     try {
       this.setInteractionPhase("conversation", "agent_thinking");
       result = await this.processTranscriptText(transcript);
@@ -1408,8 +1519,10 @@ export class SodiumApp {
 
     this.isSpeaking = true;
     try {
-      this.setInteractionPhase("conversation", "agent_speaking");
-      await this.speakReplyText(result.replyText, "voice");
+      if (!result.playbackAlreadyDone && result.replyText.trim()) {
+        this.setInteractionPhase("conversation", "agent_speaking");
+        await this.speakReplyText(result.replyText, "voice");
+      }
     } catch (err) {
       console.error("[conversation] TTS/playback failed:", err);
     } finally {
@@ -1426,10 +1539,19 @@ export class SodiumApp {
       return;
     }
 
-    // Bot has finished speaking — start the inactivity countdown, then loop
+    // Bot has finished speaking — either open the mic for another turn, or stay in "waiting" until tool output.
+    const waitingForToolOrForm = this.conversationWaitingForExternalOutput();
+    if (waitingForToolOrForm) {
+      // pause_until_output, or a pending resume prompt: do not recurse into another recording pass.
+      // External paths (form submit hook, browser lifecycle, dashboard agent, etc.) run the agent next.
+      this.resetConversationTimerWhileWaiting();
+      this.setInteractionPhase("conversation", "user_listening");
+      return;
+    }
+
     this.resetConversationTimer();
     this.setInteractionPhase("conversation", "user_listening");
-    if (this.conversationState === "conversation") {
+    if (this.voiceConversationSession) {
       void this.runConversationTurn();
       return;
     }
@@ -1465,7 +1587,12 @@ export class SodiumApp {
       return errorResponse(request, this.config, 422, error instanceof Error ? error.message : "Invalid field: model");
     }
 
-    let result: { transcript: string; replyText: string; endConversation: boolean };
+    let result: {
+      transcript: string;
+      replyText: string;
+      endConversation: boolean;
+      playbackAlreadyDone?: boolean;
+    };
     try {
       this.setInteractionPhase("voice-http", "agent_thinking");
       result = await this.processVoiceAudio(audioField, model);
@@ -1479,8 +1606,10 @@ export class SodiumApp {
     }
 
     try {
-      this.setInteractionPhase("voice-http", "agent_speaking");
-      await this.speakReplyText(result.replyText, "voice");
+      if (!result.playbackAlreadyDone && result.replyText.trim()) {
+        this.setInteractionPhase("voice-http", "agent_speaking");
+        await this.speakReplyText(result.replyText, "voice");
+      }
       if (result.endConversation) {
         await this.archiveAndResetConversation();
       }
@@ -1534,7 +1663,12 @@ export class SodiumApp {
       }
     }
 
-    let result: { transcript: string; replyText: string; endConversation: boolean };
+    let result: {
+      transcript: string;
+      replyText: string;
+      endConversation: boolean;
+      playbackAlreadyDone?: boolean;
+    };
     try {
       this.setInteractionPhase("voice-http", "agent_thinking");
       result = await this.processVoiceAudio(audioBuffer, model);
@@ -1548,8 +1682,10 @@ export class SodiumApp {
     }
 
     try {
-      this.setInteractionPhase("voice-http", "agent_speaking");
-      await this.speakReplyText(result.replyText, "voice");
+      if (!result.playbackAlreadyDone && result.replyText.trim()) {
+        this.setInteractionPhase("voice-http", "agent_speaking");
+        await this.speakReplyText(result.replyText, "voice");
+      }
       if (result.endConversation) {
         await this.archiveAndResetConversation();
       }
@@ -1561,7 +1697,7 @@ export class SodiumApp {
 
   private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {
     const body = asRecord(await parseJsonBody(request));
-    const text = requireString(body, "text");
+    const text = decodeJsonStyleUnicodeEscapes(requireString(body, "text"));
 
     this.transcriptBus.publishTts(text);
 
@@ -1600,6 +1736,8 @@ export class SodiumApp {
     const normalizedResponse = normalizePromptResponse(prompt, response as Record<string, unknown>);
     const { prompt: completed, memoryEntry } = this.database.respondToPrompt(promptId, normalizedResponse);
 
+    this.lastActivityAt = new Date();
+
     const responseKeys = Object.keys(completed.response ?? {});
     const responseText = `User submitted form "${completed.title}" for ${completed.memoryKey}. Fields: ${responseKeys.join(", ") || "(none)"}`;
     const responseEntry = this.database.createTranscriptEntry({
@@ -1616,6 +1754,14 @@ export class SodiumApp {
       },
     });
     this.transcriptBus.publish("tool", responseEntry);
+
+    let continuation:
+      | {
+          resumed: true;
+          target: "agent" | "browser-use";
+          status: "queued";
+        }
+      | undefined;
 
     const hitlRequest = this.database.findPendingHitlByPromptId(promptId);
     if (hitlRequest) {
@@ -1641,22 +1787,24 @@ export class SodiumApp {
       });
       this.transcriptBus.publish("tool", resumeEntry);
       this.transcriptBus.publish("transcript", robotResume);
+      continuation = { resumed: true, target: "browser-use", status: "queued" };
 
       void this.browserUseService.resumeHitlRequest(hitlRequest).catch((error) => {
         console.error("[browser-use] Failed to resume HITL request:", error);
       });
-    } else if (this.wasAgentPrompt(completed.id)) {
+    } else if (completed.resumeAgentAfter === true || this.wasAgentPrompt(completed.id)) {
+      continuation = { resumed: true, target: "agent", status: "queued" };
       void this.continueAfterPromptResponse(completed).catch((error) => {
         console.error("[agent] Failed to continue after prompt response:", error);
       });
     }
 
-    return { prompt: completed, memoryEntry };
+    return continuation ? { prompt: completed, memoryEntry, continuation } : { prompt: completed, memoryEntry };
   }
 
   private wasAgentPrompt(promptId: string): boolean {
     return this.database.listTranscriptEntries().some((entry) => {
-      if (entry.kind !== "tool" || entry.toolName !== "request_user_input") {
+      if (entry.kind !== "tool" || (entry.toolName !== "request_user_input" && entry.toolName !== "present_options")) {
         return false;
       }
 
@@ -1665,31 +1813,124 @@ export class SodiumApp {
         return true;
       }
 
-      const result =
+      let result: Record<string, unknown> | null =
         typeof metadata.result === "object" && metadata.result !== null
           ? (metadata.result as Record<string, unknown>)
           : null;
+      if (result === null && typeof metadata.result === "string") {
+        try {
+          const parsed = JSON.parse(metadata.result) as unknown;
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            result = parsed as Record<string, unknown>;
+          }
+        } catch {
+          result = null;
+        }
+      }
       return result?.promptId === promptId;
     });
   }
 
   private async continueAfterPromptResponse(prompt: { title: string; memoryKey: string }): Promise<void> {
-    const result = await this.agentHarness.collectTurn({
-      message: `The user completed the "${prompt.title}" form. Read memory "${prompt.memoryKey}" and continue the pending task.`,
-      source: "dashboard",
+    const resumeStarted = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "system",
+      text: `Resuming agent after "${prompt.title}" was submitted.`,
+      toolName: "prompt-hook",
+      toolStatus: "started",
+      metadata: {
+        promptTitle: prompt.title,
+        memoryKey: prompt.memoryKey,
+        trigger: "prompt-response",
+      },
     });
+    this.transcriptBus.publish("tool", resumeStarted);
+    this.enterConversationMode();
 
-    if (result.text.trim()) {
-      const robotEntry = this.database.createTranscriptEntry({
-        kind: "message",
-        role: "robot",
-        text: result.text,
+    try {
+      const result = await this.agentHarness.collectTurn({
+        message: `The user completed the "${prompt.title}" form. Read memory "${prompt.memoryKey}" and continue the pending task.`,
+        source: "voice",
+        continuationAfterPrompt: true,
+        onSpeakChunk: async (chunk) => {
+          if (this.interactionOwner === "conversation") {
+            this.setInteractionPhase("conversation", "agent_speaking");
+          }
+          await this.speakReplyText(chunk, "voice");
+          await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
+        },
       });
-      this.transcriptBus.publish("transcript", robotEntry);
-    }
+      this.syncPauseOutputFromAgentResult(result);
 
-    if (result.kind === "end_conversation") {
-      await this.archiveAndResetConversation();
+      if (result.text.trim()) {
+        const robotEntry = this.database.createTranscriptEntry({
+          kind: "message",
+          role: "robot",
+          text: result.text,
+        });
+        this.transcriptBus.publish("transcript", robotEntry);
+
+        const shouldSpeakAloud =
+          result.kind === "text" || result.kind === "browser_task" || result.kind === "end_conversation";
+        if (shouldSpeakAloud && !result.playbackAlreadyDone) {
+          this.isSpeaking = true;
+          try {
+            if (this.interactionOwner === "conversation") {
+              this.setInteractionPhase("conversation", "agent_speaking");
+            }
+            await this.speakReplyText(result.text, "voice");
+          } catch (err) {
+            console.error("[prompt-hook] TTS failed:", err);
+          } finally {
+            await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
+            this.isSpeaking = false;
+          }
+        }
+      }
+
+      const resumeCompleted = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Prompt hook completed for "${prompt.title}".`,
+        toolName: "prompt-hook",
+        toolStatus: "completed",
+        metadata: {
+          promptTitle: prompt.title,
+          memoryKey: prompt.memoryKey,
+          trigger: "prompt-response",
+          resultKind: result.kind,
+        },
+      });
+      this.transcriptBus.publish("tool", resumeCompleted);
+
+      // Never archive on prompt-hook completion: end_conversation here often means "task segment done"
+      // but the user may still be in a voice session; archiving wipes the transcript they expect to continue.
+      if (result.kind === "end_conversation") {
+        console.log("[prompt-hook] Model returned end_conversation — keeping transcript and voice session (no archive).");
+      } else {
+        if (this.conversationWaitingForExternalOutput()) {
+          this.resetConversationTimerWhileWaiting();
+        } else {
+          this.resetConversationTimer();
+        }
+        void this.runConversationTurn();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const resumeFailed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Prompt hook failed for "${prompt.title}": ${message}`,
+        toolName: "prompt-hook",
+        toolStatus: "failed",
+        metadata: {
+          promptTitle: prompt.title,
+          memoryKey: prompt.memoryKey,
+          trigger: "prompt-response",
+        },
+      });
+      this.transcriptBus.publish("tool", resumeFailed);
+      throw error;
     }
   }
 
@@ -1848,7 +2089,9 @@ export class SodiumApp {
         metadata: { recapWindowMinutes: snapshot.windowMinutes, recapItems: snapshot.items.length },
       });
       this.transcriptBus.publish("transcript", robotEntry);
-      return { kind: "text", text: recap };
+      const recapResult: AgentTurnResult = { kind: "text", text: recap };
+      this.syncPauseOutputFromAgentResult(recapResult);
+      return recapResult;
     }
 
     const crisisResult = await this.handleCrisisTurn(payload);
@@ -1861,10 +2104,12 @@ export class SodiumApp {
         });
         this.transcriptBus.publish("transcript", robotEntry);
       }
+      this.syncPauseOutputFromAgentResult(crisisResult);
       return crisisResult;
     }
 
     const result = await this.agentHarness.collectTurn(payload);
+    this.syncPauseOutputFromAgentResult(result);
     if (result.text.trim()) {
       const robotEntry = this.database.createTranscriptEntry({
         kind: "message",
@@ -1881,15 +2126,146 @@ export class SodiumApp {
   }
 
   private readPrimaryFamilyContact(): { fullName: string; relationship: string; phoneNumber: string } | null {
-    const contactMemory = this.database.readMemory(FAMILY_CONTACT_MEMORY_KEY);
-    const contactData = contactMemory?.data;
-    const fullName = typeof contactData?.full_name === "string" ? contactData.full_name.trim() : "";
-    const relationship = typeof contactData?.relationship === "string" ? contactData.relationship.trim() : "";
-    const phoneNumber = typeof contactData?.phone_number === "string" ? contactData.phone_number.trim() : "";
-    if (!fullName || !relationship || !phoneNumber) {
-      return null;
+    // const contactMemory = this.database.readMemory(FAMILY_CONTACT_MEMORY_KEY);
+    // const contactData = contactMemory?.data;
+    // const fullName = typeof contactData?.full_name === "string" ? contactData.full_name.trim() : "";
+    // const relationship = typeof contactData?.relationship === "string" ? contactData.relationship.trim() : "";
+    // const phoneNumber = typeof contactData?.phone_number === "string" ? contactData.phone_number.trim() : "";
+    // if (!fullName || !relationship || !phoneNumber) {
+    //   return null;
+    // }
+    // return { fullName, relationship, phoneNumber };
+    return { fullName: "Nikhil David", relationship: "Mother", phoneNumber: "+19258194040" };
+  }
+
+  /** Any non-manual crisis call completed within the cooldown window (keyword or agent-initiated). */
+  private findRecentGlobalEmergencyCall(): boolean {
+    const thresholdMs = this.config.crisis.callCooldownSeconds * 1000;
+    const now = Date.now();
+    const entries = this.database.listTranscriptEntries();
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry) {
+        continue;
+      }
+      if (entry.kind !== "tool" || entry.toolName !== "crisis-escalation" || entry.toolStatus !== "completed") {
+        continue;
+      }
+      if (entry.metadata?.manualTrigger === true) {
+        continue;
+      }
+      const timestampMs = Date.parse(entry.timestamp);
+      if (Number.isNaN(timestampMs) || now - timestampMs > thresholdMs) {
+        continue;
+      }
+      return true;
     }
-    return { fullName, relationship, phoneNumber };
+    return false;
+  }
+
+  private async runAgentEmergencyFamilyCall(reason: string): Promise<{ ok: boolean; message: string; callId?: string }> {
+    if (!this.config.crisis.enabled) {
+      return { ok: false, message: "Emergency family calling is disabled on this server." };
+    }
+
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) {
+      return { ok: false, message: "A brief reason is required." };
+    }
+
+    if (this.findRecentGlobalEmergencyCall()) {
+      return {
+        ok: false,
+        message: "A family call was already placed recently; wait before trying again.",
+      };
+    }
+
+    const contact = this.readPrimaryFamilyContact();
+    if (!contact) {
+      this.ensureFamilyContactPrompt();
+      return {
+        ok: false,
+        message: "No primary family contact is saved. Ask the user to add one in Requested Info.",
+      };
+    }
+
+    if (!this.blandService.isConfigured()) {
+      return {
+        ok: false,
+        message: "The calling service is not configured (missing BLAND_API_KEY).",
+      };
+    }
+
+    const { fullName, relationship, phoneNumber } = contact;
+
+    const started = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "system",
+      text: "Calling tool: crisis-escalation (agent-initiated)",
+      toolName: "crisis-escalation",
+      toolStatus: "started",
+      metadata: {
+        agentInitiated: true,
+        agentReason: trimmedReason,
+      },
+    });
+    this.transcriptBus.publish("tool", started);
+
+    try {
+      const requestData = buildEmergencyBlandRequestData(this.database, {
+        relationship,
+        callReason: trimmedReason,
+        source: "agent",
+        setAgentReasonAlias: true,
+      });
+      const blandCall = await this.blandService.placePathwayCall({
+        phoneNumber,
+        requestData,
+      });
+      const completed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Tool crisis-escalation completed (agent-initiated)",
+        toolName: "crisis-escalation",
+        toolStatus: "completed",
+        metadata: {
+          agentInitiated: true,
+          agentReason: trimmedReason,
+          targetName: fullName,
+          relationship,
+          targetPhoneRedacted: redactPhoneNumber(phoneNumber),
+          blandCallId: blandCall.callId,
+          recentActivityIncluded: Boolean(requestData.recent_activity),
+        },
+      });
+      this.transcriptBus.publish("tool", completed);
+      return {
+        ok: true,
+        message: "Placed the family wellness call via Bland.",
+        callId: blandCall.callId,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Tool crisis-escalation failed: ${message}`,
+        toolName: "crisis-escalation",
+        toolStatus: "failed",
+        metadata: {
+          agentInitiated: true,
+          agentReason: trimmedReason,
+          targetName: fullName,
+          targetPhoneRedacted: redactPhoneNumber(phoneNumber),
+          failureReason: message,
+        },
+      });
+      this.transcriptBus.publish("tool", failed);
+      return {
+        ok: false,
+        message,
+      };
+    }
   }
 
   private findRecentManualEmergencyCall(): boolean {
@@ -1957,12 +2333,14 @@ export class SodiumApp {
     this.transcriptBus.publish("tool", started);
 
     try {
-      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 18 });
-      const recentActivity =
-        formatRecentActivityForBland(snapshot) ?? summarizeRecentActivity(this.database.listTranscriptEntries());
+      const requestData = buildEmergencyBlandRequestData(this.database, {
+        relationship: contact.relationship,
+        callReason: "Guardian requested an emergency wellness call from the family contact button.",
+        source: "guardian",
+      });
       const blandCall = await this.blandService.placePathwayCall({
         phoneNumber: contact.phoneNumber,
-        requestData: emergencyCallRequestData(contact.relationship, recentActivity),
+        requestData,
       });
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
@@ -1976,7 +2354,7 @@ export class SodiumApp {
           relationship: contact.relationship,
           targetPhoneRedacted: redactPhoneNumber(contact.phoneNumber),
           blandCallId: blandCall.callId,
-          recentActivityIncluded: Boolean(recentActivity),
+          recentActivityIncluded: Boolean(requestData.recent_activity),
         },
       });
       this.transcriptBus.publish("tool", completed);
@@ -2018,6 +2396,16 @@ export class SodiumApp {
     const detection = detectCrisis(payload.message);
     if (!detection.triggered) {
       return null;
+    }
+
+    if (this.findRecentGlobalEmergencyCall()) {
+      return {
+        kind: "text",
+        text:
+          payload.source === "voice"
+            ? "I already contacted your family. Stay with me."
+            : "Crisis escalation already triggered recently for this request.",
+      };
     }
 
     const duplicate = this.findRecentCrisisEscalation(detection.normalizedMessage);
@@ -2092,11 +2480,14 @@ export class SodiumApp {
     }
 
     try {
-      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 18 });
-      const recentActivity = formatRecentActivityForBland(snapshot);
+      const requestData = buildEmergencyBlandRequestData(this.database, {
+        relationship,
+        callReason: buildKeywordCallReason(payload.message, detection.matchedPhrases),
+        source: "keyword",
+      });
       const blandCall = await this.blandService.placePathwayCall({
         phoneNumber,
-        requestData: emergencyCallRequestData(relationship, recentActivity),
+        requestData,
       });
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
@@ -2111,7 +2502,7 @@ export class SodiumApp {
           targetPhoneRedacted: redactPhoneNumber(phoneNumber),
           blandCallId: blandCall.callId,
           normalizedMessage: detection.normalizedMessage,
-          recentActivityIncluded: Boolean(recentActivity),
+          recentActivityIncluded: Boolean(requestData.recent_activity),
         },
       });
       this.transcriptBus.publish("tool", completed);
@@ -2210,8 +2601,10 @@ export class SodiumApp {
       await Bun.sleep(50);
     }
 
+    let resumeVoiceAfterReminder = false;
     try {
       this.setInteractionPhase("reminder", "agent_thinking");
+      this.enterConversationMode();
       const result = await this.executeRecordedTurn(
         {
           message: prompt,
@@ -2225,6 +2618,8 @@ export class SodiumApp {
         this.setInteractionPhase("reminder", "agent_speaking");
         await this.speakReplyText(result.text, "reminder");
       }
+
+      resumeVoiceAfterReminder = result.kind !== "end_conversation";
 
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
@@ -2259,11 +2654,19 @@ export class SodiumApp {
     } finally {
       this.releaseInteraction("reminder");
     }
+    if (resumeVoiceAfterReminder) {
+      if (this.conversationWaitingForExternalOutput()) {
+        this.resetConversationTimerWhileWaiting();
+      } else {
+        this.resetConversationTimer();
+      }
+      void this.runConversationTurn();
+    }
   }
 
   private async speakReplyText(text: string, source: "voice" | "reminder"): Promise<void> {
     const ttsStartedAt = Date.now();
-    const audioOut = await this.ttsService.synthesize(text);
+    const audioOut = await this.ttsService.synthesize(decodeJsonStyleUnicodeEscapes(text));
     console.log(
       `[${source === "voice" ? "conversation" : "reminder"}] TTS done          +${((Date.now() - ttsStartedAt) / 1000).toFixed(1)}s`,
     );

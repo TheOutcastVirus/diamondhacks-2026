@@ -44,7 +44,7 @@
     if (field.type === 'date') {
       return 'date';
     }
-    if (field.type === 'int' || field.type === 'float') {
+    if (field.type === 'number' || field.type === 'int' || field.type === 'float') {
       return 'number';
     }
     if (isPhoneField(field)) {
@@ -66,7 +66,7 @@
       return false;
     }
 
-    if (field.type === 'int' || field.type === 'float') {
+    if (field.type === 'number' || field.type === 'int' || field.type === 'float') {
       return '';
     }
 
@@ -98,6 +98,7 @@
       label: String(value.label ?? value.name ?? `Field ${index + 1}`),
       type:
         value.type === 'text' ||
+        value.type === 'number' ||
         value.type === 'int' ||
         value.type === 'float' ||
         value.type === 'boolean' ||
@@ -394,14 +395,28 @@
 
     try {
       const response = formValues[prompt.id] ?? {};
-      const payload = await post<{ memoryEntry?: UserMemoryEntry }>(
+      const payload = await post<{
+        memoryEntry?: UserMemoryEntry;
+        continuation?: {
+          resumed?: boolean;
+          target?: 'agent' | 'browser-use';
+          status?: 'queued';
+        };
+      }>(
         `/api/prompts/${encodeURIComponent(prompt.id)}/respond`,
         { response },
       );
       if (payload.memoryEntry?.title) {
         selectedMemoryTitle = payload.memoryEntry.title;
       }
-      setFeedback(prompt.id, 'success', 'Information saved to memory.');
+      const continuation = payload.continuation;
+      const successMessage =
+        continuation?.resumed && continuation.target === 'browser-use'
+          ? 'Information saved. Resuming the browser task now.'
+          : continuation?.resumed
+            ? 'Information saved. Resuming the agent now.'
+            : 'Information saved to memory.';
+      setFeedback(prompt.id, 'success', successMessage);
       await loadRequestedInfo();
     } catch (error) {
       setFeedback(prompt.id, 'error', error instanceof Error ? error.message : 'Unable to save information.');

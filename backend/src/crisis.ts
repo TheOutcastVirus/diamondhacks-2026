@@ -93,6 +93,6 @@ export function detectCrisis(message: string): CrisisDetectionResult {
     reason: "high-confidence distress phrase detected",
     severity: "high",
     normalizedMessage,
-    matchedPhrases: [...new Set([...distressMatches, ...actionMatches])],
+    matchedPhrases: [...new Set([...distressMatches, ...actionMatches, ...immediateDistressMatches])],
   };
 }

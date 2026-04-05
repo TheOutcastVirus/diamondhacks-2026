@@ -251,8 +251,14 @@
     source.addEventListener('state', (event) => {
       try {
         const payload = JSON.parse((event as MessageEvent<string>).data) as { conversationState?: string };
-        if (payload.conversationState === 'conversation' || payload.conversationState === 'idle') {
-          conversationState = payload.conversationState;
+        const s = payload.conversationState;
+        if (
+          s === 'idle' ||
+          s === 'speaking' ||
+          s === 'listening' ||
+          s === 'waiting'
+        ) {
+          conversationState = s;
         }
       } catch {
         // ignore malformed state events
@@ -319,10 +325,16 @@
       </div>
 
       <div class="toolbar-right">
-        {#if conversationState === 'conversation'}
-          <div class="convo-badge" role="status" aria-live="polite">
+        {#if conversationState !== 'idle'}
+          <div class="convo-badge" role="status" aria-live="polite" data-convo-state={conversationState}>
             <span class="convo-dot" aria-hidden="true"></span>
-            Listening…
+            {#if conversationState === 'speaking'}
+              Speaking…
+            {:else if conversationState === 'waiting'}
+              Waiting for input…
+            {:else}
+              Listening…
+            {/if}
           </div>
         {/if}
         <button

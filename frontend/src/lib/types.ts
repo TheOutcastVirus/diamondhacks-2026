@@ -1,5 +1,5 @@
 export type ThemeMode = 'light' | 'dark';
-export type ConversationState = 'idle' | 'conversation';
+export type ConversationState = 'idle' | 'speaking' | 'listening' | 'waiting';
 export type RecordingState = 'idle' | 'recording' | 'processing';
 export type AgentModel = 'cerebras' | 'gemini-fast';
 export type PageId = 'reminders' | 'transcription' | 'browser' | 'requested-info';
@@ -79,8 +79,9 @@ export type BrowserContext = {
 };
 
 export type PromptFieldType =
-  | 'string'
   | 'text'
+  | 'number'
+  | 'string'
   | 'int'
   | 'float'
   | 'boolean'

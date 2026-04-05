@@ -412,6 +412,10 @@ export class BrowserUseService {
   ) {}
 
   close(): void {
+    this.cancelActiveRun();
+  }
+
+  cancelActiveRun(): void {
     this.browserRunAbort?.abort();
     this.browserRunAbort = null;
     this.activeBrowserSessionId = null;
@@ -612,12 +616,15 @@ export class BrowserUseService {
     input: { browserSessionId: string; task: string },
     message: string,
   ): void {
-    this.database.updateBrowserSession({
+    const updated = this.database.updateBrowserSession({
       browserSessionId: input.browserSessionId,
       status: "blocked",
       summary: message,
       activeTask: input.task,
     });
+    if (!updated) {
+      return;
+    }
     this.database.appendBrowserAction({
       browserSessionId: input.browserSessionId,
       kind: "error",
@@ -1425,10 +1432,21 @@ export class BrowserUseService {
     }
     if (needKind === "confirmation") {
       const confirmation = this.database.readMemory("browser_confirmation")?.data;
-      if (confirmation && typeof confirmation.confirm === "boolean") {
-        return confirmation.confirm
-          ? "Continue from where you left off. The user confirmed you should proceed and submit the order."
-          : "Do not place the order. The user declined to confirm checkout.";
+      const raw = confirmation?.confirm;
+      const approved =
+        typeof raw === "boolean"
+          ? raw
+          : typeof raw === "string" && /^(yes|y|true|1|confirm|ok|proceed)\s*$/i.test(raw.trim());
+      const declined =
+        raw === false ||
+        (typeof raw === "string" && /^(no|n|false|0|stop|cancel)\s*$/i.test(String(raw).trim()));
+      if (typeof raw === "boolean" || (typeof raw === "string" && raw.trim())) {
+        if (approved && !declined) {
+          return "Continue from where you left off. The user confirmed you should proceed and submit the order.";
+        }
+        if (declined && !approved) {
+          return "Do not place the order. The user declined to confirm checkout.";
+        }
       }
       return "";
     }
@@ -1456,25 +1474,25 @@ export class BrowserUseService {
 
   private buildPaymentPromptFields(): PromptField[] {
     return [
-      { name: "cardholder_name", label: "Cardholder Name", type: "string", required: true },
-      { name: "card_number", label: "Card Number", type: "password", required: true },
-      { name: "exp_month", label: "Expiry Month (MM)", type: "string", required: true },
-      { name: "exp_year", label: "Expiry Year (YYYY)", type: "string", required: true },
-      { name: "cvv", label: "Security Code (CVV)", type: "password", required: true },
-      { name: "billing_zip", label: "Billing ZIP Code", type: "string", required: false },
+      { name: "cardholder_name", label: "Cardholder Name", type: "text", required: true },
+      { name: "card_number", label: "Card Number", type: "text", required: true },
+      { name: "exp_month", label: "Expiry Month (MM)", type: "text", required: true },
+      { name: "exp_year", label: "Expiry Year (YYYY)", type: "text", required: true },
+      { name: "cvv", label: "Security Code (CVV)", type: "text", required: true },
+      { name: "billing_zip", label: "Billing ZIP Code", type: "text", required: false },
     ];
   }
 
   private buildAddressPromptFields(): PromptField[] {
     return [
-      { name: "full_name", label: "Full Name", type: "string", required: true },
-      { name: "line_1", label: "Address Line 1", type: "string", required: true },
-      { name: "line_2", label: "Address Line 2", type: "string", required: false },
-      { name: "city", label: "City", type: "string", required: true },
-      { name: "state_or_region", label: "State", type: "string", required: true },
-      { name: "postal_code", label: "ZIP Code", type: "string", required: true },
-      { name: "country", label: "Country", type: "string", required: false, defaultValue: "US" },
-      { name: "phone_number", label: "Phone Number", type: "string", required: false },
+      { name: "full_name", label: "Full Name", type: "text", required: true },
+      { name: "line_1", label: "Address Line 1", type: "text", required: true },
+      { name: "line_2", label: "Address Line 2", type: "text", required: false },
+      { name: "city", label: "City", type: "text", required: true },
+      { name: "state_or_region", label: "State", type: "text", required: true },
+      { name: "postal_code", label: "ZIP Code", type: "text", required: true },
+      { name: "country", label: "Country", type: "text", required: false, defaultValue: "US" },
+      { name: "phone_number", label: "Phone Number", type: "text", required: false },
     ];
   }
 
@@ -1482,10 +1500,10 @@ export class BrowserUseService {
     return [
       {
         name: "confirm",
-        label: "Proceed With Checkout",
-        type: "boolean",
+        label: 'Type "yes" to proceed with checkout',
+        type: "text",
         required: true,
-        description: "Allow the browser agent to place or submit the order.",
+        description: "Type yes to allow the browser agent to place or submit the order.",
       },
     ];
   }

@@ -8,6 +8,9 @@ export type BrowserActionStatus = "pending" | "completed" | "failed";
 export type AgentSource = "voice" | "dashboard" | "resident" | "guardian";
 export type AgentModel = "cerebras" | "gemini-fast";
 
+/** SSE + UI: agent posture during an interaction (idle = no live session). */
+export type ConversationDisplayState = "idle" | "speaking" | "listening" | "waiting";
+
 export type Reminder = {
   id: string;
   title: string;
@@ -85,6 +88,13 @@ export type AgentTurnRequest = {
   profileId?: string;
   forceBrowser?: boolean;
   model?: AgentModel;
+  /** Internal: user submitted a dashboard form; agent should reply via speak once, no duplication. */
+  continuationAfterPrompt?: boolean;
+  /**
+   * Voice only: speak each new speak() batch before the next model step (ToolLoopAgent step).
+   * When set, collectTurn sets playbackAlreadyDone when all phrases were played via this callback.
+   */
+  onSpeakChunk?: (text: string) => Promise<void>;
 };
 
 export type AgentTurnResponse =
@@ -112,8 +122,9 @@ export type UserMemoryEntry = {
 };
 
 export type PromptFieldType =
-  | "string"
   | "text"
+  | "number"
+  | "string"
   | "int"
   | "float"
   | "boolean"
@@ -170,6 +181,8 @@ export type UserPrompt = {
   memoryLabel: string;
   status: PromptStatus;
   createdAt: string;
+  /** When true, submitting this prompt should run another agent turn (dashboard hook). */
+  resumeAgentAfter?: boolean;
   response?: Record<string, unknown>;
   respondedAt?: string;
 };

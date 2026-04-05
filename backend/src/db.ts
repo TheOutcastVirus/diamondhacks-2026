@@ -106,6 +106,7 @@ type UserPromptRow = {
   response_json: string | null;
   created_at: string;
   responded_at: string | null;
+  resume_agent_after?: number | null;
 };
 
 type UserMemoryRow = {
@@ -420,6 +421,10 @@ function serializePrompt(row: UserPromptRow): UserPrompt {
   if (row.responded_at) {
     prompt.respondedAt = row.responded_at;
   }
+  const resumeRaw = (row as UserPromptRow).resume_agent_after;
+  if (resumeRaw === 1) {
+    prompt.resumeAgentAfter = true;
+  }
   return prompt;
 }
 
@@ -676,6 +681,7 @@ export class SodiumDatabase {
     this.ensureColumn("user_memory", "data_json", "TEXT");
     this.ensureColumn("user_prompts", "memory_key", "TEXT");
     this.ensureColumn("user_prompts", "memory_label", "TEXT");
+    this.ensureColumn("user_prompts", "resume_agent_after", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("reminders", "attachments_json", "TEXT");
   }
 
@@ -1013,12 +1019,12 @@ export class SodiumDatabase {
     previewUrl?: string;
     screenshotUrl?: string;
     domSnippet?: string;
-  }): void {
+  }): boolean {
     const existing = this.database
       .query("SELECT * FROM browser_sessions WHERE id = ?1")
       .get(input.browserSessionId) as BrowserSessionRow | null;
     if (!existing) {
-      throw new Error(`Unknown browser session: ${input.browserSessionId}`);
+      return false;
     }
 
     const row: BrowserSessionRow = {
@@ -1071,6 +1077,8 @@ export class SodiumDatabase {
         row.dom_snippet,
         row.last_updated,
       );
+
+    return true;
   }
 
   appendBrowserAction(input: {
@@ -1078,7 +1086,14 @@ export class SodiumDatabase {
     kind: string;
     detail: string;
     status?: BrowserActionStatus;
-  }): BrowserAction {
+  }): BrowserAction | null {
+    const session = this.database
+      .query("SELECT id FROM browser_sessions WHERE id = ?1")
+      .get(input.browserSessionId) as { id: string } | null;
+    if (!session) {
+      return null;
+    }
+
     const row: BrowserActionRow = {
       id: prefixedId("a"),
       session_id: input.browserSessionId,
@@ -1483,19 +1498,31 @@ export class SodiumDatabase {
     fields: PromptField[];
     memoryKey?: string;
     memoryLabel?: string;
+    /** When true, app should run an agent turn after the user submits this prompt. */
+    resumeAgentAfter?: boolean;
   }): UserPrompt {
     const id = prefixedId("p");
     const createdAt = nowIso();
     const memoryKey = slugifyKey(input.memoryKey ?? input.title);
     const memoryLabel = input.memoryLabel?.trim() || input.title.trim();
+    const resumeAgentAfter = input.resumeAgentAfter === true ? 1 : 0;
     this.database
       .query(
         `INSERT INTO user_prompts (
-           id, title, description, memory_key, memory_label, fields_json, status, response_json, created_at, responded_at
+           id, title, description, memory_key, memory_label, fields_json, status, response_json, created_at, responded_at, resume_agent_after
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, NULL)`,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, NULL, ?8)`,
       )
-      .run(id, input.title, input.description ?? null, memoryKey, memoryLabel, JSON.stringify(input.fields), createdAt);
+      .run(
+        id,
+        input.title,
+        input.description ?? null,
+        memoryKey,
+        memoryLabel,
+        JSON.stringify(input.fields),
+        createdAt,
+        resumeAgentAfter,
+      );
     const prompt: UserPrompt = {
       id,
       title: input.title,
@@ -1506,6 +1533,9 @@ export class SodiumDatabase {
       createdAt,
     };
     if (input.description) prompt.description = input.description;
+    if (input.resumeAgentAfter === true) {
+      prompt.resumeAgentAfter = true;
+    }
     return prompt;
   }
 

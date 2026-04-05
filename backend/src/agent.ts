@@ -19,11 +19,22 @@ import type { SodiumDatabase } from "./db";
 import type { UploadedFileService } from "./files";
 import type { TranscriptEventBus } from "./transcript-bus";
 import { buildRecentActivitySnapshot } from "./activity";
+import { decodeJsonStyleUnicodeEscapes } from "./text-normalize";
 
 export type AgentTurnResult =
-  | { kind: "text"; text: string }
-  | { kind: "browser_task"; text: string; browserSessionId: string; previewUrl: string | null }
-  | { kind: "end_conversation"; text: string };
+  | { kind: "text"; text: string; pauseRequested?: boolean; playbackAlreadyDone?: boolean }
+  | {
+      kind: "browser_task";
+      text: string;
+      browserSessionId: string;
+      previewUrl: string | null;
+      playbackAlreadyDone?: boolean;
+    }
+  | { kind: "end_conversation"; text: string; playbackAlreadyDone?: boolean };
+
+export type EmergencyFamilyCallHandler = (input: {
+  reason: string;
+}) => Promise<{ ok: boolean; message: string; callId?: string }>;
 
 type BrowserTaskInfo = {
   browserSessionId: string;
@@ -239,31 +250,6 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "present_options",
-      description:
-        'Present a numbered list of options to the user and wait for their choice. Use when the user needs to pick from multiple products, restaurants, search results, or any list of choices. The options appear as a selectable list on the frontend AND are spoken aloud for voice users. The user can respond by voice (saying the number or name) or by tapping on screen. After the user picks, the selection is saved to memory under the given memory_key.',
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "Title shown to the user, e.g. 'Which chips would you like?'" },
-          description: { type: "string", description: "Optional context about the options" },
-          options_json: {
-            type: "string",
-            description:
-              'JSON array of option objects. Each: {"label":"Display name","value":"unique_id","detail":"optional price or description"}. Example: [{"label":"Lay\'s Classic","value":"lays_classic","detail":"$3.49"},{"label":"Doritos Nacho","value":"doritos_nacho","detail":"$4.29"}]',
-          },
-          memory_key: {
-            type: "string",
-            description: "Memory key to store the selection under, e.g. 'pending_shop_choice'",
-          },
-        },
-        required: ["title", "options_json"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "end_conversation",
       description:
         "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
@@ -416,27 +402,39 @@ const WRITE_MEMORY_SCHEMA = z.object({
 
 const END_CONVERSATION_SCHEMA = EMPTY_OBJECT_SCHEMA;
 
-const REQUEST_USER_INPUT_SCHEMA = z.object({
-  title: z.string().min(1).describe("Form title shown to the user."),
-  description: z.string().optional().describe("Explain why the information is needed."),
-  memory_key: z.string().optional().describe("Structured memory key where the response should be stored."),
-  memory_label: z.string().optional().describe("Human-friendly label for the saved memory."),
-  fields_json: z.string().min(2).describe("JSON array string defining the prompt fields."),
-  fields: z.string().optional().describe("Optional JSON array string defining the prompt fields."),
+const REQUEST_USER_INPUT_FIELD_SCHEMA = z.object({
+  name: z.string().min(1).describe("Snake_case key stored in structured memory."),
+  label: z.string().min(1).describe("Label shown next to the input."),
+  type: z.enum(["text", "number"]).describe('Input kind: "text" or "number" only.'),
+  required: z.boolean().optional().describe("Whether the user must fill this field."),
 });
 
-const PRESENT_OPTIONS_SCHEMA = z.object({
-  title: z.string().min(1).describe("Title shown to the user, e.g. Which item would you like?"),
-  description: z.string().optional().describe("Optional context about the options."),
-  options_json: z
+const REQUEST_USER_INPUT_SCHEMA = z
+  .object({
+    title: z.string().min(1).describe("Form title shown to the user."),
+    description: z.string().optional().describe("Explain why the information is needed."),
+    memory_key: z.string().optional().describe("Structured memory key where the response should be stored."),
+    memory_label: z.string().optional().describe("Human-friendly label for the saved memory."),
+    fields: z.array(REQUEST_USER_INPUT_FIELD_SCHEMA).optional().describe("Form fields (preferred)."),
+    fields_json: z.string().optional().describe("Legacy: JSON array string of fields (same shape as fields)."),
+  })
+  .refine(
+    (data) =>
+      (data.fields != null && data.fields.length > 0) ||
+      (data.fields_json != null && data.fields_json.trim().length >= 2),
+    { message: "Provide fields (array) or fields_json with at least one field." },
+  );
+
+const CALL_FAMILY_EMERGENCY_SCHEMA = z.object({
+  reason: z
     .string()
-    .min(2)
-    .describe('JSON array of {label, value, detail?} for each selectable option.'),
-  memory_key: z
-    .string()
-    .optional()
-    .describe("Memory key for the pending choice; defaults to pending_shop_choice."),
+    .min(1)
+    .describe(
+      "Brief factual reason the resident may need help (e.g. chest pain, severe confusion, fall, explicit request for family). Used for the outbound call context.",
+    ),
 });
+
+
 
 function safeParseJsonObject(raw: unknown): Record<string, unknown> | undefined {
   if (raw === undefined || raw === null) {
@@ -470,6 +468,34 @@ function safeParseJsonArray(raw: unknown): unknown[] | undefined {
   }
 
   return undefined;
+}
+
+/** request_user_input: only plain text and numeric fields (no files, selects, etc.). */
+function normalizeAgentPromptFields(raw: unknown): PromptField[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw.map((item, index) => {
+    if (typeof item !== "object" || item === null) {
+      throw new Error(`request_user_input.fields[${index}] must be an object.`);
+    }
+    const rec = item as Record<string, unknown>;
+    const name = String(rec.name ?? "").trim();
+    const label = String(rec.label ?? "").trim();
+    if (!name || !label) {
+      throw new Error(`request_user_input.fields[${index}] must include non-empty name and label.`);
+    }
+    const t = String(rec.type ?? "text").toLowerCase();
+    const type: PromptField["type"] =
+      t === "number" || t === "int" || t === "float" ? "number" : "text";
+    return {
+      name,
+      label,
+      type,
+      required: Boolean(rec.required),
+    };
+  });
 }
 
 function unwrapJsonEncodedText(content: string): string {
@@ -621,6 +647,7 @@ export class AgentHarness {
     private readonly browserUseService: BrowserUseService,
     private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
+    private readonly emergencyFamilyCallHandler?: EmergencyFamilyCallHandler,
   ) {
     this.cerebrasProvider = createOpenAICompatible({
       name: "cerebras",
@@ -683,8 +710,13 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "This is a VOICE interaction. Your reply will be spoken aloud automatically. Default to one short sentence. Never exceed two short sentences unless the user explicitly asks for more detail. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
-        : "This is a dashboard interaction. Keep replies extremely short by default. Use one short sentence unless the user explicitly asks for more detail.";
+        ? "Interaction from: voice."
+        : "Interaction from: dashboard.";
+
+    const promptContinuationNote =
+      request.source === "voice" && request.continuationAfterPrompt
+        ? "This turn is right after the user submitted a form you requested. Reply with a single speak call: one short confirmation. Do not repeat the same sentence twice. Do not rely on plain assistant text for anything the user should hear."
+        : "";
 
     const browserState = request.forceBrowser
       ? "Browser request: the user explicitly requested browser automation for this turn."
@@ -693,12 +725,16 @@ export class AgentHarness {
     return [
         `You are Sodium. Your name is Sodium. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.`,
     `Be warm, calm, concise, and practical. Do not sound grandiose, theatrical, or overly chatty. If you are unsure, a clarification question. If you are still unsure, ask another. If you feel the conversation is going nowhere, research using the browser tool.`,
-      interactionStyle,
+        "Emergency: If the resident is in clear distress or explicitly asks you to call their family or emergency contact for help, use call_family_emergency after you speak brief reassurance. That tool places a phone call via Bland AI to the saved primary family contact. Do not use it for routine or non-urgent requests.",
+      "NEVER SAY ANYTHING THAT IS NEVER DIRECTLY BACKED BY CONTEXT (CITE FROM MEMORY, DOCUMENTS, TOOL CALL RESULTS. NEVER ASSUME.)",
+      voiceNote,
+      ...(promptContinuationNote ? [promptContinuationNote] : []),
       browserState,
       "Speech rule: the only user-visible spoken words you produce are the messages passed to the speak tool.",
       "Think about your response when outputing text. The only thing the user hears is the output from the speak tool.",
       "Reasoning rule: use a bit of reasoning before acting on anything complicated, but keep that reasoning private and express the user-facing result through tools.",
       "Clarification rule: if something important is ambiguous, ask the user directly instead of guessing or launching browser automation.",
+      "Form rule: request_user_input only accepts simple fields with type \"text\" or \"number\" (plus name, label, and required). No file uploads, dropdowns, or other field types.",
       "Cron rule: reminder schedules use exactly five cron fields in this order: minute hour day-of-month month day-of-week.",
         "Cron examples: '0 9 * * *' means every day at 9:00 AM. '30 19 * * 2' means every Tuesday at 7:30 PM. There is no seconds field.",
         `Response style:
@@ -860,7 +896,7 @@ export class AgentHarness {
         }
 
         case "speak": {
-          const message = String(args.message ?? "").trim();
+          const message = decodeJsonStyleUnicodeEscapes(String(args.message ?? "").trim());
           if (message) {
             runtime.spokenPhrases.push(message);
           }
@@ -871,6 +907,7 @@ export class AgentHarness {
         case "pause_until_output": {
           runtime.pauseRequested = true;
           result = { paused: true, reason: String(args.reason ?? "other") };
+          this.transcriptBus.publishState("waiting");
           break;
         }
 
@@ -1041,82 +1078,22 @@ export class AgentHarness {
         }
 
         case "end_conversation": {
-          runtime.endConversation = true;
+          // Defer flag so parallel tool calls in the same step still run speak() first (Promise.all order is not guaranteed).
+          queueMicrotask(() => {
+            runtime.endConversation = true;
+          });
           result = { ended: true };
           break;
         }
-
-        case "present_options": {
-          type OptionItem = { label: string; value: string; detail?: string };
-          let options: OptionItem[] = [];
-          try {
-            const rawOptions = args.options_json ?? "[]";
-            const parsed = JSON.parse(typeof rawOptions === "string" ? rawOptions : JSON.stringify(rawOptions));
-            options = Array.isArray(parsed) ? (parsed as OptionItem[]) : [];
-          } catch {
-            options = [];
-          }
-
-          if (options.length === 0) {
-            result = { error: "No options provided" };
-            break;
-          }
-
-          // Build select field for the frontend form
-          const selectField: PromptField = {
-            name: "chosen_option",
-            label: String(args.title ?? "Pick one"),
-            type: "select",
-            required: true,
-            options: options.map((opt, i) => ({
-              label: opt.detail ? `${i + 1}. ${opt.label} — ${opt.detail}` : `${i + 1}. ${opt.label}`,
-              value: opt.value,
-            })),
-          };
-
-          const memoryKey = typeof args.memory_key === "string" ? args.memory_key : "pending_shop_choice";
-          const promptInput: {
-            title: string;
-            fields: PromptField[];
-            description?: string;
-            memoryKey?: string;
-            memoryLabel?: string;
-          } = {
-            title: String(args.title ?? "Choose an option"),
-            fields: [selectField],
-            memoryKey,
-            memoryLabel: String(args.title ?? "User choice"),
-          };
-          if (typeof args.description === "string" && args.description.trim()) {
-            promptInput.description = args.description;
-          }
-          const prompt = this.database.createPrompt(promptInput);
-          this.transcriptBus.publishPrompt(prompt);
-
-          // Also save the full options list to memory so voice resolution can match
-          this.database.writeMemory(memoryKey, JSON.stringify(options, null, 2), {
-            data: { options, promptId: prompt.id, status: "pending" },
-          });
-
-          // Build a voice-friendly numbered list
-          const spokenList = options
-            .map((opt, i) => `${i + 1}: ${opt.label}${opt.detail ? `, ${opt.detail}` : ""}`)
-            .join(". ");
-
-          const spokenListFull = `Here are your options. ${spokenList}. Which one would you like?`;
-          runtime.optionsSpokenList = spokenListFull;
-          runtime.promptSent = true;
-          result = {
-            promptId: prompt.id,
-            status: "pending",
-            message: "Options sent to user.",
-            spokenList: spokenListFull,
-          };
-          break;
-        }
-
         case "request_user_input": {
-          const fields = (safeParseJsonArray(args.fields_json ?? args.fields) ?? []) as PromptField[];
+          const rawFields =
+            Array.isArray(args.fields) && args.fields.length > 0
+              ? args.fields
+              : (safeParseJsonArray(args.fields_json ?? args.fields) ?? []);
+          const fields = normalizeAgentPromptFields(rawFields);
+          if (fields.length === 0) {
+            throw new Error("request_user_input requires at least one field with name, label, and type text or number.");
+          }
           const promptInput: {
             title: string;
             fields: PromptField[];
@@ -1137,10 +1114,24 @@ export class AgentHarness {
             promptInput.memoryLabel = args.memory_label;
           }
 
-          const prompt = this.database.createPrompt(promptInput);
+          const prompt = this.database.createPrompt({ ...promptInput, resumeAgentAfter: true });
           this.transcriptBus.publishPrompt(prompt);
           runtime.promptSent = true;
+          this.transcriptBus.publishState("waiting");
           result = { promptId: prompt.id, status: "pending", message: "Form sent to user." };
+          break;
+        }
+
+        case "call_family_emergency": {
+          const parsed = CALL_FAMILY_EMERGENCY_SCHEMA.safeParse(args);
+          if (!parsed.success) {
+            throw new Error(parsed.error.message);
+          }
+          if (!this.emergencyFamilyCallHandler) {
+            result = { ok: false, message: "Emergency family calling is not configured for this deployment." };
+            break;
+          }
+          result = await this.emergencyFamilyCallHandler(parsed.data);
           break;
         }
 
@@ -1150,13 +1141,24 @@ export class AgentHarness {
         }
       }
 
+      const toolMetadata: Record<string, unknown> = { result };
+      if (
+        (name === "request_user_input") &&
+        typeof result === "object" &&
+        result !== null &&
+        "promptId" in result &&
+        typeof (result as { promptId?: unknown }).promptId === "string"
+      ) {
+        toolMetadata.promptId = (result as { promptId: string }).promptId;
+      }
+
       const doneEntry = this.database.createTranscriptEntry({
         kind: "tool",
         role: "system",
         text: `Tool ${name} completed`,
         toolName: name,
         toolStatus: "completed",
-        metadata: { result },
+        metadata: toolMetadata,
       });
       this.transcriptBus.publish("tool", doneEntry);
 
@@ -1187,7 +1189,7 @@ export class AgentHarness {
       stopWhen: [
         hasToolCall("pause_until_output"),
         hasToolCall("end_conversation"),
-        hasToolCall("present_options"),
+        hasToolCall("request_user_input"),
         stepCountIs(12),
       ],
       tools: {
@@ -1199,7 +1201,7 @@ export class AgentHarness {
         }),
         pause_until_output: tool({
           description:
-            "Pause this turn after you have already spoken. Use when background work continues elsewhere or when waiting for user-provided information.",
+            "Stop after you have already spoken. Use when the next step must come from another tool or system (browser task, form submission, reminder hook, etc.) — not from another voice turn. The session will not listen at the mic again until that output arrives. If you want the user to respond in-conversation, do NOT use this tool.",
           inputSchema: PAUSE_SCHEMA,
           execute: async (input) => this.executeToolByName("pause_until_output", input, runtime, request.profileId),
         }),
@@ -1272,25 +1274,40 @@ export class AgentHarness {
         }),
         request_user_input: tool({
           description:
-            "Send a structured form to the user to collect required information. Prefer discrete fields over free-form text.",
+            'Send a simple form to the dashboard: only "text" and "number" fields (name, label, type, required). No files, dropdowns, or other widgets.',
           inputSchema: REQUEST_USER_INPUT_SCHEMA,
           execute: async (input) => this.executeToolByName("request_user_input", input, runtime, request.profileId),
         }),
-        present_options: tool({
+        call_family_emergency: tool({
           description:
-            "Present numbered choices (screen dropdown + voice). Wait for the user's reply before ordering or run_browser_task.",
-          inputSchema: PRESENT_OPTIONS_SCHEMA,
-          execute: async (input) => this.executeToolByName("present_options", input, runtime, request.profileId),
+            "Place an urgent outbound phone call (Bland AI) to the household's saved primary family contact when the resident is in distress or explicitly needs family notified. ",
+          inputSchema: CALL_FAMILY_EMERGENCY_SCHEMA,
+          execute: async (input) => this.executeToolByName("call_family_emergency", input, runtime, request.profileId),
         }),
       },
     });
+  }
+
+  private textTurnResult(text: string, runtime: TurnRuntime): AgentTurnResult {
+    return {
+      kind: "text",
+      text,
+      ...(runtime.pauseRequested ? { pauseRequested: true as const } : {}),
+    };
+  }
+
+  private applyVoicePlaybackFlag(request: AgentTurnRequest, result: AgentTurnResult): AgentTurnResult {
+    if (!request.onSpeakChunk) {
+      return result;
+    }
+    return { ...result, playbackAlreadyDone: true };
   }
 
   async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
     if (request.forceBrowser) {
       const runtime: TurnRuntime = {
         spokenPhrases: ["Okay. I'll handle that now."],
-        pauseRequested: true,
+        pauseRequested: false,
         promptSent: false,
         endConversation: false,
       };
@@ -1315,16 +1332,34 @@ export class AgentHarness {
     const messages = this.buildMessages(request);
 
     for (let iteration = 0; iteration < 6; iteration += 1) {
+      const speakChunkWatermark = { value: runtime.spokenPhrases.length };
+      const flushVoiceChunks = async () => {
+        if (!request.onSpeakChunk) {
+          return;
+        }
+        while (runtime.spokenPhrases.length > speakChunkWatermark.value) {
+          const chunk = runtime.spokenPhrases.slice(speakChunkWatermark.value).join(" ");
+          speakChunkWatermark.value = runtime.spokenPhrases.length;
+          if (chunk.trim()) {
+            await request.onSpeakChunk(chunk);
+          }
+        }
+      };
+
       const agent = this.buildTurnAgent(request, runtime);
       const result = await agent.generate({
         messages,
+        onStepFinish: async () => {
+          await flushVoiceChunks();
+        },
       });
+      await flushVoiceChunks();
 
       const spokenText = runtime.spokenPhrases.join(" ").trim();
       const fallbackText = result.text.trim();
 
       if (runtime.optionsSpokenList?.trim() && !spokenText) {
-        return { kind: "text", text: runtime.optionsSpokenList.trim() };
+        return this.applyVoicePlaybackFlag(request, this.textTurnResult(runtime.optionsSpokenList.trim(), runtime));
       }
 
       if (!spokenText && !runtime.browserTask && !runtime.endConversation && !runtime.promptSent) {
@@ -1340,37 +1375,41 @@ export class AgentHarness {
             this.appendFallbackToolMessages(messages, fallbackToolCall, toolResult);
           }
 
+          await flushVoiceChunks();
+
           const afterFallbackSpoken = runtime.spokenPhrases.join(" ").trim();
           if (runtime.optionsSpokenList?.trim() && !afterFallbackSpoken) {
-            return { kind: "text", text: runtime.optionsSpokenList.trim() };
+            return this.applyVoicePlaybackFlag(request, this.textTurnResult(runtime.optionsSpokenList.trim(), runtime));
           }
 
           if (runtime.endConversation) {
-            return {
+            return this.applyVoicePlaybackFlag(request, {
               kind: "end_conversation",
               text: afterFallbackSpoken || "Goodbye for now.",
-            };
+            });
           }
 
           const browserTask = runtime.browserTask as BrowserTaskInfo | undefined;
           if (browserTask) {
-            return {
+            return this.applyVoicePlaybackFlag(request, {
               kind: "browser_task",
               text: runtime.spokenPhrases.join(" ").trim() || "Okay. I'll handle that now.",
               browserSessionId: browserTask.browserSessionId,
               previewUrl: browserTask.previewUrl,
-            };
+            });
           }
 
           if (runtime.promptSent || runtime.pauseRequested) {
-            return {
-              kind: "text",
-              text:
+            return this.applyVoicePlaybackFlag(
+              request,
+              this.textTurnResult(
                 runtime.spokenPhrases.join(" ").trim() ||
-                (runtime.promptSent
-                  ? "I've sent you a form to fill out. Please check the Requested Info panel."
-                  : "Okay."),
-            };
+                  (runtime.promptSent
+                    ? "I've sent you a form to fill out. Please check the Requested Info panel."
+                    : "Okay."),
+                runtime,
+              ),
+            );
           }
 
           continue;
@@ -1384,10 +1423,10 @@ export class AgentHarness {
       }
 
       if (runtime.endConversation) {
-        return {
+        return this.applyVoicePlaybackFlag(request, {
           kind: "end_conversation",
           text: spokenText || "Goodbye for now.",
-        };
+        });
       }
 
       const replyText =
@@ -1397,30 +1436,35 @@ export class AgentHarness {
           : "I'm sorry, I couldn't complete that request.");
 
       if (runtime.browserTask) {
-        return { kind: "browser_task", text: replyText, ...runtime.browserTask };
+        return this.applyVoicePlaybackFlag(request, { kind: "browser_task", text: replyText, ...runtime.browserTask });
       }
 
-      return { kind: "text", text: replyText };
+      return this.applyVoicePlaybackFlag(request, this.textTurnResult(replyText, runtime));
     }
 
     if (runtime.endConversation) {
-      return { kind: "end_conversation", text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now." };
+      return this.applyVoicePlaybackFlag(request, {
+        kind: "end_conversation",
+        text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now.",
+      });
     }
     if (runtime.browserTask) {
-      return {
+      return this.applyVoicePlaybackFlag(request, {
         kind: "browser_task",
         text: runtime.spokenPhrases.join(" ").trim() || "Okay. I'll handle that now.",
         ...runtime.browserTask,
-      };
+      });
     }
-    return {
-      kind: "text",
-      text:
+    return this.applyVoicePlaybackFlag(
+      request,
+      this.textTurnResult(
         runtime.spokenPhrases.join(" ").trim() ||
-        (runtime.promptSent
-          ? "I've sent you a form to fill out. Please check the Requested Info panel."
-          : "I'm sorry, I couldn't complete that request."),
-    };
+          (runtime.promptSent
+            ? "I've sent you a form to fill out. Please check the Requested Info panel."
+            : "I'm sorry, I couldn't complete that request."),
+        runtime,
+      ),
+    );
   }
 
   streamTurn(request: AgentTurnRequest): ReadableStream<string> {

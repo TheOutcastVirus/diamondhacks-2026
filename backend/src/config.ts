@@ -33,6 +33,8 @@ export type AppConfig = {
   agent: {
     chunkDelayMs: number;
     conversationTimeoutSeconds: number;
+    /** Idle timeout while UI is "waiting" (pause_until_output or pending tool form). 0 = never. Default 24h. */
+    conversationWaitingTimeoutSeconds: number;
   };
   crisis: {
     enabled: boolean;
@@ -251,6 +253,10 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     agent: {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
       conversationTimeoutSeconds: parseInteger(source.CONVERSATION_TIMEOUT_SECONDS, 10),
+      conversationWaitingTimeoutSeconds: parseInteger(
+        source.CONVERSATION_WAITING_TIMEOUT_SECONDS,
+        24 * 60 * 60,
+      ),
     },
     crisis: {
       enabled: parseBoolean(source.CRISIS_ESCALATION_ENABLED, true),

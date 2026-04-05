@@ -8,6 +8,7 @@ import { detectCrisis } from "../src/crisis";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
 import { SodiumDatabase } from "../src/db";
+import { decodeJsonStyleUnicodeEscapes } from "../src/text-normalize";
 
 const cleanupPaths: string[] = [];
 
@@ -814,6 +815,85 @@ describe("Sodium Bun backend", () => {
         const entries = database.listTranscriptEntries();
         expect(entries.some((e) => e.toolName === "crisis-escalation" && e.toolStatus === "completed")).toBe(true);
         expect(entries.some((e) => e.text?.includes("Guardian placed an emergency call"))).toBe(true);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("agent call_family_emergency tool places Bland call with agent reason", async () => {
+    let completionRound = 0;
+    let blandCalls = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [toolCallChoice("call_family_emergency", { reason: "Resident reports chest pain and asks for family" })],
+          });
+        }
+        return jsonResponse({
+          choices: [speakChoice("I'm contacting your family now.")],
+        });
+      }
+      if (url.includes("/v1/calls")) {
+        blandCalls += 1;
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          request_data?: { agent_reason?: string; emergency_brief?: string; call_reason?: string };
+        };
+        expect(body.request_data?.agent_reason).toContain("chest pain");
+        expect(body.request_data?.call_reason).toContain("chest pain");
+        expect(String(body.request_data?.emergency_brief ?? "")).toContain("Call reason:");
+        return jsonResponse({ status: "success", call_id: "agent_tool_bland_1" });
+      }
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+      try {
+        database.writeMemory(
+          "family_contact_primary",
+          JSON.stringify({
+            full_name: "Jane Doe",
+            relationship: "Daughter",
+            phone_number: "+14155551234",
+          }),
+          {
+            data: {
+              full_name: "Jane Doe",
+              relationship: "Daughter",
+              phone_number: "+14155551234",
+            },
+          },
+        );
+
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "What time is it right now?",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(blandCalls).toBe(1);
+        const entries = database.listTranscriptEntries();
+        expect(entries.some((e) => e.toolName === "call_family_emergency" && e.toolStatus === "completed")).toBe(true);
+        expect(
+          entries.some(
+            (e) =>
+              e.toolName === "crisis-escalation" &&
+              e.toolStatus === "completed" &&
+              (e.metadata as { agentInitiated?: boolean })?.agentInitiated === true,
+          ),
+        ).toBe(true);
       } finally {
         app.close();
         database.close();
@@ -2503,7 +2583,7 @@ trailer <<>>
     const { app, database } = createTestApp();
     const events: string[] = [];
     const privateApp = app as unknown as {
-      conversationState: "idle" | "conversation";
+      voiceConversationSession: boolean;
       runConversationTurn: () => Promise<void>;
       processTranscriptText: (
         transcript: string,
@@ -2522,7 +2602,7 @@ trailer <<>>
       };
     };
 
-    privateApp.conversationState = "conversation";
+    privateApp.voiceConversationSession = true;
     privateApp.sttService.createRealtimeSession = async () => ({
       sendAudio: () => {},
       finalize: async () => "Hello there",
@@ -2569,7 +2649,7 @@ trailer <<>>
     const { app, database } = createTestApp();
     let runConversationTurnCalls = 0;
     const privateApp = app as unknown as {
-      conversationState: "idle" | "conversation";
+      voiceConversationSession: boolean;
       interactionOwner: "conversation" | "voice-http" | "reminder" | null;
       interactionPhase: "idle" | "user_listening" | "agent_thinking" | "agent_speaking";
       exitConversationMode: () => void;
@@ -2577,7 +2657,7 @@ trailer <<>>
       runConversationTurn: () => Promise<void>;
     };
 
-    privateApp.conversationState = "conversation";
+    privateApp.voiceConversationSession = true;
     privateApp.interactionOwner = "conversation";
     privateApp.interactionPhase = "user_listening";
     privateApp.runConversationTurn = async () => {
@@ -2587,13 +2667,13 @@ trailer <<>>
     try {
       privateApp.exitConversationMode();
 
-      expect(String(privateApp.conversationState)).toBe("idle");
+      expect(privateApp.voiceConversationSession).toBe(false);
       expect(privateApp.interactionOwner).toBeNull();
       expect(String(privateApp.interactionPhase)).toBe("idle");
 
       await privateApp.handleWakeWord();
 
-      expect(privateApp.conversationState).toBe("conversation");
+      expect(privateApp.voiceConversationSession).toBe(true);
       expect(runConversationTurnCalls).toBe(1);
     } finally {
       app.close();
@@ -3031,5 +3111,10 @@ Error opening input file dummy.
     expect(() => playbackArgsForPlatform("aix", "/tmp/reply.mp3")).toThrow(
       'Audio playback is not supported on platform "aix".',
     );
+  });
+
+  test("decodeJsonStyleUnicodeEscapes turns literal \\uXXXX into characters for TTS", () => {
+    expect(decodeJsonStyleUnicodeEscapes("You\\u2019re here")).toBe("You\u2019re here");
+    expect(decodeJsonStyleUnicodeEscapes("plain")).toBe("plain");
   });
 });
