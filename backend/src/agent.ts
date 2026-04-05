@@ -314,7 +314,12 @@ const LIST_REMINDERS_SCHEMA = EMPTY_OBJECT_SCHEMA;
 const CREATE_REMINDER_SCHEMA = z.object({
   title: z.string().min(1).describe("Short title for the reminder."),
   instructions: z.string().min(1).describe("What Gazabot should say or do when the reminder fires."),
-  cron: z.string().min(1).describe("5-field cron expression."),
+  cron: z
+    .string()
+    .min(1)
+    .describe(
+      "5-field cron expression in minute hour day-of-month month day-of-week order, with no seconds field (for example '0 9 * * *' for every day at 9:00 AM or '30 19 * * 2' for Tuesdays at 7:30 PM).",
+    ),
   cadence: z.enum(["daily", "weekly", "custom"]).describe("Recurrence type."),
   scheduleLabel: z.string().min(1).describe("Human-readable schedule description."),
   timezone: z.string().optional().describe("Optional IANA timezone name."),
@@ -331,7 +336,12 @@ const UPDATE_REMINDER_SCHEMA = z.object({
   reminder_name: z.string().optional().describe("Current reminder title when the id is unknown."),
   title: z.string().optional().describe("Updated title."),
   instructions: z.string().optional().describe("Updated instructions."),
-  cron: z.string().optional().describe("Updated cron expression."),
+  cron: z
+    .string()
+    .optional()
+    .describe(
+      "Updated 5-field cron expression in minute hour day-of-month month day-of-week order, with no seconds field.",
+    ),
   cadence: z.enum(["daily", "weekly", "custom"]).optional().describe("Updated recurrence type."),
   scheduleLabel: z.string().optional().describe("Updated schedule label."),
   timezone: z.string().optional().describe("Updated IANA timezone."),
@@ -543,6 +553,24 @@ function normalizeFallbackToolResult(toolResult: unknown): Record<string, unknow
   };
 }
 
+function buildHiddenReasoningReminder(fallbackText: string): ModelMessage {
+  const trimmed = fallbackText.trim();
+  const preview = trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed;
+
+  return {
+    role: "system",
+    content: [
+      "Hidden reasoning reminder:",
+      "Your previous plain assistant text was treated as private thinking and was not shown to the user.",
+      "If you want the user to hear anything, call the speak tool.",
+      "If you want browser automation, call run_browser_task only when the user explicitly asked for browser or website work.",
+      "If you need more information, ask the user directly via speak or request_user_input instead of browsing speculatively.",
+      "When creating or updating reminders, use a valid five-field cron expression in minute hour day-of-month month day-of-week order.",
+      preview ? `Hidden text: ${preview}` : "Hidden text: (empty)",
+    ].join("\n"),
+  } as ModelMessage;
+}
+
 export class AgentHarness {
   private readonly cerebrasProvider;
 
@@ -618,12 +646,18 @@ export class AgentHarness {
 
     const browserState = request.forceBrowser
       ? "Browser request: the user explicitly requested browser automation for this turn."
-      : "Browser request: decide based on the task.";
+      : "Browser request: only use browser automation when the user explicitly asks for browsing, searching the web, opening a site, ordering, booking, or checking a website. If you are merely unsure, ask the user directly instead of using the browser.";
 
     return [
       "You are Gazabot, a concise household assistant for reminders, memory, uploaded files, forms, and browser tasks.",
       interactionStyle,
       browserState,
+      "Speech rule: the only user-visible spoken words you produce are the messages passed to the speak tool.",
+      "Speech rule: never rely on plain assistant text as the reply. Any assistant text that is not a tool call and is not a speak tool message is treated as hidden thinking tokens.",
+      "Reasoning rule: use a bit of reasoning before acting on anything complicated, but keep that reasoning private and express the user-facing result through tools.",
+      "Clarification rule: if something important is ambiguous, ask the user directly instead of guessing or launching browser automation.",
+      "Cron rule: reminder schedules use exactly five cron fields in this order: minute hour day-of-month month day-of-week.",
+      "Cron examples: '0 9 * * *' means every day at 9:00 AM. '30 19 * * 2' means every Tuesday at 7:30 PM. There is no seconds field.",
       `Default reminder timezone: ${DEFAULT_REMINDER_TIMEZONE}.`,
       `Current date and time: ${new Date().toLocaleString("en-US", {
         timeZone: DEFAULT_REMINDER_TIMEZONE,
@@ -1028,7 +1062,7 @@ export class AgentHarness {
       tools: {
         speak: tool({
           description:
-            "Say something to the user. Use this for any user-visible response in this turn instead of replying directly.",
+            "The only tool that may produce user-visible speech. Use this for every spoken reply. Never rely on plain assistant text for user-facing output.",
           inputSchema: SPEAK_SCHEMA,
           execute: async (input) => this.executeToolByName("speak", input, runtime, request.profileId),
         }),
@@ -1071,7 +1105,7 @@ export class AgentHarness {
         }),
         run_browser_task: tool({
           description:
-            "Dispatch a browser automation task for browsing, ordering, booking, searching, or interacting with websites.",
+            "Dispatch a browser automation task only when the user explicitly asked for browsing, searching the web, opening a website, ordering, booking, or other website interaction. Do not use this tool just because you are uncertain; ask the user directly instead.",
           inputSchema: RUN_BROWSER_TASK_SCHEMA,
           execute: async (input) => this.executeToolByName("run_browser_task", input, runtime, request.profileId),
         }),
@@ -1195,18 +1229,23 @@ export class AgentHarness {
 
           continue;
         }
+
+        if (fallbackText) {
+          messages.push({ role: "assistant", content: fallbackText });
+          messages.push(buildHiddenReasoningReminder(fallbackText));
+          continue;
+        }
       }
 
       if (runtime.endConversation) {
         return {
           kind: "end_conversation",
-          text: spokenText || fallbackText || "Goodbye for now.",
+          text: spokenText || "Goodbye for now.",
         };
       }
 
       const replyText =
         spokenText ||
-        fallbackText ||
         (runtime.promptSent
           ? "I've sent you a form to fill out. Please check the Requested Info panel."
           : "I'm sorry, I couldn't complete that request.");

@@ -276,6 +276,32 @@ export class AudioService {
   // spawn duplicate processes.
   private vadStartingPromise: Promise<void> | null = null;
 
+  close(): void {
+    this.vadTurnCallback = null;
+
+    const recordingProc = this.proc;
+    this.proc = null;
+    this.recordingPath = null;
+    if (recordingProc) {
+      try {
+        recordingProc.kill();
+      } catch {
+        // Ignore shutdown races if the process already exited.
+      }
+    }
+
+    const vadProc = this.vadProc;
+    this.vadProc = null;
+    this.vadIsReady = false;
+    if (vadProc) {
+      try {
+        vadProc.kill();
+      } catch {
+        // Ignore shutdown races if the process already exited.
+      }
+    }
+  }
+
   private async resolveVadPaths(): Promise<{ python: string; vadScript: string }> {
     const botDir   = resolvePath(import.meta.dir, "../../bot");
     const vadScript = resolvePath(botDir, "silero_vad.py");
