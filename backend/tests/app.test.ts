@@ -347,7 +347,8 @@ describe("Gazabot Bun backend", () => {
 
         if (sessionCreates === 1) {
           expect(body.workspaceId).toBe("ws_cvs_repeat");
-          expect(String(body.task)).toContain("Go to CVS and order @{{chips}}");
+          expect(String(body.task)).toContain("Go to https://www.cvs.com and sign in with the saved account.");
+          expect(String(body.task)).toContain("Order the following items: chips.");
           return jsonResponse({
             id: "remote-order-1",
             status: "running",
@@ -357,7 +358,8 @@ describe("Gazabot Bun backend", () => {
         }
 
         expect(body.workspaceId).toBe("ws_cvs_repeat");
-        expect(String(body.task)).toContain("Go to CVS and order @{{pretzels}}");
+        expect(String(body.task)).toContain("Go to https://www.cvs.com and sign in with the saved account.");
+        expect(String(body.task)).toContain("Order the following items: pretzels.");
         return jsonResponse({
           id: "remote-order-2",
           status: "running",
