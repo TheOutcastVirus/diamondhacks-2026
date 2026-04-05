@@ -227,6 +227,69 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("routes gemini-fast dashboard turns through Google AI instead of Imagine", async () => {
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("Imagine should not be called for gemini-fast requests", { status: 500 });
+      }
+
+      if (url.includes("generativelanguage.googleapis.com")) {
+        expect(url).toContain("/models/gemini-3-flash-preview:generateContent");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.toolConfig).toEqual({
+          functionCallingConfig: {
+            mode: "AUTO",
+          },
+        });
+
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ text: "Gemini is active." }],
+              },
+              finishReason: "STOP",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp({
+        GOOGLE_AI_API_KEY: "test-google-key",
+      });
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Say which model is active.",
+              source: "dashboard",
+              model: "gemini-fast",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Gemini is active.",
+        });
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("updates browser state after a queued browser task", async () => {
     let completionRound = 0;
     let stopRequests = 0;
@@ -449,6 +512,84 @@ describe("Gazabot Bun backend", () => {
         expect(result.replyText).toBe("Goodbye for now.");
         expect(capturedSystemPrompt).toContain("you MUST call end_conversation before giving a brief farewell");
         expect(capturedSystemPrompt).toContain("Do not end a voice conversation with farewell text alone");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("archives and clears conversation when end_conversation is called", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_end_1",
+                      type: "function",
+                      function: {
+                        name: "end_conversation",
+                        arguments: "{}",
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "That's all, goodbye.",
+              source: "guardian",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Goodbye for now.",
+        });
+
+        expect(database.listTranscriptEntries()).toHaveLength(0);
+        const memories = database.listMemoryEntries();
+        expect(memories.length).toBeGreaterThan(0);
+        expect(memories[0]?.title).toStartWith("past_conversation_");
+        expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
+        expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
       } finally {
         app.close();
         database.close();
