@@ -173,3 +173,25 @@ export type ApiErrorPayload = {
   message: string;
   details?: unknown;
 };
+
+export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "unknown";
+
+export type HitlNeed = {
+  kind: HitlNeedKind;
+  rawMessage: string;
+};
+
+export type HitlRequestStatus = "pending" | "resolved" | "expired";
+
+export type HitlRequest = {
+  id: string;
+  browserSessionId: string;
+  remoteSessionId: string;
+  promptId: string | null;
+  needKind: HitlNeedKind;
+  status: HitlRequestStatus;
+  createdAt: string;
+  resolvedAt: string | null;
+  originalTask: string;
+  profileId: string | null;
+};

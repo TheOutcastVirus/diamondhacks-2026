@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import type { BrowserStatus } from "./contracts";
+import type { BrowserStatus, HitlNeed, HitlNeedKind, HitlRequest, PromptField } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
 import { GazabotDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
@@ -238,6 +238,131 @@ export class BrowserUseService {
     await this.runRemoteTask(input, preparedTask);
   }
 
+  async resumeHitlRequest(hitlRequest: HitlRequest): Promise<void> {
+    const followUpTask = this.buildFollowUpTaskForHitlNeed(hitlRequest.needKind);
+    if (!followUpTask) {
+      throw new Error(`Unable to resolve HITL request ${hitlRequest.id} for need ${hitlRequest.needKind}.`);
+    }
+
+    this.database.updateBrowserSession({
+      browserSessionId: hitlRequest.browserSessionId,
+      status: "executing",
+      summary: "Resuming browser task with your information.",
+      activeTask: hitlRequest.originalTask,
+      remoteSessionId: hitlRequest.remoteSessionId,
+      ...(hitlRequest.profileId ? { profileId: hitlRequest.profileId } : {}),
+    });
+    this.database.appendBrowserAction({
+      browserSessionId: hitlRequest.browserSessionId,
+      kind: "hitl",
+      detail: `Resuming browser task with ${hitlRequest.needKind}.`,
+      status: "pending",
+    });
+
+    try {
+      const { session, expired } = await this.sendFollowUpTask(
+        hitlRequest.remoteSessionId,
+        followUpTask,
+        hitlRequest.profileId ?? undefined,
+      );
+
+      const expiredCreateInput: { task: string; profileId?: string } = {
+        task: `${hitlRequest.originalTask}\n\n${followUpTask}`,
+      };
+      if (hitlRequest.profileId) {
+        expiredCreateInput.profileId = hitlRequest.profileId;
+      }
+      const finalSession = expired ? await this.createRemoteSession(expiredCreateInput) : session;
+
+      const completedSession = isTerminalCloudStatus(finalSession.status)
+        ? finalSession
+        : await this.pollRemoteSession(finalSession.id);
+      const summary = extractSummary(completedSession.output);
+      const failed = ["failed", "stopped"].includes(normalizeCloudStatus(completedSession.status));
+
+      const resumedUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+        browserSessionId: hitlRequest.browserSessionId,
+        status: failed ? "blocked" : "idle",
+        summary,
+        activeTask: hitlRequest.originalTask,
+        remoteSessionId: completedSession.id,
+        ...(hitlRequest.profileId ? { profileId: hitlRequest.profileId } : {}),
+      };
+      if (completedSession.url) {
+        resumedUpdate.currentUrl = completedSession.url;
+      }
+      if (completedSession.title) {
+        resumedUpdate.title = completedSession.title;
+        resumedUpdate.tabLabel = completedSession.title;
+      }
+      if (completedSession.liveUrl) {
+        resumedUpdate.previewUrl = completedSession.liveUrl;
+      }
+      this.database.updateBrowserSession(resumedUpdate);
+      this.database.appendBrowserAction({
+        browserSessionId: hitlRequest.browserSessionId,
+        kind: "hitl",
+        detail: failed
+          ? `Browser resume failed after collecting ${hitlRequest.needKind}.`
+          : `Browser resume completed after collecting ${hitlRequest.needKind}.`,
+        status: failed ? "failed" : "completed",
+      });
+
+      const transcriptEntry = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: summary,
+        toolName: "browser-use-hitl",
+        toolStatus: failed ? "failed" : "completed",
+        metadata: {
+          hitlRequestId: hitlRequest.id,
+          sessionId: completedSession.id,
+          needKind: hitlRequest.needKind,
+          liveUrl: completedSession.liveUrl ?? undefined,
+        },
+      });
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: summary,
+      });
+      this.transcriptBus.publish("tool", transcriptEntry);
+      this.transcriptBus.publish("transcript", robotEntry);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? `Browser resume failed after prompt submission: ${error.message}`
+          : "Browser resume failed after prompt submission.";
+      this.database.updateBrowserSession({
+        browserSessionId: hitlRequest.browserSessionId,
+        status: "blocked",
+        summary: message,
+        activeTask: hitlRequest.originalTask,
+        remoteSessionId: hitlRequest.remoteSessionId,
+        ...(hitlRequest.profileId ? { profileId: hitlRequest.profileId } : {}),
+      });
+      this.database.appendBrowserAction({
+        browserSessionId: hitlRequest.browserSessionId,
+        kind: "hitl",
+        detail: message,
+        status: "failed",
+      });
+      const failedEntry = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: message,
+        toolName: "browser-use-hitl",
+        toolStatus: "failed",
+        metadata: {
+          hitlRequestId: hitlRequest.id,
+          needKind: hitlRequest.needKind,
+        },
+      });
+      this.transcriptBus.publish("tool", failedEntry);
+      throw error;
+    }
+  }
+
   private recordBrowserTaskFailure(
     input: { browserSessionId: string; task: string },
     message: string,
@@ -340,7 +465,177 @@ export class BrowserUseService {
       }
       this.database.updateBrowserSession(initialUpdate);
 
-      const finalSession = await this.pollRemoteSession(initialSession.id);
+      let currentSession = await this.pollRemoteSession(initialSession.id);
+      const MAX_HITL_LOOPS = 3;
+
+      // --- HITL loop: detect needs, auto-resolve or request user input ---
+      for (let hitlLoop = 0; hitlLoop < MAX_HITL_LOOPS; hitlLoop++) {
+        const currentStatus = normalizeCloudStatus(currentSession.status);
+        if (currentStatus === "failed" || currentStatus === "stopped") break;
+
+        const currentSummary = extractSummary(currentSession.output);
+        const need = this.detectNeededInfo(currentSummary);
+        if (!need) break; // No HITL need — proceed to finalize
+
+        console.log(`[browser-use] HITL need detected (loop ${hitlLoop + 1}): ${need.kind} — ${currentSummary.slice(0, 120)}`);
+
+        this.database.appendBrowserAction({
+          browserSessionId: input.browserSessionId,
+          kind: "hitl",
+          detail: `Browser agent needs: ${need.kind}. "${currentSummary.slice(0, 200)}"`,
+          status: "pending",
+        });
+
+        // Try to auto-resolve from memory
+        let followUpTask: string | null = null;
+        if (need.kind === "payment_card") {
+          const card = this.resolveCardFromMemory();
+          if (card) {
+            followUpTask = this.buildFollowUpTaskForPayment(card);
+          }
+        } else if (need.kind === "delivery_address") {
+          const addr = this.resolveAddressFromMemory();
+          if (addr) {
+            followUpTask = this.buildFollowUpTaskForAddress(addr);
+          }
+        } else if (need.kind === "confirmation") {
+          // Confirmations cannot be auto-resolved — always need user
+          followUpTask = null;
+        }
+
+        if (followUpTask) {
+          // Auto-resolved from memory — send follow-up task
+          const hitlEntry = this.database.createTranscriptEntry({
+            kind: "tool",
+            role: "system",
+            text: `Auto-resolved ${need.kind} from memory. Sending follow-up to browser session.`,
+            toolName: "browser-use-hitl",
+            toolStatus: "started",
+          });
+          this.transcriptBus.publish("tool", hitlEntry);
+
+          this.database.updateBrowserSession({
+            browserSessionId: input.browserSessionId,
+            status: "executing",
+            summary: `Resuming with ${need.kind} from memory...`,
+          });
+
+          const { session: nextSession, expired } = await this.sendFollowUpTask(
+            currentSession.id,
+            followUpTask,
+            effectiveProfileId ?? undefined,
+          );
+
+          if (expired) {
+            // Session expired — start fresh with full context
+            console.warn(`[browser-use] Session expired during HITL. Starting fresh session.`);
+            const freshTask = `${preparedTask.task}\n\n${followUpTask}`;
+            const freshCreateRequest: {
+              task: string;
+              profileId?: string;
+              workspaceId?: string;
+            } = { task: freshTask };
+            if (effectiveProfileId) {
+              freshCreateRequest.profileId = effectiveProfileId;
+            }
+            if (preparedTask.workspaceId) {
+              freshCreateRequest.workspaceId = preparedTask.workspaceId;
+            }
+            const freshSession = await this.createRemoteSession(freshCreateRequest);
+            currentSession = await this.pollRemoteSession(freshSession.id);
+          } else {
+            currentSession = nextSession;
+          }
+
+          this.database.appendBrowserAction({
+            browserSessionId: input.browserSessionId,
+            kind: "hitl",
+            detail: `Follow-up sent for ${need.kind}.`,
+            status: "completed",
+          });
+          continue; // Loop to check if more info is needed
+        }
+
+        // Cannot auto-resolve — request user input and pause
+        const memoryKey =
+          need.kind === "payment_card"
+            ? "payment_card"
+            : need.kind === "delivery_address"
+              ? "delivery_address"
+              : need.kind === "confirmation"
+                ? "browser_confirmation"
+                : "browser_hitl_info";
+        const promptTitle =
+          need.kind === "payment_card"
+            ? "Payment Information Needed"
+            : need.kind === "delivery_address"
+              ? "Delivery Address Needed"
+              : "Information Needed";
+        const promptDescription =
+          need.kind === "payment_card"
+            ? "The browser agent needs your payment card to complete checkout."
+            : need.kind === "delivery_address"
+              ? "The browser agent needs your delivery address to complete checkout."
+              : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
+        const fields =
+          need.kind === "payment_card"
+            ? this.buildPaymentPromptFields()
+            : need.kind === "delivery_address"
+              ? this.buildAddressPromptFields()
+              : need.kind === "confirmation"
+                ? this.buildConfirmationPromptFields()
+                : [{ name: "info", label: "Information", type: "text" as const, required: true }];
+
+        const prompt = this.database.createPrompt({
+          title: promptTitle,
+          description: promptDescription,
+          fields,
+          memoryKey,
+          memoryLabel: promptTitle,
+        });
+
+        const hitlRequestCreateInput: Parameters<GazabotDatabase["createHitlRequest"]>[0] = {
+          browserSessionId: input.browserSessionId,
+          remoteSessionId: currentSession.id,
+          promptId: prompt.id,
+          needKind: need.kind,
+          originalTask: preparedTask.task,
+        };
+        if (effectiveProfileId) {
+          hitlRequestCreateInput.profileId = effectiveProfileId;
+        }
+        this.database.createHitlRequest(hitlRequestCreateInput);
+
+        this.database.updateBrowserSession({
+          browserSessionId: input.browserSessionId,
+          status: "blocked",
+          summary: `Waiting for user: ${promptTitle}`,
+          activeTask: preparedTask.task,
+        });
+
+        const waitingEntry = this.database.createTranscriptEntry({
+          kind: "tool",
+          role: "system",
+          text: `Browser task paused — ${promptDescription} Please fill out the form in the Requested Info panel.`,
+          toolName: "browser-use-hitl",
+          toolStatus: "started",
+          metadata: { promptId: prompt.id, needKind: need.kind },
+        });
+        const robotMsg = this.database.createTranscriptEntry({
+          kind: "message",
+          role: "robot",
+          text: `I need some information to continue. ${promptDescription} Please check the Requested Info panel.`,
+        });
+        this.transcriptBus.publish("tool", waitingEntry);
+        this.transcriptBus.publish("transcript", robotMsg);
+        this.transcriptBus.publishPrompt(prompt);
+
+        // Return early — resume will happen when user submits the prompt (via app.ts hook)
+        return;
+      }
+
+      // --- Finalize: no more HITL needs or max loops reached ---
+      const finalSession = currentSession;
       const cloudStatus = normalizeCloudStatus(finalSession.status);
       const failed = cloudStatus === "failed" || cloudStatus === "stopped";
       const summary = extractSummary(finalSession.output);
@@ -597,6 +892,161 @@ export class BrowserUseService {
     }
 
     return "Deterministic rerun refreshed or seeded the Browser Use script for future repeat orders.";
+  }
+
+  detectNeededInfo(output: string): HitlNeed | null {
+    const lower = output.toLowerCase();
+
+    const paymentPatterns = [
+      "payment", "credit card", "card number", "card info",
+      "billing", "pay with", "enter card", "add payment",
+      "payment method", "card details", "debit card",
+    ];
+    const addressPatterns = [
+      "delivery address", "shipping address", "enter address",
+      "add address", "delivery location", "where to deliver",
+      "missing address", "need address", "provide address",
+    ];
+    const confirmationPatterns = [
+      "confirm", "confirmation", "approve", "review order",
+      "place order", "submit order", "verify", "authorize",
+    ];
+
+    for (const p of paymentPatterns) {
+      if (lower.includes(p)) {
+        return { kind: "payment_card", rawMessage: output };
+      }
+    }
+    for (const p of addressPatterns) {
+      if (lower.includes(p)) {
+        return { kind: "delivery_address", rawMessage: output };
+      }
+    }
+    for (const p of confirmationPatterns) {
+      if (lower.includes(p)) {
+        return { kind: "confirmation", rawMessage: output };
+      }
+    }
+
+    // Generic "needs info" / "missing info" patterns
+    if (lower.includes("missing info") || lower.includes("need info") || lower.includes("requires info")) {
+      return { kind: "unknown", rawMessage: output };
+    }
+
+    return null;
+  }
+
+  async sendFollowUpTask(
+    remoteSessionId: string,
+    task: string,
+    profileId?: string,
+  ): Promise<{ session: BrowserUseSessionResponse; expired: boolean }> {
+    const body: Record<string, unknown> = {
+      session_id: remoteSessionId,
+      task,
+      model: this.config.browserUse.model,
+      keepAlive: this.config.browserUse.keepAlive,
+    };
+    if (profileId) {
+      body.profileId = profileId;
+    }
+
+    console.log(`[browser-use] Sending follow-up task to session ${remoteSessionId}: ${task.slice(0, 120)}`);
+
+    try {
+      const session = await this.browserUseRequest<BrowserUseSessionResponse>("/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const finalSession = await this.pollRemoteSession(session.id);
+      return { session: finalSession, expired: false };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("404") || msg.includes("410") || msg.includes("not found") || msg.includes("expired")) {
+        console.warn(`[browser-use] Session ${remoteSessionId} expired, cannot send follow-up.`);
+        return { session: { id: remoteSessionId, status: "stopped" }, expired: true };
+      }
+      throw error;
+    }
+  }
+
+  private buildFollowUpTaskForPayment(card: ReturnType<typeof parseCardFromMemory>): string {
+    if (!card) return "";
+    const parts = [
+      "Continue with checkout. Use this payment information:",
+      `Card number: ${card.card}`,
+      `Expiry: ${card.exp_month}/${card.exp_year}`,
+    ];
+    if (card.cvv) parts.push(`CVV: ${card.cvv}`);
+    if (card.name) parts.push(`Cardholder name: ${card.name}`);
+    if (card.billing_zip) parts.push(`Billing ZIP: ${card.billing_zip}`);
+    return parts.join(" ");
+  }
+
+  private buildFollowUpTaskForAddress(address: string | undefined): string {
+    if (!address) return "";
+    return `Continue with checkout. Use this delivery address: ${address}`;
+  }
+
+  private buildFollowUpTaskForHitlNeed(needKind: HitlNeedKind): string {
+    if (needKind === "payment_card") {
+      return this.buildFollowUpTaskForPayment(this.resolveCardFromMemory());
+    }
+    if (needKind === "delivery_address") {
+      return this.buildFollowUpTaskForAddress(this.resolveAddressFromMemory());
+    }
+    if (needKind === "confirmation") {
+      const confirmation = this.database.readMemory("browser_confirmation")?.data;
+      if (confirmation && typeof confirmation.confirm === "boolean") {
+        return confirmation.confirm
+          ? "Continue from where you left off. The user confirmed you should proceed and submit the order."
+          : "Do not place the order. The user declined to confirm checkout.";
+      }
+      return "";
+    }
+
+    const extraInfo = this.database.readMemory("browser_hitl_info");
+    if (!extraInfo) {
+      return "";
+    }
+    return `Continue from where you left off. Here is the information the user provided: ${extraInfo.content}`;
+  }
+
+  private buildPaymentPromptFields(): PromptField[] {
+    return [
+      { name: "cardholder_name", label: "Cardholder Name", type: "string", required: true },
+      { name: "card_number", label: "Card Number", type: "password", required: true },
+      { name: "exp_month", label: "Expiry Month (MM)", type: "string", required: true },
+      { name: "exp_year", label: "Expiry Year (YYYY)", type: "string", required: true },
+      { name: "cvv", label: "Security Code (CVV)", type: "password", required: true },
+      { name: "billing_zip", label: "Billing ZIP Code", type: "string", required: false },
+    ];
+  }
+
+  private buildAddressPromptFields(): PromptField[] {
+    return [
+      { name: "full_name", label: "Full Name", type: "string", required: true },
+      { name: "line_1", label: "Address Line 1", type: "string", required: true },
+      { name: "line_2", label: "Address Line 2", type: "string", required: false },
+      { name: "city", label: "City", type: "string", required: true },
+      { name: "state_or_region", label: "State", type: "string", required: true },
+      { name: "postal_code", label: "ZIP Code", type: "string", required: true },
+      { name: "country", label: "Country", type: "string", required: false, defaultValue: "US" },
+      { name: "phone_number", label: "Phone Number", type: "string", required: false },
+    ];
+  }
+
+  private buildConfirmationPromptFields(): PromptField[] {
+    return [
+      {
+        name: "confirm",
+        label: "Proceed With Checkout",
+        type: "boolean",
+        required: true,
+        description: "Allow the browser agent to place or submit the order.",
+      },
+    ];
   }
 
   private async browserUseRequest<T>(path: string, init: RequestInit): Promise<T> {

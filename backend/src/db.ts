@@ -20,6 +20,9 @@ import type {
   UploadedFileTextStatus,
   UserMemoryEntry,
   UserPrompt,
+  HitlNeedKind,
+  HitlRequest,
+  HitlRequestStatus,
 } from "./contracts";
 import { computeNextRun } from "./cron";
 import { resolveReminderTimezone } from "./reminders";
@@ -552,6 +555,19 @@ export class GazabotDatabase {
         response_json TEXT,
         created_at TEXT NOT NULL,
         responded_at TEXT
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS browser_hitl_requests (
+        id TEXT PRIMARY KEY NOT NULL,
+        browser_session_id TEXT NOT NULL,
+        remote_session_id TEXT NOT NULL,
+        prompt_id TEXT,
+        need_kind TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'resolved', 'expired')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        original_task TEXT NOT NULL,
+        profile_id TEXT
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS browser_task_templates (
@@ -1245,6 +1261,74 @@ export class GazabotDatabase {
       .query("SELECT * FROM shopping_orders ORDER BY created_at DESC")
       .all() as ShoppingOrderRow[];
     return rows.map(serializeShoppingOrder);
+  }
+
+  createHitlRequest(input: {
+    browserSessionId: string;
+    remoteSessionId: string;
+    promptId?: string;
+    needKind: HitlNeedKind;
+    originalTask: string;
+    profileId?: string;
+  }): HitlRequest {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    this.database
+      .query(
+        `INSERT INTO browser_hitl_requests (id, browser_session_id, remote_session_id, prompt_id, need_kind, status, created_at, original_task, profile_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.browserSessionId,
+        input.remoteSessionId,
+        input.promptId ?? null,
+        input.needKind,
+        now,
+        input.originalTask,
+        input.profileId ?? null,
+      );
+    return {
+      id,
+      browserSessionId: input.browserSessionId,
+      remoteSessionId: input.remoteSessionId,
+      promptId: input.promptId ?? null,
+      needKind: input.needKind as HitlNeedKind,
+      status: "pending",
+      createdAt: now,
+      resolvedAt: null,
+      originalTask: input.originalTask,
+      profileId: input.profileId ?? null,
+    };
+  }
+
+  findPendingHitlByPromptId(promptId: string): HitlRequest | null {
+    const row = this.database
+      .query(
+        `SELECT * FROM browser_hitl_requests WHERE prompt_id = ? AND status = 'pending' LIMIT 1`,
+      )
+      .get(promptId) as Record<string, unknown> | null;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      browserSessionId: String(row.browser_session_id),
+      remoteSessionId: String(row.remote_session_id),
+      promptId: row.prompt_id ? String(row.prompt_id) : null,
+      needKind: String(row.need_kind) as HitlNeedKind,
+      status: String(row.status) as HitlRequestStatus,
+      createdAt: String(row.created_at),
+      resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
+      originalTask: String(row.original_task),
+      profileId: row.profile_id ? String(row.profile_id) : null,
+    };
+  }
+
+  resolveHitlRequest(id: string): void {
+    this.database
+      .query(
+        `UPDATE browser_hitl_requests SET status = 'resolved', resolved_at = ? WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), id);
   }
 
   createPrompt(input: {
