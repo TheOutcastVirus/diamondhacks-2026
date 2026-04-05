@@ -469,7 +469,54 @@ export class GazabotApp {
   private conversationTimer: ReturnType<typeof setTimeout> | null = null;
   private isSpeaking = false;
   private lastActivityAt: Date | null = null;
+  private wakeWordProcess: ReturnType<typeof spawn> | null = null;
+  private wakeWordRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private wakeWordListenerEnabled = false;
+  private interactionOwner: "conversation" | "voice-http" | "reminder" | null = null;
+  private interactionPhase: "idle" | "user_listening" | "agent_thinking" | "agent_speaking" = "idle";
   private static readonly SESSION_GAP_MS = 10 * 60 * 1000; // 10 minutes
+  private static readonly POST_SPEECH_LISTEN_DELAY_MS = 750;
+
+  private claimInteraction(owner: "conversation" | "voice-http" | "reminder"): boolean {
+    if (this.interactionOwner && this.interactionOwner !== owner) {
+      return false;
+    }
+    this.interactionOwner = owner;
+    return true;
+  }
+
+  private releaseInteraction(owner: "conversation" | "voice-http" | "reminder"): void {
+    if (this.interactionOwner !== owner) {
+      return;
+    }
+    this.interactionOwner = null;
+    this.interactionPhase = "idle";
+  }
+
+  private setInteractionPhase(
+    owner: "conversation" | "voice-http" | "reminder",
+    phase: "user_listening" | "agent_thinking" | "agent_speaking",
+  ): void {
+    if (this.interactionOwner === owner) {
+      this.interactionPhase = phase;
+    }
+  }
+
+  private interactionBusyMessage(owner: "conversation" | "voice-http" | "reminder"): string {
+    const phaseLabel =
+      this.interactionPhase === "user_listening"
+        ? "listening to the user"
+        : this.interactionPhase === "agent_thinking"
+          ? "processing a turn"
+          : this.interactionPhase === "agent_speaking"
+            ? "speaking"
+            : "busy";
+    return `[${owner}] Interaction locked by ${this.interactionOwner ?? "unknown"} while ${phaseLabel}.`;
+  }
+
+  private interactionBusyError(owner: "conversation" | "voice-http" | "reminder"): Error & { conflict: true } {
+    return Object.assign(new Error(this.interactionBusyMessage(owner)), { conflict: true as const });
+  }
 
   private enterConversationMode(): void {
     this.conversationState = "conversation";
@@ -769,6 +816,10 @@ export class GazabotApp {
           return errorResponse(request, this.config, 400, error.message);
         }
 
+        if ((error as Error & { conflict?: boolean }).conflict) {
+          return errorResponse(request, this.config, 409, error.message);
+        }
+
         if (error.message.includes("INFERENCE_CLOUD_API_KEY is not configured")) {
           return errorResponse(request, this.config, 503, error.message);
         }
@@ -906,6 +957,7 @@ export class GazabotApp {
   // ── Wake word ──────────────────────────────────────────────────────────────
 
   private startWakeWordListener(): void {
+    this.wakeWordListenerEnabled = true;
     const botDir = resolve(import.meta.dir, "../../bot");
     const script = resolve(botDir, "wake_word.py");
     // Use the venv's Python if it exists, otherwise fall back to system python3
@@ -916,7 +968,11 @@ export class GazabotApp {
     let child: ReturnType<typeof spawn>;
 
     const start = () => {
+      if (!this.wakeWordListenerEnabled || this.wakeWordProcess) {
+        return;
+      }
       child = spawn(python, [script], { stdio: ["ignore", "pipe", "pipe"] });
+      this.wakeWordProcess = child;
 
       // Forward Python stderr so wake_word startup logs appear in the Bun console
       child.stderr?.on("data", (chunk: Buffer) => {
@@ -944,22 +1000,53 @@ export class GazabotApp {
       });
 
       child.on("close", (code: number | null) => {
+        if (this.wakeWordProcess === child) {
+          this.wakeWordProcess = null;
+        }
+        if (!this.wakeWordListenerEnabled) {
+          return;
+        }
         console.warn(`[wake-word] Process exited (code=${code}). Restarting in 3 s…`);
-        setTimeout(start, 3000);
+        this.wakeWordRestartTimer = setTimeout(() => {
+          this.wakeWordRestartTimer = null;
+          start();
+        }, 3000);
       });
     };
 
     start();
   }
 
+  private stopWakeWordListener(): void {
+    this.wakeWordListenerEnabled = false;
+    if (this.wakeWordRestartTimer) {
+      clearTimeout(this.wakeWordRestartTimer);
+      this.wakeWordRestartTimer = null;
+    }
+
+    const child = this.wakeWordProcess;
+    if (!child) {
+      return;
+    }
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Ignore shutdown races if the process already exited.
+    }
+  }
+
   private async handleWakeWord(): Promise<void> {
-    if (this.isSpeaking) {
+    if (this.isSpeaking || this.interactionPhase === "agent_speaking") {
       console.log("[wake-word] Bot is speaking — ignoring trigger.");
       return;
     }
 
-    if (this.conversationState === "conversation" && this.audioService.isRecording) {
-      // Already in a conversation turn, ignore duplicate triggers
+    if (
+      this.interactionOwner !== null ||
+      (this.conversationState === "conversation" && this.audioService.isRecording)
+    ) {
+      // Already in a conversation turn or another voice interaction, ignore duplicate triggers
       return;
     }
 
@@ -979,12 +1066,26 @@ export class GazabotApp {
   }
 
   private async runConversationTurn(): Promise<void> {
+    const ownsInteraction = this.interactionOwner === "conversation";
     if (this.conversationState !== "conversation" || this.audioService.isRecording || this.isSpeaking) {
       return;
+    }
+    if (!ownsInteraction && !this.claimInteraction("conversation")) {
+      return;
+    }
+
+    // Suspend the inactivity timer for the entire turn: recording → STT → agent
+    // → TTS → playback. The timer races with recordUntilSilence (both are ~10s)
+    // and was firing mid-recording before the turn even reached processing.
+    // The countdown only resumes once the bot has finished speaking.
+    if (this.conversationTimer) {
+      clearTimeout(this.conversationTimer);
+      this.conversationTimer = null;
     }
 
     let audioBuffer: Buffer;
     try {
+      this.setInteractionPhase("conversation", "user_listening");
       audioBuffer = await this.audioService.recordUntilSilence({
         silenceDb: -20,
         silenceDuration: 1,
@@ -992,45 +1093,45 @@ export class GazabotApp {
       });
     } catch (err) {
       console.error("[conversation] Recording failed:", err);
+      this.resetConversationTimer();
+      if (!ownsInteraction) {
+        this.releaseInteraction("conversation");
+      }
       return;
-    }
-
-    // Suspend the inactivity timer for the duration of STT + agent processing.
-    // The round-trip can easily exceed the timeout window, and we must not drop
-    // out of conversation mode while a turn is still in flight.
-    if (this.conversationTimer) {
-      clearTimeout(this.conversationTimer);
-      this.conversationTimer = null;
     }
 
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
+      this.setInteractionPhase("conversation", "agent_thinking");
       result = await this.processVoiceAudio(audioBuffer);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
-        // No speech — restart the timer and wait for the next attempt
         console.log("[conversation] No speech detected, waiting for activity…");
         this.resetConversationTimer();
+        if (!ownsInteraction) {
+          this.releaseInteraction("conversation");
+        }
         return;
       }
       console.error("[conversation] Processing failed:", err);
       this.resetConversationTimer();
+      if (!ownsInteraction) {
+        this.releaseInteraction("conversation");
+      }
       return;
     }
 
     console.log(`[conversation] User: "${result.transcript}"`);
-
-    // Record activity time and restart the inactivity timer
     this.lastActivityAt = new Date();
-    this.resetConversationTimer();
 
     this.isSpeaking = true;
     try {
-      const audioOut = await this.ttsService.synthesize(result.replyText);
-      await this.audioService.playAudio(audioOut);
+      this.setInteractionPhase("conversation", "agent_speaking");
+      await this.speakReplyText(result.replyText, "voice");
     } catch (err) {
       console.error("[conversation] TTS/playback failed:", err);
     } finally {
+      await Bun.sleep(GazabotApp.POST_SPEECH_LISTEN_DELAY_MS);
       this.isSpeaking = false;
     }
 
@@ -1038,67 +1139,111 @@ export class GazabotApp {
     if (result.endConversation) {
       console.log("[conversation] Agent ended conversation.");
       this.exitConversationMode();
+      this.releaseInteraction("conversation");
       return;
     }
 
-    // Loop: immediately listen for the next utterance
+    // Bot has finished speaking — start the inactivity countdown, then loop
+    this.resetConversationTimer();
+    this.setInteractionPhase("conversation", "user_listening");
     if (this.conversationState === "conversation") {
       void this.runConversationTurn();
+      return;
     }
+    this.releaseInteraction("conversation");
   }
 
   // ── HTTP voice routes ───────────────────────────────────────────────────────
 
   private async handleVoiceTurn(request: Request): Promise<Response> {
+    if (!this.claimInteraction("voice-http")) {
+      return errorResponse(request, this.config, 409, this.interactionBusyMessage("voice-http"));
+    }
+
     let formData: Awaited<ReturnType<Request["formData"]>>;
     try {
       formData = await request.formData();
     } catch {
+      this.releaseInteraction("voice-http");
       return errorResponse(request, this.config, 422, "Expected multipart/form-data.");
     }
 
     const audioField = formData.get("audio");
     if (!audioField || !(audioField instanceof File)) {
+      this.releaseInteraction("voice-http");
       return errorResponse(request, this.config, 422, "Missing audio field.");
     }
 
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
+      this.setInteractionPhase("voice-http", "agent_thinking");
       result = await this.processVoiceAudio(audioField);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
+        this.releaseInteraction("voice-http");
         return errorResponse(request, this.config, 422, err.message);
       }
+      this.releaseInteraction("voice-http");
       throw err;
     }
 
-    await this.speakReplyText(result.replyText, "voice");
-
-    return jsonResponse(request, this.config, { ok: true, transcript: result.transcript });
+    try {
+      this.setInteractionPhase("voice-http", "agent_speaking");
+      await this.speakReplyText(result.replyText, "voice");
+      return jsonResponse(request, this.config, { ok: true, transcript: result.transcript });
+    } finally {
+      this.releaseInteraction("voice-http");
+    }
   }
 
   private async handleVoiceStart(): Promise<{ ok: boolean }> {
-    await this.audioService.startRecording();
-    return { ok: true };
+    if (!this.claimInteraction("voice-http")) {
+      throw this.interactionBusyError("voice-http");
+    }
+    this.setInteractionPhase("voice-http", "user_listening");
+    try {
+      await this.audioService.startRecording();
+      return { ok: true };
+    } catch (error) {
+      this.releaseInteraction("voice-http");
+      throw error;
+    }
   }
 
   private async handleVoiceStop(): Promise<{ ok: boolean; transcript: string }> {
-    const audioBuffer = await this.audioService.stopRecording();
+    if (this.interactionOwner !== "voice-http") {
+      throw this.interactionBusyError("voice-http");
+    }
+
+    let audioBuffer: Buffer;
+    try {
+      audioBuffer = await this.audioService.stopRecording();
+    } catch (error) {
+      this.releaseInteraction("voice-http");
+      throw error;
+    }
     console.log(`[voice] Recorded buffer size: ${audioBuffer.length} bytes`);
 
     let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
+      this.setInteractionPhase("voice-http", "agent_thinking");
       result = await this.processVoiceAudio(audioBuffer);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
+        this.releaseInteraction("voice-http");
         return { ok: false, transcript: "" };
       }
+      this.releaseInteraction("voice-http");
       throw err;
     }
 
-    await this.speakReplyText(result.replyText, "voice");
-
-    return { ok: true, transcript: result.transcript };
+    try {
+      this.setInteractionPhase("voice-http", "agent_speaking");
+      await this.speakReplyText(result.replyText, "voice");
+      return { ok: true, transcript: result.transcript };
+    } finally {
+      this.releaseInteraction("voice-http");
+    }
   }
 
   private async handleTts(request: Request): Promise<{ spoken: boolean; text: string }> {
@@ -1217,6 +1362,7 @@ export class GazabotApp {
   }
 
   close(): void {
+    this.stopWakeWordListener();
     this.unsubscribeReminderChanges();
     this.reminderScheduler.stop();
   }
@@ -1273,7 +1419,12 @@ export class GazabotApp {
     this.transcriptBus.publish("tool", started);
     console.log(`[reminder] Triggered ${reminder.id} "${reminder.title}" at ${dueAt}`);
 
+    while (!this.claimInteraction("reminder")) {
+      await Bun.sleep(50);
+    }
+
     try {
+      this.setInteractionPhase("reminder", "agent_thinking");
       const result = await this.executeRecordedTurn(
         {
           message: prompt,
@@ -1284,6 +1435,7 @@ export class GazabotApp {
         { reminderId: reminder.id, dueAt, reminderTitle: reminder.title },
       );
       if (result.kind === "text") {
+        this.setInteractionPhase("reminder", "agent_speaking");
         await this.speakReplyText(result.text, "reminder");
       }
 
@@ -1317,14 +1469,14 @@ export class GazabotApp {
       this.transcriptBus.publish("tool", failed);
       console.error(`[reminder] Failed ${reminder.id} "${reminder.title}": ${message}`);
       throw error;
+    } finally {
+      this.releaseInteraction("reminder");
     }
   }
 
   private async speakReplyText(text: string, source: "voice" | "reminder"): Promise<void> {
     const audioOut = await this.ttsService.synthesize(text);
-    this.audioService.playAudio(audioOut).catch((err) => {
-      console.error(`[${source}] Playback error:`, err);
-    });
+    await this.audioService.playAudio(audioOut);
   }
 }
 

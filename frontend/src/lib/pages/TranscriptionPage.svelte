@@ -122,6 +122,22 @@
     expandedTools = next;
   }
 
+  function hasMetadataField(entry: TranscriptEntry, key: string) {
+    return Boolean(entry.metadata && Object.prototype.hasOwnProperty.call(entry.metadata, key));
+  }
+
+  function formatDebugJson(value: unknown) {
+    if (value === undefined) {
+      return '';
+    }
+
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
   function appendEntries(nextEntries: TranscriptEntry[]) {
     if (nextEntries.length === 0) {
       return;
@@ -374,15 +390,22 @@
                   {#if entry.metadata?.params && typeof entry.metadata.params === 'object' && Object.keys(entry.metadata.params).length > 0}
                     <div class="tool-params">
                       <span class="tool-params-label">Parameters</span>
-                      <code class="meta">{JSON.stringify(entry.metadata.params, null, 2)}</code>
+                      <code class="meta">{formatDebugJson(entry.metadata.params)}</code>
                     </div>
-                  {:else if entry.metadata?.params !== undefined}
+                  {:else if hasMetadataField(entry, 'params')}
                     <div class="tool-params">
                       <span class="tool-params-label">Parameters</span>
                       <code class="meta">(none)</code>
                     </div>
-                  {:else if entry.metadata}
-                    <code class="meta">{JSON.stringify(entry.metadata, null, 2)}</code>
+                  {/if}
+                  {#if hasMetadataField(entry, 'result')}
+                    <div class="tool-params">
+                      <span class="tool-params-label">Result</span>
+                      <code class="meta">{formatDebugJson(entry.metadata?.['result'])}</code>
+                    </div>
+                  {/if}
+                  {#if entry.metadata && !hasMetadataField(entry, 'params') && !hasMetadataField(entry, 'result')}
+                    <code class="meta">{formatDebugJson(entry.metadata)}</code>
                   {/if}
                 </div>
               {/if}

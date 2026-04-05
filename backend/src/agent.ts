@@ -379,7 +379,7 @@ export class AgentHarness {
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Imagine API error ${response.status}: ${body}`);
+      throw new Error(`Imagine API error ${response.status} for model "${this.config.imagine.model}": ${body}`);
     }
 
     return response.json() as Promise<ChatCompletionResponse>;
@@ -406,7 +406,9 @@ export class AgentHarness {
                 r.attachments && r.attachments.length > 0
                   ? ` | attached files: ${r.attachments.map((attachment) => attachment.name).join(", ")}`
                   : "";
-              return `- ${r.title} (${r.scheduleLabel}): ${r.instructions}${attachmentSummary}`;
+              const nextRun = r.nextRun ?? "none";
+              const timezone = r.timezone ?? DEFAULT_REMINDER_TIMEZONE;
+              return `- id=${r.id} | title=${r.title} | status=${r.status} | schedule=${r.scheduleLabel} | timezone=${timezone} | next_run=${nextRun}: ${r.instructions}${attachmentSummary}`;
             })
             .join("\n");
 
@@ -426,7 +428,7 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences."
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
         : "";
 
     const systemPrompt = `You are Gazabot, a senior care assistant specializing in reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
@@ -455,6 +457,7 @@ TOOL USE RULES - follow exactly:
 - Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
 - Use create_reminder ONLY if the user asks to set or schedule a reminder.
 - Use list_reminders ONLY if the user asks to see their reminders.
+- To update or delete a reminder, use the exact reminder id. If you are not certain which reminder id matches the user's request, call list_reminders first. Never guess a reminder id.
 - Never call more than one tool per turn unless strictly necessary.
 - Never repeat a tool call.
 - For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.
@@ -475,6 +478,67 @@ TOOL USE RULES - follow exactly:
 
     messages.push({ role: "user", content: request.message });
     return messages;
+  }
+
+  private resolveReminderId(
+    args: Record<string, unknown>,
+    options: { titleKeys?: string[] } = {},
+  ): string {
+    const findUniqueTitleMatch = (value: string): string | null => {
+      const normalized = value.trim().toLowerCase();
+      if (!normalized) {
+        return null;
+      }
+
+      const matches = this.database
+        .listReminders()
+        .filter((reminder) => reminder.title.trim().toLowerCase() === normalized);
+
+      if (matches.length === 1) {
+        return matches[0]!.id;
+      }
+
+      if (matches.length > 1) {
+        throw new Error(`Multiple reminders match "${value}". Use the exact reminder id.`);
+      }
+
+      return null;
+    };
+
+    for (const candidate of [args.id, args.reminderId, args.reminder_id]) {
+      if (typeof candidate !== "string" || !candidate.trim()) {
+        continue;
+      }
+
+      const identifier = candidate.trim();
+      const reminder = this.database.getReminderById(identifier);
+      if (reminder) {
+        return reminder.id;
+      }
+
+      const matchedByTitle = findUniqueTitleMatch(identifier);
+      if (matchedByTitle) {
+        return matchedByTitle;
+      }
+
+      throw new Error(`Reminder not found for identifier "${identifier}".`);
+    }
+
+    for (const key of options.titleKeys ?? []) {
+      const candidate = args[key];
+      if (typeof candidate !== "string" || !candidate.trim()) {
+        continue;
+      }
+
+      const matchedByTitle = findUniqueTitleMatch(candidate);
+      if (matchedByTitle) {
+        return matchedByTitle;
+      }
+
+      throw new Error(`Reminder not found for title "${candidate.trim()}".`);
+    }
+
+    throw new Error("Reminder id is required. Call list_reminders first if you are not certain which reminder to modify.");
   }
 
   private async executeTool(
@@ -527,6 +591,9 @@ TOOL USE RULES - follow exactly:
         }
 
         case "update_reminder": {
+          const reminderId = this.resolveReminderId(args, {
+            titleKeys: ["reminderTitle", "currentTitle", "existingTitle", "reminder_name"],
+          });
           const update: Record<string, unknown> = {};
           if (typeof args.title === "string") {
             update.title = args.title;
@@ -553,12 +620,19 @@ TOOL USE RULES - follow exactly:
             update.attachmentFileIds = args.attachmentFileIds.map((value) => String(value));
           }
 
-          result = this.database.updateReminder(String(args.id ?? ""), update as ReminderUpdateInput);
+          result = this.database.updateReminder(reminderId, update as ReminderUpdateInput);
           break;
         }
 
         case "delete_reminder": {
-          result = { deleted: this.database.deleteReminder(String(args.id ?? "")) };
+          const reminderId = this.resolveReminderId(args, {
+            titleKeys: ["title", "reminderTitle", "name", "reminder_name"],
+          });
+          const deleted = this.database.deleteReminder(reminderId);
+          if (!deleted) {
+            throw new Error(`Reminder not found for id "${reminderId}".`);
+          }
+          result = { deleted: true, id: reminderId };
           break;
         }
 
@@ -727,6 +801,7 @@ TOOL USE RULES - follow exactly:
         text: `Tool ${name} completed`,
         toolName: name,
         toolStatus: "completed",
+        metadata: { result },
       });
       this.transcriptBus.publish("tool", doneEntry);
 
@@ -741,6 +816,10 @@ TOOL USE RULES - follow exactly:
         text: `Tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`,
         toolName: name,
         toolStatus: "failed",
+        metadata: {
+          params: args,
+          error: error instanceof Error ? error.message : String(error),
+        },
       });
       this.transcriptBus.publish("tool", failEntry);
       return { result: { error: String(error) } };
