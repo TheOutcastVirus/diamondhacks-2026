@@ -1155,7 +1155,7 @@ export class GazabotApp {
         const session = await this.sttService.createRealtimeSession();
         await this.audioService.recordPcmUntilSilence(
           (chunk) => session.sendAudio(chunk),
-          { silenceDb: -35, silenceDuration: 1.2, maxDuration: 10 },
+          { silenceDb: -30, silenceDuration: 1.2, maxDuration: 10 },
         );
         recordingStoppedAt = Date.now();
         console.log(
