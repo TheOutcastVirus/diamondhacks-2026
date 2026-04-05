@@ -242,6 +242,7 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+<<<<<<< HEAD
   test("crisis turn calls Bland and skips the model when family contact is saved", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url, init) => {
@@ -361,11 +362,42 @@ describe("Gazabot Bun backend", () => {
       if (url.includes("/chat/completions")) {
         return new Response("model should not be called for crisis escalation", { status: 500 });
       }
+=======
+  test("routes gemini-fast dashboard turns through Google AI instead of Imagine", async () => {
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        return new Response("Imagine should not be called for gemini-fast requests", { status: 500 });
+      }
+
+      if (url.includes("generativelanguage.googleapis.com")) {
+        expect(url).toContain("/models/gemini-3-flash-preview:generateContent");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.toolConfig).toEqual({
+          functionCallingConfig: {
+            mode: "AUTO",
+          },
+        });
+
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ text: "Gemini is active." }],
+              },
+              finishReason: "STOP",
+            },
+          ],
+        });
+      }
+
+>>>>>>> origin/main
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
     try {
       const { app, database } = createTestApp({
+<<<<<<< HEAD
         BLAND_API_KEY: "",
         BLAND_PATHWAY_ID: "",
       });
@@ -382,21 +414,39 @@ describe("Gazabot Bun backend", () => {
           },
         });
 
+=======
+        GOOGLE_AI_API_KEY: "test-google-key",
+      });
+
+      try {
+>>>>>>> origin/main
         const response = await app.fetch(
           new Request("http://localhost/api/agent/turn", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+<<<<<<< HEAD
               message: "I'm in trouble",
               source: "dashboard",
+=======
+              message: "Say which model is active.",
+              source: "dashboard",
+              model: "gemini-fast",
+>>>>>>> origin/main
             }),
           }),
         );
 
         expect(response.status).toBe(200);
+<<<<<<< HEAD
         expect(await response.json()).toEqual({
           route: "conversation",
           reply: "I'm trying to contact your family, but the calling system is not set up yet.",
+=======
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Gemini is active.",
+>>>>>>> origin/main
         });
       } finally {
         app.close();
@@ -407,6 +457,7 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+<<<<<<< HEAD
   test("crisis turn reports provider failures and suppresses duplicate calls during cooldown", async () => {
     let blandCalls = 0;
     const restore = withFetchStub(async (url) => {
@@ -492,6 +543,8 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+=======
+>>>>>>> origin/main
   test("updates browser state after a queued browser task", async () => {
     let completionRound = 0;
     let stopRequests = 0;
@@ -723,6 +776,7 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+<<<<<<< HEAD
   test("surfaces Browser Use network failures as actionable browser status", async () => {
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
@@ -746,15 +800,54 @@ describe("Gazabot Bun backend", () => {
                 ],
               },
               finish_reason: "tool_calls",
+=======
+  test("archives and clears conversation when end_conversation is called", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_end_1",
+                      type: "function",
+                      function: {
+                        name: "end_conversation",
+                        arguments: "{}",
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
+              finish_reason: "stop",
+>>>>>>> origin/main
             },
           ],
         });
       }
 
+<<<<<<< HEAD
       if (url.includes("browser-use.com")) {
         throw new TypeError("NetworkError when attempting to fetch resource.");
       }
 
+=======
+>>>>>>> origin/main
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
     });
 
@@ -767,13 +860,19 @@ describe("Gazabot Bun backend", () => {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+<<<<<<< HEAD
               message: "Check the weather in the browser.",
               source: "dashboard",
+=======
+              message: "That's all, goodbye.",
+              source: "guardian",
+>>>>>>> origin/main
             }),
           }),
         );
 
         expect(response.status).toBe(200);
+<<<<<<< HEAD
         await new Promise((resolve) => setTimeout(resolve, 50));
 
         const browserResponse = await app.fetch(new Request("http://localhost/api/browser"));
@@ -794,6 +893,19 @@ describe("Gazabot Bun backend", () => {
               entry.text.includes("I couldn't reach Browser Use right now."),
           ),
         ).toBe(true);
+=======
+        await expect(response.json()).resolves.toEqual({
+          route: "conversation",
+          reply: "Goodbye for now.",
+        });
+
+        expect(database.listTranscriptEntries()).toHaveLength(0);
+        const memories = database.listMemoryEntries();
+        expect(memories.length).toBeGreaterThan(0);
+        expect(memories[0]?.title).toStartWith("past_conversation_");
+        expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
+        expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
+>>>>>>> origin/main
       } finally {
         app.close();
         database.close();
