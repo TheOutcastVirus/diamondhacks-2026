@@ -7,6 +7,7 @@ import type {
 } from "./contracts";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
+import type { UploadedFileService } from "./files";
 import type { TranscriptEventBus } from "./transcript-bus";
 
 // OpenAI-compatible types for Imagine API
@@ -59,6 +60,11 @@ const TOOL_DEFINITIONS = [
           cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Recurrence type" },
           scheduleLabel: { type: "string", description: "Human-readable schedule description (e.g. 'Every day at 9am')" },
           timezone: { type: "string", description: "IANA timezone name (e.g. 'America/New_York')" },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional uploaded file ids to associate with the reminder.",
+          },
         },
         required: ["title", "instructions", "cron", "cadence", "scheduleLabel", "timezone"],
       },
@@ -81,6 +87,11 @@ const TOOL_DEFINITIONS = [
           scheduleLabel: { type: "string", description: "Updated human-readable schedule description" },
           timezone: { type: "string", description: "Updated IANA timezone name" },
           status: { type: "string", enum: ["active", "paused", "draft"], description: "Reminder status" },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Replace the reminder's attached uploaded files with these file ids.",
+          },
         },
         required: ["id"],
       },
@@ -123,6 +134,45 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ["task"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_uploaded_files",
+      description:
+        "List all uploaded files available to the household, including filenames, types, reminder links, and whether text extraction succeeded.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_uploaded_file",
+      description:
+        "Read an uploaded file by id. For PDFs and text files this returns extracted text when available, plus metadata such as filename and mime type.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to inspect" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "extract_pdf_text",
+      description:
+        "Force text extraction for an uploaded PDF or text-like document by id. Use when you need the document contents for a task.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to extract text from" },
+        },
+        required: ["id"],
       },
     },
   },
@@ -187,7 +237,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "request_user_input",
       description:
-        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details). The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string, e.g.: [{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}]',
+        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
       parameters: {
         type: "object",
         properties: {
@@ -205,7 +255,7 @@ const TOOL_DEFINITIONS = [
           fields_json: {
             type: "string",
             description:
-              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select","required":true|false}',
+              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select|file","required":true|false}. File fields may also include accept and multiple.',
           },
         },
         required: ["title", "fields_json"],
@@ -256,6 +306,7 @@ export class AgentHarness {
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
     private readonly browserUseService: BrowserUseService,
+    private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
   ) {}
 
@@ -286,6 +337,7 @@ export class AgentHarness {
   private buildMessages(request: AgentTurnRequest): ChatMessage[] {
     const reminders = this.database.listReminders();
     const memoryTitles = this.database.listMemoryTitles();
+    const uploadedFiles = this.database.listUploadedFiles();
     const allEntries = this.database.listTranscriptEntries();
     const history = allEntries.slice(-this.config.imagine.maxHistoryEntries);
 
@@ -298,7 +350,23 @@ export class AgentHarness {
       reminders.length === 0
         ? "No active reminders."
         : reminders
-            .map((r) => `- ${r.title} (${r.scheduleLabel}): ${r.instructions}`)
+            .map((r) => {
+              const attachmentSummary =
+                r.attachments && r.attachments.length > 0
+                  ? ` | attached files: ${r.attachments.map((attachment) => attachment.name).join(", ")}`
+                  : "";
+              return `- ${r.title} (${r.scheduleLabel}): ${r.instructions}${attachmentSummary}`;
+            })
+            .join("\n");
+
+    const uploadedFileSummary =
+      uploadedFiles.length === 0
+        ? "No uploaded files."
+        : uploadedFiles
+            .map((file) => {
+              const linkedReminder = file.reminderId ? ` -> reminder ${file.reminderId}` : "";
+              return `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]${linkedReminder}`;
+            })
             .join("\n");
 
     const forceNote = request.forceBrowser
@@ -322,6 +390,8 @@ ${reminderSummary}
 
 When you learn something worth remembering about the user or household, call write_memory to store it.
 When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
+Available uploaded files (call list_uploaded_files or read_uploaded_file for details):
+${uploadedFileSummary}
 
 TOOL USE RULES - follow exactly:
 - Only call a tool if the user EXPLICITLY requests that action.
@@ -330,7 +400,11 @@ TOOL USE RULES - follow exactly:
 - Use create_reminder ONLY if the user asks to set or schedule a reminder.
 - Use list_reminders ONLY if the user asks to see their reminders.
 - Never call more than one tool per turn unless strictly necessary.
-- Never repeat a tool call.${voiceNote}${forceNote}`;
+- Never repeat a tool call.
+- When you need user data, prefer request_user_input over asking for free-form prose.
+- For payment forms, collect the complete set of fields needed to actually submit the card, including billing address.
+- For shipping or delivery, collect the complete address in separate fields, plus recipient name and phone if useful.
+- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -377,6 +451,9 @@ TOOL USE RULES - follow exactly:
         }
 
         case "create_reminder": {
+          const attachmentFileIds = Array.isArray(args.attachmentFileIds)
+            ? args.attachmentFileIds.map((value) => String(value))
+            : undefined;
           result = this.database.createReminder({
             title: String(args.title ?? ""),
             instructions: String(args.instructions ?? ""),
@@ -384,6 +461,7 @@ TOOL USE RULES - follow exactly:
             cadence: (args.cadence as ReminderCadence) ?? "custom",
             scheduleLabel: String(args.scheduleLabel ?? ""),
             timezone: String(args.timezone ?? "UTC"),
+            ...(attachmentFileIds !== undefined && { attachmentFileIds }),
           });
           break;
         }
@@ -410,6 +488,9 @@ TOOL USE RULES - follow exactly:
           }
           if (args.status === "active" || args.status === "paused" || args.status === "draft") {
             update.status = args.status;
+          }
+          if (Array.isArray(args.attachmentFileIds)) {
+            update.attachmentFileIds = args.attachmentFileIds.map((value) => String(value));
           }
 
           result = this.database.updateReminder(String(args.id ?? ""), update as ReminderUpdateInput);
@@ -450,6 +531,32 @@ TOOL USE RULES - follow exactly:
 
           browserTask = { browserSessionId: session.id, previewUrl: session.previewUrl };
           result = browserTask;
+          break;
+        }
+
+        case "list_uploaded_files": {
+          result = this.database.listUploadedFiles();
+          break;
+        }
+
+        case "read_uploaded_file": {
+          const fileId = String(args.id ?? "");
+          const file = this.database.getUploadedFile(fileId);
+          if (!file) {
+            result = { error: "Uploaded file not found" };
+            break;
+          }
+          result = file.textStatus === "ready" ? file : await this.uploadedFileService.extractTextIfPossible(fileId);
+          break;
+        }
+
+        case "extract_pdf_text": {
+          const fileId = String(args.id ?? "");
+          const file = this.database.getUploadedFile(fileId);
+          result = file ?? { error: "Uploaded file not found" };
+          if (file) {
+            result = await this.uploadedFileService.extractTextIfPossible(fileId);
+          }
           break;
         }
 

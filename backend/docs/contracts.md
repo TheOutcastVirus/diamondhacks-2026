@@ -29,7 +29,16 @@ All frontend-facing routes are rooted at `/api` and return JSON unless marked as
       "nextRun": "2026-04-05T22:00:00.000Z",
       "status": "active",
       "owner": "Gazabot agent",
-      "timezone": "America/Los_Angeles"
+      "timezone": "America/Los_Angeles",
+      "attachments": [
+        {
+          "id": "file_abc123",
+          "name": "prescription.pdf",
+          "mimeType": "application/pdf",
+          "sizeBytes": 48312,
+          "textStatus": "ready"
+        }
+      ]
     }
   ]
 }
@@ -45,7 +54,8 @@ Request:
   "cadence": "daily",
   "cron": "0 15 * * *",
   "scheduleLabel": "Every day at 15:00",
-  "timezone": "America/Los_Angeles"
+  "timezone": "America/Los_Angeles",
+  "attachmentFileIds": ["file_abc123"]
 }
 ```
 
@@ -240,7 +250,7 @@ Response:
 
 ## User Input Prompts
 
-Used when the agent needs structured input from the user (e.g. payment details, a form). The agent creates a prompt via its `request_user_input` tool; the frontend detects it via the `prompt` SSE event and renders the form.
+Used when the agent needs structured input from the user (e.g. payment details, address, uploaded documents). The agent creates a prompt via its `request_user_input` tool; the frontend detects it via the `prompt` SSE event and renders the form.
 
 ### `GET /api/prompts`
 
@@ -256,8 +266,14 @@ Returns all pending (unfilled) prompts.
       "fields": [
         { "name": "card_number", "label": "Card Number", "type": "string", "required": true },
         { "name": "cardholder_name", "label": "Name on Card", "type": "string", "required": true },
-        { "name": "expiry", "label": "Expiry (MM/YY)", "type": "string", "required": true, "placeholder": "04/28" },
-        { "name": "cvv", "label": "CVV", "type": "password", "required": true }
+        { "name": "expiry_month", "label": "Expiry Month", "type": "string", "required": true, "placeholder": "04" },
+        { "name": "expiry_year", "label": "Expiry Year", "type": "string", "required": true, "placeholder": "2028" },
+        { "name": "security_code", "label": "Security Code", "type": "password", "required": true },
+        { "name": "billing_address_line_1", "label": "Billing Address Line 1", "type": "string", "required": true },
+        { "name": "billing_city", "label": "Billing City", "type": "string", "required": true },
+        { "name": "billing_state_or_region", "label": "Billing State / Region", "type": "string", "required": true },
+        { "name": "billing_postal_code", "label": "Billing Postal Code", "type": "string", "required": true },
+        { "name": "billing_country", "label": "Billing Country", "type": "string", "required": true }
       ],
       "status": "pending",
       "createdAt": "2026-04-04T19:00:00.000Z"
@@ -276,8 +292,9 @@ Request:
   "response": {
     "card_number": "4111111111111111",
     "cardholder_name": "Alice",
-    "expiry": "04/28",
-    "cvv": "123"
+    "expiry_month": "04",
+    "expiry_year": "2028",
+    "security_code": "123"
   }
 }
 ```
@@ -299,6 +316,19 @@ Response: the completed prompt object.
 
 The response data is recorded as a transcript entry and a `tool` SSE event is emitted. After submitting, send a follow-up message via `/api/agent/turn` to continue the conversation with the collected data in context.
 
+File fields return an array of uploaded file references, for example:
+```json
+[
+  {
+    "id": "file_abc123",
+    "name": "prescription.pdf",
+    "mimeType": "application/pdf",
+    "sizeBytes": 48312,
+    "textStatus": "ready"
+  }
+]
+```
+
 **Field types and recommended HTML inputs:**
 
 | `type` | HTML input |
@@ -308,6 +338,48 @@ The response data is recorded as a transcript entry and a `tool` SSE event is em
 | `int` | `<input type="number" step="1">` |
 | `float` | `<input type="number" step="any">` |
 | `boolean` | `<input type="checkbox">` |
+| `file` | `<input type="file">` |
+
+---
+
+## Files
+
+### `GET /api/files`
+
+Returns uploaded files available to the household.
+
+### `POST /api/files`
+
+Multipart form upload endpoint. Expected fields:
+- `file`: uploaded file blob
+- `displayName` (optional)
+- `promptId` (optional)
+- `fieldName` (optional)
+- `reminderId` (optional)
+
+Response:
+```json
+{
+  "file": {
+    "id": "file_abc123",
+    "name": "prescription.pdf",
+    "originalName": "prescription.pdf",
+    "mimeType": "application/pdf",
+    "sizeBytes": 48312,
+    "textStatus": "ready",
+    "createdAt": "2026-04-04T19:00:00.000Z",
+    "extractedText": "Prescription contents..."
+  }
+}
+```
+
+### `GET /api/files/:id`
+
+Returns one uploaded file record.
+
+### `GET /api/files/:id/text`
+
+Returns extracted text for the uploaded file and triggers extraction on demand if it has not already been produced.
 
 ---
 

@@ -18,6 +18,7 @@ export type Reminder = {
   status: ReminderStatus;
   owner?: string;
   timezone?: string;
+  attachments?: UploadedFileReference[];
 };
 
 export type ReminderCreateInput = {
@@ -27,6 +28,7 @@ export type ReminderCreateInput = {
   cron: string;
   scheduleLabel: string;
   timezone: string;
+  attachmentFileIds?: string[];
 };
 
 export type ReminderUpdateInput = {
@@ -37,6 +39,7 @@ export type ReminderUpdateInput = {
   scheduleLabel?: string;
   timezone?: string;
   status?: ReminderStatus;
+  attachmentFileIds?: string[];
 };
 
 export type TranscriptEntry = {
@@ -111,7 +114,8 @@ export type PromptFieldType =
   | "boolean"
   | "password"
   | "date"
-  | "select";
+  | "select"
+  | "file";
 
 export type PromptFieldOption = {
   label: string;
@@ -127,6 +131,27 @@ export type PromptField = {
   description?: string;
   options?: PromptFieldOption[];
   defaultValue?: string | number | boolean | null;
+  accept?: string;
+  multiple?: boolean;
+};
+
+export type UploadedFileTextStatus = "none" | "ready" | "failed";
+
+export type UploadedFileReference = {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  textStatus: UploadedFileTextStatus;
+};
+
+export type UploadedFile = UploadedFileReference & {
+  originalName: string;
+  createdAt: string;
+  reminderId?: string;
+  promptId?: string;
+  promptFieldName?: string;
+  extractedText?: string;
 };
 
 export type PromptStatus = "pending" | "completed" | "cancelled";

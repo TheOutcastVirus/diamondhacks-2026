@@ -9,10 +9,13 @@ import type {
   ReminderCreateInput,
   ReminderUpdateInput,
   TranscriptRole,
+  UploadedFile,
+  UploadedFileReference,
 } from "./contracts";
 import { AgentHarness, type AgentTurnResult } from "./agent";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
+import { UploadedFileService } from "./files";
 import { ReminderScheduler } from "./reminder-scheduler";
 import { SttService } from "./stt";
 import { TtsService } from "./tts";
@@ -129,6 +132,17 @@ function optionalRecord(record: Record<string, unknown>, key: string): Record<st
   return value as Record<string, unknown>;
 }
 
+function optionalStringArray(record: Record<string, unknown>, key: string): string[] | undefined {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.trim())) {
+    throw new Error(`Invalid field: ${key}`);
+  }
+  return value.map((item) => item.trim());
+}
+
 function normalizePromptFieldOption(value: unknown, index: number): PromptFieldOption {
   const record = asRecord(value);
   return {
@@ -148,7 +162,8 @@ function normalizePromptField(value: unknown): PromptField {
     type !== "boolean" &&
     type !== "password" &&
     type !== "date" &&
-    type !== "select"
+    type !== "select" &&
+    type !== "file"
   ) {
     throw new Error("Invalid field: type");
   }
@@ -172,6 +187,18 @@ function normalizePromptField(value: unknown): PromptField {
 
   if (Array.isArray(record.options)) {
     field.options = record.options.map((option, index) => normalizePromptFieldOption(option, index));
+  }
+
+  const accept = optionalString(record, "accept");
+  if (accept) {
+    field.accept = accept;
+  }
+
+  if ("multiple" in record) {
+    if (typeof record.multiple !== "boolean") {
+      throw new Error("Invalid field: multiple");
+    }
+    field.multiple = record.multiple;
   }
 
   const defaultValue = record.defaultValue;
@@ -199,10 +226,23 @@ function normalizePromptResponseValue(field: PromptField, value: unknown): unkno
     if (field.required) {
       throw new Error(`Invalid field: response.${field.name}`);
     }
-    return field.type === "boolean" ? false : null;
+    if (field.type === "boolean") return false;
+    if (field.type === "file") return [];
+    return null;
   }
 
   switch (field.type) {
+    case "file": {
+      const values = Array.isArray(value) ? value : [value];
+      const normalized = values.map((entry) => normalizeUploadedFileReference(entry, field.name));
+      if (field.required && normalized.length === 0) {
+        throw new Error(`Invalid field: response.${field.name}`);
+      }
+      if (!field.multiple && normalized.length > 1) {
+        throw new Error(`Invalid field: response.${field.name}`);
+      }
+      return normalized;
+    }
     case "boolean":
       if (typeof value === "boolean") return value;
       if (value === "true") return true;
@@ -230,6 +270,36 @@ function normalizePromptResponseValue(field: PromptField, value: unknown): unkno
   }
 
   throw new Error(`Invalid field: response.${field.name}`);
+}
+
+function normalizeUploadedFileReference(value: unknown, fieldName: string): UploadedFileReference {
+  const record = asRecord(value);
+  const sizeValue = record.sizeBytes;
+  const sizeBytes =
+    typeof sizeValue === "number" && Number.isFinite(sizeValue)
+      ? sizeValue
+      : typeof sizeValue === "string"
+        ? Number.parseInt(sizeValue, 10)
+        : NaN;
+  const textStatus =
+    record.textStatus === "ready" || record.textStatus === "failed" ? record.textStatus : "none";
+
+  if (
+    typeof record.id !== "string" ||
+    typeof record.name !== "string" ||
+    typeof record.mimeType !== "string" ||
+    !Number.isFinite(sizeBytes)
+  ) {
+    throw new Error(`Invalid field: response.${fieldName}`);
+  }
+
+  return {
+    id: record.id,
+    name: record.name,
+    mimeType: record.mimeType,
+    sizeBytes,
+    textStatus,
+  };
 }
 
 function normalizePromptResponse(
@@ -270,6 +340,7 @@ function parseMemoryWrite(payload: unknown): {
 function parseReminderCreateInput(payload: unknown): ReminderCreateInput {
   const record = asRecord(payload);
   const cadence = requireString(record, "cadence");
+  const attachmentFileIds = optionalStringArray(record, "attachmentFileIds");
   if (cadence !== "daily" && cadence !== "weekly" && cadence !== "custom") {
     throw new Error("Invalid field: cadence");
   }
@@ -281,6 +352,7 @@ function parseReminderCreateInput(payload: unknown): ReminderCreateInput {
     cron: requireString(record, "cron"),
     scheduleLabel: requireString(record, "scheduleLabel"),
     timezone: requireString(record, "timezone"),
+    ...(attachmentFileIds !== undefined && { attachmentFileIds }),
   };
 }
 
@@ -316,6 +388,9 @@ function parseReminderUpdateInput(payload: unknown): ReminderUpdateInput {
       throw new Error("Invalid field: status");
     }
     update.status = status;
+  }
+  if ("attachmentFileIds" in record) {
+    update.attachmentFileIds = optionalStringArray(record, "attachmentFileIds") ?? [];
   }
 
   if (Object.keys(update).length === 0) {
@@ -374,6 +449,8 @@ export class GazabotApp {
 
   private readonly reminderScheduler: ReminderScheduler;
 
+  private readonly uploadedFileService: UploadedFileService;
+
   private readonly unsubscribeReminderChanges: () => void;
 
   private readonly sttService: SttService;
@@ -385,7 +462,14 @@ export class GazabotApp {
     private readonly database: GazabotDatabase,
   ) {
     this.browserUseService = new BrowserUseService(config, database, this.transcriptBus);
-    this.agentHarness = new AgentHarness(config, database, this.browserUseService, this.transcriptBus);
+    this.uploadedFileService = new UploadedFileService(config, database);
+    this.agentHarness = new AgentHarness(
+      config,
+      database,
+      this.browserUseService,
+      this.uploadedFileService,
+      this.transcriptBus,
+    );
     this.reminderScheduler = new ReminderScheduler(
       config,
       database,
@@ -410,6 +494,8 @@ export class GazabotApp {
     const url = new URL(request.url);
     const reminderMatch = /^\/api\/reminders\/([^/]+)$/.exec(url.pathname);
     const memoryMatch = /^\/api\/memory\/([^/]+)$/.exec(url.pathname);
+    const fileMatch = /^\/api\/files\/([^/]+)$/.exec(url.pathname);
+    const fileTextMatch = /^\/api\/files\/([^/]+)\/text$/.exec(url.pathname);
 
     try {
       if (request.method === "GET" && url.pathname === "/health") {
@@ -497,6 +583,14 @@ export class GazabotApp {
         return jsonResponse(request, this.config, { entries: this.database.listMemoryEntries() });
       }
 
+      if (request.method === "GET" && url.pathname === "/api/files") {
+        return jsonResponse(request, this.config, { files: this.database.listUploadedFiles() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/files") {
+        return jsonResponse(request, this.config, await this.handleFileUpload(request));
+      }
+
       if (memoryMatch) {
         const title = decodeURIComponent(memoryMatch[1] ?? "");
         if (request.method === "GET") {
@@ -542,6 +636,32 @@ export class GazabotApp {
         );
       }
 
+      if (fileTextMatch && request.method === "GET") {
+        const fileId = decodeURIComponent(fileTextMatch[1] ?? "");
+        const file = this.database.getUploadedFile(fileId);
+        if (!file) {
+          return errorResponse(request, this.config, 404, "Uploaded file not found.");
+        }
+
+        const refreshed =
+          file.textStatus === "ready" ? file : await this.uploadedFileService.extractTextIfPossible(fileId);
+        return jsonResponse(request, this.config, {
+          fileId: refreshed.id,
+          textStatus: refreshed.textStatus,
+          text: refreshed.extractedText ?? "",
+        });
+      }
+
+      if (fileMatch && request.method === "GET") {
+        const fileId = decodeURIComponent(fileMatch[1] ?? "");
+        const file = this.database.getUploadedFile(fileId);
+        if (!file) {
+          return errorResponse(request, this.config, 404, "Uploaded file not found.");
+        }
+
+        return jsonResponse(request, this.config, { file });
+      }
+
       return errorResponse(request, this.config, 404, "Route not found.");
     } catch (error) {
       if (error instanceof Error) {
@@ -570,7 +690,11 @@ export class GazabotApp {
           return errorResponse(request, this.config, 502, error.message);
         }
 
-        if (error.message === "Reminder not found." || error.message === "Memory entry not found.") {
+        if (
+          error.message === "Reminder not found." ||
+          error.message === "Memory entry not found." ||
+          error.message === "Uploaded file not found."
+        ) {
           return errorResponse(request, this.config, 404, error.message);
         }
       }
@@ -765,6 +889,34 @@ export class GazabotApp {
     this.transcriptBus.publish("tool", responseEntry);
 
     return { prompt: completed, memoryEntry };
+  }
+
+  private async handleFileUpload(request: Request): Promise<{ file: UploadedFile }> {
+    let formData: Awaited<ReturnType<Request["formData"]>>;
+    try {
+      formData = await request.formData();
+    } catch {
+      throw new Error("Invalid request.");
+    }
+
+    const uploaded = formData.get("file");
+    if (!(uploaded instanceof File)) {
+      throw new Error("Invalid field: file");
+    }
+
+    const displayName = formData.get("displayName");
+    const promptId = formData.get("promptId");
+    const fieldName = formData.get("fieldName");
+    const reminderId = formData.get("reminderId");
+
+    const file = await this.uploadedFileService.saveUpload(uploaded, {
+      ...(typeof displayName === "string" && displayName.trim() ? { displayName } : {}),
+      ...(typeof promptId === "string" && promptId.trim() ? { promptId } : {}),
+      ...(typeof fieldName === "string" && fieldName.trim() ? { fieldName } : {}),
+      ...(typeof reminderId === "string" && reminderId.trim() ? { reminderId } : {}),
+    });
+
+    return { file };
   }
 
   async runReminderSchedulerOnce(now = new Date()): Promise<number> {

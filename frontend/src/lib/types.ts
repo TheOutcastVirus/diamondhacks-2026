@@ -7,7 +7,8 @@ export type EndpointKey =
   | 'transcript'
   | 'transcriptStream'
   | 'prompts'
-  | 'memory';
+  | 'memory'
+  | 'files';
 
 export type PageDefinition = {
   id: PageId;
@@ -32,6 +33,7 @@ export type Reminder = {
   status: ReminderStatus;
   owner?: string;
   timezone?: string;
+  attachments?: UploadedFileReference[];
 };
 
 export type TranscriptKind = 'message' | 'tool';
@@ -79,7 +81,8 @@ export type PromptFieldType =
   | 'boolean'
   | 'password'
   | 'date'
-  | 'select';
+  | 'select'
+  | 'file';
 
 export type PromptFieldOption = {
   label: string;
@@ -95,6 +98,27 @@ export type PromptField = {
   description?: string;
   options?: PromptFieldOption[];
   defaultValue?: string | number | boolean | null;
+  accept?: string;
+  multiple?: boolean;
+};
+
+export type UploadedFileTextStatus = 'none' | 'ready' | 'failed';
+
+export type UploadedFileReference = {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  textStatus: UploadedFileTextStatus;
+};
+
+export type UploadedFile = UploadedFileReference & {
+  originalName: string;
+  createdAt: string;
+  reminderId?: string;
+  promptId?: string;
+  promptFieldName?: string;
+  extractedText?: string;
 };
 
 export type PromptStatus = 'pending' | 'completed' | 'cancelled';
