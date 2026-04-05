@@ -22,6 +22,7 @@ const app = createApp(config);
 Bun.serve({
   hostname: config.host,
   port: config.port,
+  idleTimeout: 120,
   fetch(request) {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname.startsWith("/api/agent")) {

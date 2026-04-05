@@ -1,38 +1,172 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFile, unlink, readFile } from "node:fs/promises";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 
-function recordingArgs(outputPath: string): { cmd: string; args: string[] } {
-  const os = platform();
-  if (os === "darwin") {
-    return {
-      cmd: "ffmpeg",
-      args: ["-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", outputPath, "-y"],
-    };
+type AudioCommand = {
+  cmd: string;
+  args: string[];
+};
+
+function summarizeFfmpegStderr(chunks: string[]): string {
+  const text = chunks.join("").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
   }
-  // Linux (ALSA); works with PulseAudio via the ALSA plugin
+
+  return text.length > 280 ? `${text.slice(0, 277)}...` : text;
+}
+
+function unsupportedPlatformError(kind: "recording" | "playback", os: NodeJS.Platform): Error {
+  return new Error(`Audio ${kind} is not supported on platform "${os}".`);
+}
+
+function openAlRecordingArgs(deviceName: string, outputPath: string): AudioCommand {
   return {
     cmd: "ffmpeg",
-    args: ["-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", outputPath, "-y"],
+    args: [
+      "-hide_banner",
+      "-f",
+      "openal",
+      "-channels",
+      "1",
+      "-sample_size",
+      "16",
+      "-sample_rate",
+      "44100",
+      "-i",
+      deviceName,
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-y",
+      outputPath,
+    ],
   };
 }
 
-function playbackArgs(audioPath: string): { cmd: string; args: string[] } {
-  const os = platform();
-  if (os === "darwin") {
-    return { cmd: "afplay", args: [audioPath] };
-  }
+function dshowRecordingArgs(deviceName: string, outputPath: string): AudioCommand {
   return {
-    cmd: "ffplay",
-    args: ["-nodisp", "-autoexit", "-loglevel", "quiet", audioPath],
+    cmd: "ffmpeg",
+    args: [
+      "-hide_banner",
+      "-f",
+      "dshow",
+      "-audio_buffer_size",
+      "50",
+      "-i",
+      `audio=${deviceName}`,
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-y",
+      outputPath,
+    ],
   };
+}
+
+export function recordingArgsForPlatform(os: NodeJS.Platform, outputPath: string): AudioCommand {
+  switch (os) {
+    case "darwin":
+      return {
+        cmd: "ffmpeg",
+        args: ["-hide_banner", "-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-y", outputPath],
+      };
+    case "linux":
+      // Linux (ALSA); works with PulseAudio/PipeWire via the ALSA plugin on most deployments.
+      return {
+        cmd: "ffmpeg",
+        args: ["-hide_banner", "-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-y", outputPath],
+      };
+    case "win32":
+      return openAlRecordingArgs("", outputPath);
+    default:
+      throw unsupportedPlatformError("recording", os);
+  }
+}
+
+export function playbackArgsForPlatform(os: NodeJS.Platform, audioPath: string): AudioCommand {
+  switch (os) {
+    case "darwin":
+      return { cmd: "afplay", args: [audioPath] };
+    case "linux":
+    case "win32":
+      return {
+        cmd: "ffplay",
+        args: ["-nodisp", "-autoexit", "-loglevel", "quiet", audioPath],
+      };
+    default:
+      throw unsupportedPlatformError("playback", os);
+  }
+}
+
+function runCommandCapture(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
+      const combined = `${stdout ?? ""}\n${stderr ?? ""}`;
+      if (error) {
+        const code = typeof error.code === "number" ? error.code : undefined;
+        const text = combined.trim();
+        if (code === 1 || code === 234) {
+          resolve(text);
+          return;
+        }
+
+        reject(new Error(text || error.message));
+        return;
+      }
+
+      resolve(combined.trim());
+    });
+  });
+}
+
+export function parseOpenAlCaptureDevices(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\[[^\]]+\]\s{2,}(.+?)\s*$/)?.[1] ?? "")
+    .filter((line) => line.length > 0);
+}
+
+export function parseDshowAudioDevices(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\[[^\]]+\]\s+"(.+)"\s+\(audio\)$/)?.[1] ?? "")
+    .filter((line) => line.length > 0);
+}
+
+async function probeWindowsRecordingCommand(outputPath: string): Promise<AudioCommand> {
+  const openAlOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "openal", "-i", "dummy"]);
+  const openAlDevices = parseOpenAlCaptureDevices(openAlOutput);
+  if (openAlDevices.length > 0) {
+    return openAlRecordingArgs(openAlDevices[0] ?? "", outputPath);
+  }
+
+  const dshowOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+  const dshowDevices = parseDshowAudioDevices(dshowOutput);
+  if (dshowDevices.length > 0) {
+    return dshowRecordingArgs(dshowDevices[0] ?? "", outputPath);
+  }
+
+  throw new Error("No Windows audio capture device was found via ffmpeg (checked OpenAL and DirectShow).");
+}
+
+async function resolveRecordingCommand(outputPath: string): Promise<AudioCommand> {
+  const os = platform();
+  if (os === "win32") {
+    return probeWindowsRecordingCommand(outputPath);
+  }
+
+  return recordingArgsForPlatform(os, outputPath);
 }
 
 export class AudioService {
   private proc: ReturnType<typeof spawn> | null = null;
   private recordingPath: string | null = null;
+  private recordingError: string | null = null;
 
   async startRecording(): Promise<void> {
     if (this.proc) {
@@ -40,40 +174,120 @@ export class AudioService {
     }
 
     const outPath = join(tmpdir(), `voice-in-${Date.now()}.wav`);
-    const { cmd, args } = recordingArgs(outPath);
+    const { cmd, args } = await resolveRecordingCommand(outPath);
+    this.recordingError = null;
 
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
+      const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"] });
+      const stderrChunks: string[] = [];
 
-      let resolved = false;
+      let settled = false;
+      let started = false;
+      let pollTimer: ReturnType<typeof setTimeout> | null = null;
+      let startupTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanupTimers = () => {
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
+        if (startupTimer) {
+          clearTimeout(startupTimer);
+          startupTimer = null;
+        }
+      };
+
+      const fail = (message: string) => {
+        const stderr = summarizeFfmpegStderr(stderrChunks);
+        const error = new Error(stderr ? `${message} ${stderr}` : message);
+        this.recordingError = error.message;
+        unlink(outPath).catch(() => {});
+        return error;
+      };
+
       const done = (err?: Error) => {
-        if (resolved) return;
-        resolved = true;
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanupTimers();
         if (err) {
-          this.recordingPath = null;
           reject(err);
         } else {
           resolve();
         }
       };
 
-      child.on("error", (err) => done(new Error(`Failed to start recording: ${err.message}`)));
+      const markStarted = () => {
+        if (started || settled) {
+          return;
+        }
 
-      // ffmpeg writes startup lines to stderr; first output means it's running
-      child.stderr?.once("data", () => {
+        started = true;
         this.proc = child;
         this.recordingPath = outPath;
+        this.recordingError = null;
+        child.once("close", (code) => {
+          if (this.proc === child) {
+            this.proc = null;
+            this.recordingPath = null;
+            this.recordingError =
+              code === null ? "Recording process exited unexpectedly." : `Recording process exited with code ${code}.`;
+          }
+        });
         done();
+      };
+
+      child.stderr?.on("data", (chunk) => {
+        const text = chunk.toString();
+        stderrChunks.push(text);
+
+        // ffmpeg prints a steady-state line after the input and output open cleanly.
+        if (text.includes("Press [q] to stop") || text.includes("size=")) {
+          markStarted();
+        }
       });
 
-      // Fallback: assume started after 600 ms
-      setTimeout(() => {
-        if (!this.proc && !resolved) {
-          this.proc = child;
-          this.recordingPath = outPath;
+      const pollForOutput = async () => {
+        if (settled || started) {
+          return;
         }
-        done();
-      }, 600);
+
+        try {
+          const file = await stat(outPath);
+          if (file.isFile()) {
+            markStarted();
+            return;
+          }
+        } catch {
+          // The file has not been created yet.
+        }
+
+        if (child.exitCode !== null) {
+          done(fail(`Failed to start recording (exit code ${child.exitCode}).`));
+          return;
+        }
+
+        pollTimer = setTimeout(() => {
+          void pollForOutput();
+        }, 100);
+      };
+
+      child.once("error", (err) => done(new Error(`Failed to start recording: ${err.message}`)));
+      child.once("close", (code) => {
+        if (!started) {
+          done(fail(`Failed to start recording${code === null ? "." : ` (exit code ${code}).`}`));
+        }
+      });
+
+      startupTimer = setTimeout(() => {
+        if (!started) {
+          done(fail("Timed out while waiting for microphone recording to start."));
+        }
+      }, 3000);
+
+      void pollForOutput();
     });
   }
 
@@ -88,15 +302,63 @@ export class AudioService {
     this.proc = null;
     this.recordingPath = null;
 
-    // SIGTERM causes ffmpeg to flush and close the output file cleanly
-    child.kill("SIGTERM");
-
+    // Ask ffmpeg to stop gracefully so it flushes the WAV container before exit.
     await new Promise<void>((resolve) => {
-      child.on("close", resolve);
-      setTimeout(resolve, 4000); // safety timeout
+      let settled = false;
+      let forcedStopTimer: ReturnType<typeof setTimeout> | null = null;
+      let safetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const done = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        if (forcedStopTimer) {
+          clearTimeout(forcedStopTimer);
+        }
+        if (safetyTimer) {
+          clearTimeout(safetyTimer);
+        }
+        resolve();
+      };
+
+      child.once("close", done);
+
+      try {
+        child.stdin?.write("q\n");
+        child.stdin?.end();
+      } catch {
+        // Fall back to terminating the process below.
+      }
+
+      forcedStopTimer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // Ignore shutdown errors and let the safety timer resolve.
+        }
+      }, 1500);
+
+      safetyTimer = setTimeout(done, 5000);
     });
 
-    const buf = await readFile(outPath);
+    let buf: Buffer;
+    try {
+      buf = await readFile(outPath);
+    } catch (error) {
+      const code = error && typeof error === "object" ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code === "ENOENT") {
+        throw new Error(this.recordingError ?? "Recording stopped before any audio was saved.");
+      }
+      throw error;
+    }
+
+    if (buf.length === 0) {
+      unlink(outPath).catch(() => {});
+      throw new Error("Recording stopped before any audio was saved.");
+    }
+
     unlink(outPath).catch(() => {});
     return buf;
   }
@@ -105,7 +367,7 @@ export class AudioService {
     const audioPath = join(tmpdir(), `voice-out-${Date.now()}.mp3`);
     await writeFile(audioPath, audioBuffer);
 
-    const { cmd, args } = playbackArgs(audioPath);
+    const { cmd, args } = playbackArgsForPlatform(platform(), audioPath);
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(cmd, args, { stdio: "ignore" });

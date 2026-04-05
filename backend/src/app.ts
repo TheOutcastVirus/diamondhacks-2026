@@ -17,7 +17,9 @@ import { AudioService } from "./audio";
 import { BrowserUseService } from "./browser-use";
 import { GazabotDatabase } from "./db";
 import { UploadedFileService } from "./files";
+import { parseMultipartUpload } from "./multipart";
 import { ReminderScheduler } from "./reminder-scheduler";
+import { resolveReminderTimezone } from "./reminders";
 import { SttService } from "./stt";
 import { TtsService } from "./tts";
 import { TranscriptEventBus } from "./transcript-bus";
@@ -352,7 +354,7 @@ function parseReminderCreateInput(payload: unknown): ReminderCreateInput {
     cadence,
     cron: requireString(record, "cron"),
     scheduleLabel: requireString(record, "scheduleLabel"),
-    timezone: requireString(record, "timezone"),
+    timezone: resolveReminderTimezone(record.timezone),
     ...(attachmentFileIds !== undefined && { attachmentFileIds }),
   };
 }
@@ -688,7 +690,10 @@ export class GazabotApp {
           error.message === "Message is required." ||
           error.message === "Invalid cron expression." ||
           error.message.startsWith("Unknown timezone:") ||
-          error.message.startsWith("Prompt already ")
+          error.message.startsWith("Prompt already ") ||
+          error.name === "MulterError" ||
+          error.message === "Unexpected end of form" ||
+          error.message === "File too large"
         ) {
           return errorResponse(request, this.config, 400, error.message);
         }
@@ -846,11 +851,7 @@ export class GazabotApp {
       throw err;
     }
 
-    const audioOut = await this.ttsService.synthesize(result.replyText);
-    // Play on backend speaker; do not return audio to the client
-    this.audioService.playAudio(audioOut).catch((err) => {
-      console.error("[voice] Playback error:", err);
-    });
+    await this.speakReplyText(result.replyText, "voice");
 
     return jsonResponse(request, this.config, { ok: true, transcript: result.transcript });
   }
@@ -862,6 +863,7 @@ export class GazabotApp {
 
   private async handleVoiceStop(): Promise<{ ok: boolean; transcript: string }> {
     const audioBuffer = await this.audioService.stopRecording();
+    console.log(`[voice] Recorded buffer size: ${audioBuffer.length} bytes`);
 
     let result: { transcript: string; replyText: string };
     try {
@@ -873,11 +875,7 @@ export class GazabotApp {
       throw err;
     }
 
-    const audioOut = await this.ttsService.synthesize(result.replyText);
-    // Play on backend speaker asynchronously so the HTTP response returns promptly
-    this.audioService.playAudio(audioOut).catch((err) => {
-      console.error("[voice] Playback error:", err);
-    });
+    await this.speakReplyText(result.replyText, "voice");
 
     return { ok: true, transcript: result.transcript };
   }
@@ -943,28 +941,51 @@ export class GazabotApp {
   }
 
   private async handleFileUpload(request: Request): Promise<{ file: UploadedFile }> {
-    let formData: Awaited<ReturnType<Request["formData"]>>;
+    const fallbackRequest = request.clone();
+    let uploadedFile: File;
+    let displayName: string | undefined;
+    let promptId: string | undefined;
+    let fieldName: string | undefined;
+    let reminderId: string | undefined;
+
     try {
-      formData = await request.formData();
+      const { file: uploaded, fields } = await parseMultipartUpload(request);
+      uploadedFile = new File([uploaded.buffer], uploaded.originalname || "upload", {
+        type: uploaded.mimetype || "application/octet-stream",
+      });
+      displayName = typeof fields.displayName === "string" ? fields.displayName : undefined;
+      promptId = typeof fields.promptId === "string" ? fields.promptId : undefined;
+      fieldName = typeof fields.fieldName === "string" ? fields.fieldName : undefined;
+      reminderId = typeof fields.reminderId === "string" ? fields.reminderId : undefined;
     } catch {
-      throw new Error("Invalid request.");
+      let formData: Awaited<ReturnType<Request["formData"]>>;
+      try {
+        formData = await fallbackRequest.formData();
+      } catch {
+        throw new Error("Invalid request.");
+      }
+
+      const uploaded = formData.get("file");
+      if (!(uploaded instanceof File)) {
+        throw new Error("Invalid field: file");
+      }
+
+      uploadedFile = uploaded;
+      const fallbackDisplayName = formData.get("displayName");
+      const fallbackPromptId = formData.get("promptId");
+      const fallbackFieldName = formData.get("fieldName");
+      const fallbackReminderId = formData.get("reminderId");
+      displayName = typeof fallbackDisplayName === "string" ? fallbackDisplayName : undefined;
+      promptId = typeof fallbackPromptId === "string" ? fallbackPromptId : undefined;
+      fieldName = typeof fallbackFieldName === "string" ? fallbackFieldName : undefined;
+      reminderId = typeof fallbackReminderId === "string" ? fallbackReminderId : undefined;
     }
 
-    const uploaded = formData.get("file");
-    if (!(uploaded instanceof File)) {
-      throw new Error("Invalid field: file");
-    }
-
-    const displayName = formData.get("displayName");
-    const promptId = formData.get("promptId");
-    const fieldName = formData.get("fieldName");
-    const reminderId = formData.get("reminderId");
-
-    const file = await this.uploadedFileService.saveUpload(uploaded, {
-      ...(typeof displayName === "string" && displayName.trim() ? { displayName } : {}),
-      ...(typeof promptId === "string" && promptId.trim() ? { promptId } : {}),
-      ...(typeof fieldName === "string" && fieldName.trim() ? { fieldName } : {}),
-      ...(typeof reminderId === "string" && reminderId.trim() ? { reminderId } : {}),
+    const file = await this.uploadedFileService.saveUpload(uploadedFile, {
+      ...(displayName?.trim() ? { displayName } : {}),
+      ...(promptId?.trim() ? { promptId } : {}),
+      ...(fieldName?.trim() ? { fieldName } : {}),
+      ...(reminderId?.trim() ? { reminderId } : {}),
     });
 
     return { file };
@@ -1041,6 +1062,9 @@ export class GazabotApp {
         `Reminder fired: ${reminder.title}. ${reminder.instructions}`,
         { reminderId: reminder.id, dueAt, reminderTitle: reminder.title },
       );
+      if (result.kind === "text") {
+        await this.speakReplyText(result.text, "reminder");
+      }
 
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
@@ -1073,6 +1097,13 @@ export class GazabotApp {
       console.error(`[reminder] Failed ${reminder.id} "${reminder.title}": ${message}`);
       throw error;
     }
+  }
+
+  private async speakReplyText(text: string, source: "voice" | "reminder"): Promise<void> {
+    const audioOut = await this.ttsService.synthesize(text);
+    this.audioService.playAudio(audioOut).catch((err) => {
+      console.error(`[${source}] Playback error:`, err);
+    });
   }
 }
 
