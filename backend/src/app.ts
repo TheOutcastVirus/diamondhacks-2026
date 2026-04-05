@@ -1089,6 +1089,9 @@ export class GazabotApp {
     }
 
     let transcript = "";
+    const recordingStartedAt = Date.now();
+    let recordingStoppedAt = recordingStartedAt;
+    let sttFinishedAt = recordingStartedAt;
     try {
       this.setInteractionPhase("conversation", "user_listening");
       if (process.platform === "win32") {
@@ -1097,14 +1100,30 @@ export class GazabotApp {
           silenceDuration: 1,
           maxDuration: 10,
         });
+        recordingStoppedAt = Date.now();
+        console.log(
+          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
+        );
         transcript = await this.sttService.transcribe(audioBuffer);
+        sttFinishedAt = Date.now();
+        console.log(
+          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
+        );
       } else {
         const session = await this.sttService.createRealtimeSession();
         await this.audioService.recordPcmUntilSilence(
           (chunk) => session.sendAudio(chunk),
           { silenceDb: -20, silenceDuration: 1, maxDuration: 10 },
         );
+        recordingStoppedAt = Date.now();
+        console.log(
+          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
+        );
         transcript = await session.finalize();
+        sttFinishedAt = Date.now();
+        console.log(
+          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
+        );
       }
     } catch (err) {
       console.error("[conversation] Recording failed:", err);
@@ -1491,7 +1510,11 @@ export class GazabotApp {
   }
 
   private async speakReplyText(text: string, source: "voice" | "reminder"): Promise<void> {
+    const ttsStartedAt = Date.now();
     const audioOut = await this.ttsService.synthesize(text);
+    console.log(
+      `[${source === "voice" ? "conversation" : "reminder"}] TTS done          +${((Date.now() - ttsStartedAt) / 1000).toFixed(1)}s`,
+    );
     await this.audioService.playAudio(audioOut);
   }
 }
