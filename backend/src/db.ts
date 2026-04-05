@@ -22,6 +22,7 @@ import type {
   UserPrompt,
 } from "./contracts";
 import { computeNextRun } from "./cron";
+import { resolveReminderTimezone } from "./reminders";
 
 type ReminderRow = {
   id: string;
@@ -596,6 +597,7 @@ export class GazabotDatabase {
 
   createReminder(input: ReminderCreateInput): Reminder {
     const attachments = this.resolveUploadedFileReferences(input.attachmentFileIds);
+    const timezone = resolveReminderTimezone(input.timezone);
     const row: ReminderRow = {
       id: prefixedId("r"),
       title: input.title.trim(),
@@ -605,12 +607,12 @@ export class GazabotDatabase {
       schedule_label: input.scheduleLabel.trim(),
       next_run: nextRunForReminder({
         cron: input.cron.trim(),
-        timezone: input.timezone.trim(),
+        timezone,
         status: "active",
       }),
       status: "active",
       owner: "Gazabot agent",
-      timezone: input.timezone.trim(),
+      timezone,
       created_at: nowIso(),
       attachments_json: JSON.stringify(attachments),
     };
@@ -720,7 +722,7 @@ export class GazabotDatabase {
     const cadence = input.cadence ?? existing.cadence;
     const cron = input.cron === undefined ? existing.cron : input.cron.trim();
     const scheduleLabel = input.scheduleLabel === undefined ? existing.schedule_label : input.scheduleLabel.trim();
-    const timezone = input.timezone === undefined ? existing.timezone : input.timezone.trim();
+    const timezone = input.timezone === undefined ? existing.timezone : resolveReminderTimezone(input.timezone);
     const status = input.status ?? existing.status;
     const attachments =
       input.attachmentFileIds === undefined

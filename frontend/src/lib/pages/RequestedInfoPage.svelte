@@ -16,9 +16,11 @@
   let submitBusy: Record<string, boolean> = {};
   let submitFeedback: Record<string, FeedbackState | undefined> = {};
   let uploadBusy: Record<string, boolean> = {};
+  let libraryUploadBusy = false;
+  let libraryUploadFeedback: FeedbackState | null = null;
   let formValues: Record<string, Record<string, string | number | boolean | UploadedFileReference[]>> = {};
   let selectedMemoryTitle = '';
-  let selectedFileId = '';
+  let expandedFileId = '';
   let eventSource: EventSource | null = null;
 
   function formatDate(value: string) {
@@ -233,11 +235,9 @@
         selectedMemoryTitle = memoryEntries[0]?.title ?? '';
       }
 
-      if (!selectedFileId && uploadedFiles.length > 0) {
-        selectedFileId = uploadedFiles[0].id;
-      } else if (selectedFileId && !uploadedFiles.some((file) => file.id === selectedFileId)) {
-        selectedFileId = uploadedFiles[0]?.id ?? '';
-      }
+      expandedFileId = uploadedFiles.some((file) => file.id === expandedFileId)
+        ? expandedFileId
+        : (uploadedFiles[0]?.id ?? '');
     } catch (error) {
       loadError = error instanceof Error ? error.message : 'Unable to load requested information.';
       prompts = [];
@@ -295,13 +295,44 @@
       const nextValue = field.multiple ? [...current, ...uploaded] : uploaded.slice(0, 1);
       setFieldValue(prompt.id, field.name, nextValue);
       uploadedFiles = [...uploaded, ...uploadedFiles.filter((item) => !uploaded.some((entry) => entry.id === item.id))];
-      if (!selectedFileId && uploaded.length > 0) {
-        selectedFileId = uploaded[0].id;
+      if (uploaded.length > 0) {
+        expandFileSection(uploaded[0].id);
       }
     } catch (error) {
       setFeedback(prompt.id, 'error', error instanceof Error ? error.message : 'Unable to upload file.');
     } finally {
       uploadBusy = { ...uploadBusy, [uploadKey]: false };
+    }
+  }
+
+  async function uploadLibraryFiles(files: FileList | null) {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    libraryUploadBusy = true;
+    libraryUploadFeedback = null;
+
+    try {
+      const uploaded = await Promise.all(
+        Array.from(files).map(async (file) => {
+          const payload = await uploadFile('files', file);
+          return normalizeUploadedFile((payload as { file: unknown }).file, 0);
+        }),
+      );
+
+      uploadedFiles = [...uploaded, ...uploadedFiles.filter((item) => !uploaded.some((entry) => entry.id === item.id))];
+      if (uploaded.length > 0) {
+        expandedFileId = uploaded[0].id;
+      }
+      libraryUploadFeedback = { tone: 'success', text: 'Files added to the document library.' };
+    } catch (error) {
+      libraryUploadFeedback = {
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Unable to upload files.',
+      };
+    } finally {
+      libraryUploadBusy = false;
     }
   }
 
@@ -314,6 +345,27 @@
       fieldName,
       current.filter((file) => file.id !== fileId),
     );
+  }
+
+  function isFileExpanded(fileId: string) {
+    return expandedFileId === fileId;
+  }
+
+  function expandFileSection(fileId: string) {
+    if (expandedFileId === fileId) {
+      return;
+    }
+
+    expandedFileId = fileId;
+  }
+
+  function toggleFileSection(fileId: string) {
+    if (expandedFileId === fileId) {
+      expandedFileId = '';
+      return;
+    }
+
+    expandedFileId = fileId;
   }
 
   async function submitPrompt(prompt: UserPrompt) {
@@ -351,7 +403,6 @@
   $: completedPrompts = prompts.filter((prompt) => prompt.status === 'completed');
   $: selectedMemory =
     memoryEntries.find((entry) => entry.title === selectedMemoryTitle) ?? memoryEntries[0] ?? null;
-  $: selectedFile = uploadedFiles.find((file) => file.id === selectedFileId) ?? uploadedFiles[0] ?? null;
 </script>
 
 <section class="page-grid">
@@ -456,10 +507,10 @@
                         <div class="upload-chip-list">
                           {#each (formValues[prompt.id]?.[field.name] as UploadedFileReference[]) ?? [] as file}
                             <div class="upload-chip">
-                              <button class="file-link" type="button" on:click={() => (selectedFileId = file.id)}>
+                              <button class="file-link" type="button" on:click={() => expandFileSection(file.id)}>
                                 {file.name}
                               </button>
-                              <span class="field-note">{formatBytes(file.sizeBytes)} • {file.textStatus}</span>
+                              <span class="field-note">{formatBytes(file.sizeBytes)} | {file.textStatus}</span>
                               <button class="ghost chip-action" type="button" on:click={() => removePromptFile(prompt.id, field.name, file.id)}>
                                 Remove
                               </button>
@@ -618,64 +669,78 @@
         </div>
       </div>
 
+      <div class="file-field">
+        <input class="field-input file-input" type="file" multiple on:change={(event) => uploadLibraryFiles(event.currentTarget.files)} />
+        <span class="field-note">Upload documents directly to the shared library or attach them while filling a request or editing a reminder.</span>
+        {#if libraryUploadBusy}
+          <span class="field-note">Uploading files...</span>
+        {/if}
+        {#if libraryUploadFeedback}
+          <p class={`feedback ${libraryUploadFeedback.tone === 'error' ? 'feedback-error' : 'feedback-success'}`}>
+            {libraryUploadFeedback.text}
+          </p>
+        {/if}
+      </div>
+
       {#if uploadedFiles.length === 0}
         <p class="panel-copy">Uploaded prescriptions, delivery instructions, and other documents will appear here.</p>
       {:else}
-        <div class="memory-layout">
-          <div class="memory-list" role="tablist" aria-label="Uploaded files">
-            {#each uploadedFiles as file}
+        <div class="document-library" aria-label="Uploaded files">
+          {#each uploadedFiles as file}
+            <article class={`document-card ${isFileExpanded(file.id) ? 'document-open' : ''}`}>
               <button
-                class:active-memory={selectedFile?.id === file.id}
-                class="memory-item"
+                aria-expanded={isFileExpanded(file.id)}
+                class="document-toggle"
                 type="button"
-                on:click={() => (selectedFileId = file.id)}
+                on:click={() => toggleFileSection(file.id)}
               >
-                <span class="memory-item-label">{file.name}</span>
-                <span class="memory-item-key">{file.mimeType}</span>
+                <div class="document-heading">
+                  <div class="document-title-block">
+                    <p class="panel-label">Uploaded File</p>
+                    <h4 class="document-title">{file.name}</h4>
+                  </div>
+
+                  <div class="document-summary">
+                    <span class="key-pill">{file.textStatus}</span>
+                    <span class="document-summary-copy">{formatBytes(file.sizeBytes)} | {formatDate(file.createdAt)}</span>
+                  </div>
+                </div>
+
+                <div class="document-subrow">
+                  <div class="schema-chips">
+                    <span class="schema-chip">{file.mimeType}</span>
+                    {#if file.promptId}
+                      <span class="schema-chip">prompt {file.promptId}</span>
+                    {/if}
+                    {#if file.reminderId}
+                      <span class="schema-chip">reminder {file.reminderId}</span>
+                    {/if}
+                  </div>
+                  <span class="document-toggle-label">{isFileExpanded(file.id) ? 'Collapse' : 'Expand'}</span>
+                </div>
               </button>
-            {/each}
-          </div>
 
-          {#if selectedFile}
-            <article class="memory-detail">
-              <div class="memory-detail-head">
-                <div>
-                  <p class="panel-label">Uploaded File</p>
-                  <h3 class="callout-heading">{selectedFile.name}</h3>
-                </div>
-                <span class="key-pill">{selectedFile.textStatus}</span>
-              </div>
+              {#if isFileExpanded(file.id)}
+                <div class="document-body">
+                  <dl class="detail-grid">
+                    <div>
+                      <dt class="detail-term">Uploaded</dt>
+                      <dd class="detail-value">{formatDate(file.createdAt)}</dd>
+                    </div>
+                    <div>
+                      <dt class="detail-term">Size</dt>
+                      <dd class="detail-value">{formatBytes(file.sizeBytes)}</dd>
+                    </div>
+                  </dl>
 
-              <dl class="detail-grid">
-                <div>
-                  <dt class="detail-term">Uploaded</dt>
-                  <dd class="detail-value">{formatDate(selectedFile.createdAt)}</dd>
+                  <section class="json-panel">
+                    <p class="panel-label">Extracted Text</p>
+                    <pre class="json-block file-text-block">{file.extractedText ?? 'No extracted text available.'}</pre>
+                  </section>
                 </div>
-                <div>
-                  <dt class="detail-term">Size</dt>
-                  <dd class="detail-value">{formatBytes(selectedFile.sizeBytes)}</dd>
-                </div>
-              </dl>
-
-              <section class="schema-panel">
-                <p class="panel-label">Metadata</p>
-                <div class="schema-chips">
-                  <span class="schema-chip">{selectedFile.mimeType}</span>
-                  {#if selectedFile.promptId}
-                    <span class="schema-chip">prompt {selectedFile.promptId}</span>
-                  {/if}
-                  {#if selectedFile.reminderId}
-                    <span class="schema-chip">reminder {selectedFile.reminderId}</span>
-                  {/if}
-                </div>
-              </section>
-
-              <section class="json-panel">
-                <p class="panel-label">Extracted Text</p>
-                <pre class="json-block">{selectedFile.extractedText ?? 'No extracted text available.'}</pre>
-              </section>
+              {/if}
             </article>
-          {/if}
+          {/each}
         </div>
       {/if}
     </section>
@@ -813,6 +878,13 @@
     background: var(--color-panel);
   }
 
+  div.document-library {
+    display: flex;
+    flex-direction: column;
+    gap: 1.15rem;
+    margin-top: 0.4rem;
+  }
+
   label.field-span {
     grid-column: 1 / -1;
   }
@@ -899,6 +971,21 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  button.document-toggle {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1.25rem 1.35rem;
+    text-align: left;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: inherit;
   }
 
   button.chip-action {
@@ -957,6 +1044,80 @@
   article.history-card {
     border-top: var(--border-width) solid var(--color-line);
     padding-top: 0.9rem;
+  }
+
+  article.document-card {
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 6%, transparent), transparent 50%),
+      color-mix(in srgb, var(--color-panel-muted) 82%, var(--color-panel));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-line) 45%, transparent);
+  }
+
+  article.document-open {
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 58%),
+      color-mix(in srgb, var(--color-panel-muted) 88%, var(--color-panel));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 28%, transparent);
+  }
+
+  div.document-heading,
+  div.document-subrow {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+
+  div.document-title-block,
+  div.document-summary,
+  div.document-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  div.document-summary {
+    align-items: flex-end;
+    text-align: right;
+    flex: 0 0 auto;
+  }
+
+  h4.document-title {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 1.05rem;
+    color: var(--color-ink-strong);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    text-wrap: balance;
+  }
+
+  span.document-summary-copy,
+  span.document-toggle-label {
+    font-size: 0.85rem;
+    color: var(--color-ink-soft);
+  }
+
+  span.document-toggle-label {
+    min-width: 4.75rem;
+    text-align: right;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  div.document-body {
+    gap: 1.15rem;
+    padding: 0 1.35rem 1.35rem;
+  }
+
+  article.document-card .key-pill,
+  article.document-card .schema-chip {
+    border: none;
+    background: color-mix(in srgb, var(--color-panel) 74%, transparent);
+  }
+
+  article.document-card .schema-chips {
+    gap: 0.55rem;
   }
 
   div.memory-layout {
@@ -1047,6 +1208,16 @@
     font: 0.88rem/1.55 var(--font-mono);
   }
 
+  pre.file-text-block {
+    max-height: 26rem;
+    padding: 1.2rem 1.25rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    border: none;
+    background: color-mix(in srgb, var(--color-panel) 84%, transparent);
+  }
+
   @media (max-width: 1180px) {
     section.page-grid,
     div.memory-layout {
@@ -1065,7 +1236,9 @@
     div.request-head,
     div.history-meta,
     div.memory-detail-head,
-    div.form-footer {
+    div.form-footer,
+    div.document-heading,
+    div.document-subrow {
       flex-direction: column;
     }
 
@@ -1079,6 +1252,15 @@
     div.upload-chip {
       flex-direction: column;
       align-items: flex-start;
+    }
+
+    div.document-summary {
+      align-items: flex-start;
+      text-align: left;
+    }
+
+    span.document-toggle-label {
+      text-align: left;
     }
   }
 </style>

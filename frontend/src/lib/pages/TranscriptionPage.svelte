@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { createEventStream, get } from '../api';
   import type { ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
   import VoiceInput from '../components/VoiceInput.svelte';
@@ -117,7 +117,7 @@
     if (autoScroll) {
       requestAnimationFrame(() => {
         const feed = document.querySelector<HTMLElement>('[data-transcript-feed]');
-        feed?.scrollTo({ top: 0, behavior: 'smooth' });
+        feed?.scrollTo({ top: feed.scrollHeight, behavior: 'smooth' });
       });
     }
   }
@@ -129,6 +129,11 @@
     try {
       const payload = await get<unknown>('transcript');
       entries = normalizeTranscriptResponse(payload);
+      if (autoScroll) {
+        await tick();
+        const feed = document.querySelector<HTMLElement>('[data-transcript-feed]');
+        feed?.scrollTo({ top: feed.scrollHeight, behavior: 'auto' });
+      }
     } catch (error) {
       streamError = error instanceof Error ? error.message : 'Unable to load transcript history.';
     } finally {
@@ -208,9 +213,7 @@
 
   $: messageCount = entries.filter((entry) => entry.kind === 'message').length;
   $: toolCount = entries.filter((entry) => entry.kind === 'tool').length;
-  $: filteredEntries = (
-    filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode)
-  ).slice().reverse();
+  $: filteredEntries = filterMode === 'all' ? entries : entries.filter((entry) => entry.kind === filterMode);
 </script>
 
 <section class="page-grid tx-console" aria-label="Live transcript">

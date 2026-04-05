@@ -8,6 +8,7 @@ import type {
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
+import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { TranscriptEventBus } from "./transcript-bus";
 
 // OpenAI-compatible types for Imagine API
@@ -59,14 +60,17 @@ const TOOL_DEFINITIONS = [
           cron: { type: "string", description: "5-field cron expression (e.g. '0 9 * * *' for 9am daily)" },
           cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Recurrence type" },
           scheduleLabel: { type: "string", description: "Human-readable schedule description (e.g. 'Every day at 9am')" },
-          timezone: { type: "string", description: "IANA timezone name (e.g. 'America/New_York')" },
+          timezone: {
+            type: "string",
+            description: `Optional IANA timezone name (e.g. 'America/New_York'). Defaults to ${DEFAULT_REMINDER_TIMEZONE}.`,
+          },
           attachmentFileIds: {
             type: "array",
             items: { type: "string" },
             description: "Optional uploaded file ids to associate with the reminder.",
           },
         },
-        required: ["title", "instructions", "cron", "cadence", "scheduleLabel", "timezone"],
+        required: ["title", "instructions", "cron", "cadence", "scheduleLabel"],
       },
     },
   },
@@ -152,7 +156,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "read_uploaded_file",
       description:
-        "Read an uploaded file by id. For PDFs and text files this returns extracted text when available, plus metadata such as filename and mime type.",
+        "Read an uploaded file by id. Returns filename, file metadata, and the extracted plain-text clone when available so a text-only model can use the file contents.",
       parameters: {
         type: "object",
         properties: {
@@ -167,7 +171,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "extract_pdf_text",
       description:
-        "Force text extraction for an uploaded PDF or text-like document by id. Use when you need the document contents for a task.",
+        "Force text extraction for an uploaded file by id, especially PDFs, screenshots, photos, and other documents where visible text matters. Use when you need OCR-style contents for a task.",
       parameters: {
         type: "object",
         properties: {
@@ -407,10 +411,13 @@ TOOL USE RULES - follow exactly:
 - Use list_reminders ONLY if the user asks to see their reminders.
 - Never call more than one tool per turn unless strictly necessary.
 - Never repeat a tool call.
-- When you need user data, prefer request_user_input over asking for free-form prose.
-- For payment forms, collect the complete set of fields needed to actually submit the card, including billing address.
-- For shipping or delivery, collect the complete address in separate fields, plus recipient name and phone if useful.
-- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}`;
+- For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.
+- read_uploaded_file returns a text-only clone of the file. For images, prioritize the exact visible text and numbers from the image; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
+- When a user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on its contentText field as the file content you can reason over. If the user asks to extract text from an image, you only have access to the contentText. If the user absolutely wants to re-extract text, use the extract_pdf_text tool.
+- When you need specific user data (such as credit card information), prefer request_user_input over asking for free-form prose.
+- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
+- The run_browser_task tool hands off the task to another agent, who does not have access to the information you do. It is your job to supply the browser agent with all the information needed to complete the task (For example, when buying something, ensure to either collect credit card information and address information - request_user_input - or retrieve it from memory - read_memory - when available)
+- Whenever you call request_user_input, ensure to use the speak tool to notify the user that they have information to fill out through the web UI Requested Info panel.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -466,7 +473,7 @@ TOOL USE RULES - follow exactly:
             cron: String(args.cron ?? ""),
             cadence: (args.cadence as ReminderCadence) ?? "custom",
             scheduleLabel: String(args.scheduleLabel ?? ""),
-            timezone: String(args.timezone ?? "UTC"),
+            timezone: resolveReminderTimezone(args.timezone),
             ...(attachmentFileIds !== undefined && { attachmentFileIds }),
           });
           break;
@@ -552,7 +559,19 @@ TOOL USE RULES - follow exactly:
             result = { error: "Uploaded file not found" };
             break;
           }
-          result = file.textStatus === "ready" ? file : await this.uploadedFileService.extractTextIfPossible(fileId);
+          const extracted = file.textStatus === "ready" ? file : await this.uploadedFileService.extractTextIfPossible(fileId);
+          result = {
+            id: extracted.id,
+            name: extracted.name,
+            originalName: extracted.originalName,
+            mimeType: extracted.mimeType,
+            sizeBytes: extracted.sizeBytes,
+            textStatus: extracted.textStatus,
+            promptId: extracted.promptId,
+            promptFieldName: extracted.promptFieldName,
+            reminderId: extracted.reminderId,
+            contentText: extracted.extractedText ?? "",
+          };
           break;
         }
 
