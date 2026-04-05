@@ -869,7 +869,9 @@ export class BrowserUseService {
                 ? "browser_confirmation"
                 : need.kind === "login"
                   ? "browser_login"
-                  : "browser_hitl_info";
+                  : need.kind === "product_choice"
+                    ? "pending_shop_choice"
+                    : "browser_hitl_info";
         const promptTitle =
           need.kind === "payment_card"
             ? "Payment Information Needed"
@@ -877,7 +879,9 @@ export class BrowserUseService {
               ? "Delivery Address Needed"
               : need.kind === "login"
                 ? "Login Required"
-                : "Information Needed";
+                : need.kind === "product_choice"
+                  ? "Choose an Option"
+                  : "Information Needed";
         const promptDescription =
           need.kind === "payment_card"
             ? "The browser agent needs your payment card to complete checkout."
@@ -885,7 +889,9 @@ export class BrowserUseService {
               ? "The browser agent needs your delivery address to complete checkout."
               : need.kind === "login"
                 ? "The browser agent needs you to log in. Switch to the Browser tab, log in through the live view, then return here and click Done."
-                : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
+                : need.kind === "product_choice"
+                  ? `The browser found multiple options. Please pick one: ${currentSummary.slice(0, 300)}`
+                  : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
         const fields =
           need.kind === "payment_card"
             ? this.buildPaymentPromptFields()
@@ -895,7 +901,9 @@ export class BrowserUseService {
                 ? this.buildConfirmationPromptFields()
                 : need.kind === "login"
                   ? [] // No fields — user logs in via the live browser view
-                  : [{ name: "info", label: "Information", type: "text" as const, required: true }];
+                  : need.kind === "product_choice"
+                    ? [{ name: "chosen_option", label: "Your Choice", type: "text" as const, required: true, description: "Type the name or number of the option you want" }]
+                    : [{ name: "info", label: "Information", type: "text" as const, required: true }];
 
         const prompt = this.database.createPrompt({
           title: promptTitle,
@@ -1298,6 +1306,12 @@ export class BrowserUseService {
       "confirm", "confirmation", "approve", "review order",
       "place order", "submit order", "verify", "authorize",
     ];
+    const productChoicePatterns = [
+      "which one", "choose from", "select from", "pick one",
+      "multiple options", "multiple results", "several options",
+      "which item", "which product", "which would you like",
+      "found several", "found multiple", "here are the options",
+    ];
 
     for (const p of loginPatterns) {
       if (lower.includes(p)) {
@@ -1312,6 +1326,11 @@ export class BrowserUseService {
     for (const p of addressPatterns) {
       if (lower.includes(p)) {
         return { kind: "delivery_address", rawMessage: output };
+      }
+    }
+    for (const p of productChoicePatterns) {
+      if (lower.includes(p)) {
+        return { kind: "product_choice", rawMessage: output };
       }
     }
     for (const p of confirmationPatterns) {
@@ -1404,6 +1423,17 @@ export class BrowserUseService {
     }
     if (needKind === "login") {
       return "The user has now logged in through the live browser view. Continue with the original task from where you left off.";
+    }
+    if (needKind === "product_choice") {
+      const choice = this.database.readMemory("pending_shop_choice");
+      if (choice?.data) {
+        const data = choice.data as Record<string, unknown>;
+        const chosen = data.chosen_option ?? data.chosen_value ?? data.label;
+        if (chosen) {
+          return `Continue from where you left off. The user chose: ${String(chosen)}. Select that option and proceed.`;
+        }
+      }
+      return "Continue from where you left off. The user has made their selection.";
     }
 
     const extraInfo = this.database.readMemory("browser_hitl_info");

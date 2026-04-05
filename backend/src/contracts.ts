@@ -179,7 +179,7 @@ export type ApiErrorPayload = {
   details?: unknown;
 };
 
-export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "login" | "unknown";
+export type HitlNeedKind = "payment_card" | "delivery_address" | "confirmation" | "login" | "product_choice" | "unknown";
 
 export type HitlNeed = {
   kind: HitlNeedKind;

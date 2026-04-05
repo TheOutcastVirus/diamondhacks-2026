@@ -239,6 +239,31 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "present_options",
+      description:
+        'Present a numbered list of options to the user and wait for their choice. Use when the user needs to pick from multiple products, restaurants, search results, or any list of choices. The options appear as a selectable list on the frontend AND are spoken aloud for voice users. The user can respond by voice (saying the number or name) or by tapping on screen. After the user picks, the selection is saved to memory under the given memory_key.',
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Title shown to the user, e.g. 'Which chips would you like?'" },
+          description: { type: "string", description: "Optional context about the options" },
+          options_json: {
+            type: "string",
+            description:
+              'JSON array of option objects. Each: {"label":"Display name","value":"unique_id","detail":"optional price or description"}. Example: [{"label":"Lay\'s Classic","value":"lays_classic","detail":"$3.49"},{"label":"Doritos Nacho","value":"doritos_nacho","detail":"$4.29"}]',
+          },
+          memory_key: {
+            type: "string",
+            description: "Memory key to store the selection under, e.g. 'pending_shop_choice'",
+          },
+        },
+        required: ["title", "options_json"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "end_conversation",
       description:
         "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
@@ -290,6 +315,8 @@ type TurnRuntime = {
   pauseRequested: boolean;
   promptSent: boolean;
   endConversation: boolean;
+  /** When present_options ran without speak, use this for voice TTS. */
+  optionsSpokenList?: string;
 };
 
 const EMPTY_OBJECT_SCHEMA = z.object({});
@@ -387,6 +414,19 @@ const REQUEST_USER_INPUT_SCHEMA = z.object({
   memory_label: z.string().optional().describe("Human-friendly label for the saved memory."),
   fields_json: z.string().min(2).describe("JSON array string defining the prompt fields."),
   fields: z.string().optional().describe("Optional JSON array string defining the prompt fields."),
+});
+
+const PRESENT_OPTIONS_SCHEMA = z.object({
+  title: z.string().min(1).describe("Title shown to the user, e.g. Which item would you like?"),
+  description: z.string().optional().describe("Optional context about the options."),
+  options_json: z
+    .string()
+    .min(2)
+    .describe('JSON array of {label, value, detail?} for each selectable option.'),
+  memory_key: z
+    .string()
+    .optional()
+    .describe("Memory key for the pending choice; defaults to pending_shop_choice."),
 });
 
 function safeParseJsonObject(raw: unknown): Record<string, unknown> | undefined {
@@ -633,6 +673,10 @@ export class AgentHarness {
       `Memory topics:\n${memoryIndex}`,
       `Active reminders:\n${reminderSummary}`,
       `Uploaded files:\n${uploadedFileSummary}`,
+      "Choices: When the user must pick from multiple search or shopping results, call present_options with options_json (array of objects with label, value, and optional detail). Wait for their reply; read_memory on the memory_key you used to resolve voice or form picks before run_browser_task.",
+      "Ordering: Food — DoorDash, Uber Eats, Grubhub (name the platform in the task). Pharmacy — CVS.com for OTC and Rx refills; include rx:RX1234567 style ids when refilling. Before checkout, ensure payment_card and delivery_address exist in memory or collect via request_user_input.",
+      "The browser sub-agent does not see this chat. Pass every fact it needs inside the run_browser_task string or via memory it can rely on.",
+      "Use speak for user-visible replies in this turn. Plain text only — no markdown. Stay concise.",
     ].join("\n\n");
   }
 
@@ -941,17 +985,92 @@ export class AgentHarness {
               : data
                 ? JSON.stringify(data, null, 2)
                 : "";
-
-          result = this.database.writeMemory(String(args.title ?? ""), content, {
+          const memoryTitle = String(args.title ?? "");
+          result = this.database.writeMemory(memoryTitle, content, {
             ...(fields !== undefined && { schema: fields }),
             ...(data !== undefined && { data }),
           });
+
+          // Auto-cancel any pending prompt for this memory key (e.g. voice user
+          // picked an option that was also shown as a form on the frontend)
+          const pendingPrompt = this.database.findPendingPromptByMemoryKey(memoryTitle);
+          if (pendingPrompt) {
+            this.database.cancelPrompt(pendingPrompt.id);
+          }
           break;
         }
 
         case "end_conversation": {
           runtime.endConversation = true;
           result = { ended: true };
+          break;
+        }
+
+        case "present_options": {
+          type OptionItem = { label: string; value: string; detail?: string };
+          let options: OptionItem[] = [];
+          try {
+            const rawOptions = args.options_json ?? "[]";
+            const parsed = JSON.parse(typeof rawOptions === "string" ? rawOptions : JSON.stringify(rawOptions));
+            options = Array.isArray(parsed) ? (parsed as OptionItem[]) : [];
+          } catch {
+            options = [];
+          }
+
+          if (options.length === 0) {
+            result = { error: "No options provided" };
+            break;
+          }
+
+          // Build select field for the frontend form
+          const selectField: PromptField = {
+            name: "chosen_option",
+            label: String(args.title ?? "Pick one"),
+            type: "select",
+            required: true,
+            options: options.map((opt, i) => ({
+              label: opt.detail ? `${i + 1}. ${opt.label} — ${opt.detail}` : `${i + 1}. ${opt.label}`,
+              value: opt.value,
+            })),
+          };
+
+          const memoryKey = typeof args.memory_key === "string" ? args.memory_key : "pending_shop_choice";
+          const promptInput: {
+            title: string;
+            fields: PromptField[];
+            description?: string;
+            memoryKey?: string;
+            memoryLabel?: string;
+          } = {
+            title: String(args.title ?? "Choose an option"),
+            fields: [selectField],
+            memoryKey,
+            memoryLabel: String(args.title ?? "User choice"),
+          };
+          if (typeof args.description === "string" && args.description.trim()) {
+            promptInput.description = args.description;
+          }
+          const prompt = this.database.createPrompt(promptInput);
+          this.transcriptBus.publishPrompt(prompt);
+
+          // Also save the full options list to memory so voice resolution can match
+          this.database.writeMemory(memoryKey, JSON.stringify(options, null, 2), {
+            data: { options, promptId: prompt.id, status: "pending" },
+          });
+
+          // Build a voice-friendly numbered list
+          const spokenList = options
+            .map((opt, i) => `${i + 1}: ${opt.label}${opt.detail ? `, ${opt.detail}` : ""}`)
+            .join(". ");
+
+          const spokenListFull = `Here are your options. ${spokenList}. Which one would you like?`;
+          runtime.optionsSpokenList = spokenListFull;
+          result = {
+            promptId: prompt.id,
+            status: "pending",
+            message: "Options sent to user.",
+            spokenList: spokenListFull,
+          };
           break;
         }
 
@@ -1024,7 +1143,12 @@ export class AgentHarness {
     return new ToolLoopAgent({
       model,
       instructions: this.buildInstructions(request),
-      stopWhen: [hasToolCall("pause_until_output"), hasToolCall("end_conversation"), stepCountIs(12)],
+      stopWhen: [
+        hasToolCall("pause_until_output"),
+        hasToolCall("end_conversation"),
+        hasToolCall("present_options"),
+        stepCountIs(12),
+      ],
       tools: {
         speak: tool({
           description:
@@ -1111,6 +1235,12 @@ export class AgentHarness {
           inputSchema: REQUEST_USER_INPUT_SCHEMA,
           execute: async (input) => this.executeToolByName("request_user_input", input, runtime, request.profileId),
         }),
+        present_options: tool({
+          description:
+            "Present numbered choices (screen dropdown + voice). Wait for the user's reply before ordering or run_browser_task.",
+          inputSchema: PRESENT_OPTIONS_SCHEMA,
+          execute: async (input) => this.executeToolByName("present_options", input, runtime, request.profileId),
+        }),
       },
     });
   }
@@ -1152,6 +1282,10 @@ export class AgentHarness {
       const spokenText = runtime.spokenPhrases.join(" ").trim();
       const fallbackText = result.text.trim();
 
+      if (runtime.optionsSpokenList?.trim() && !spokenText) {
+        return { kind: "text", text: runtime.optionsSpokenList.trim() };
+      }
+
       if (!spokenText && !runtime.browserTask && !runtime.endConversation && !runtime.promptSent) {
         const fallbackToolCalls = parseTextToolCalls(fallbackText);
         if (fallbackToolCalls.length > 0) {
@@ -1165,10 +1299,15 @@ export class AgentHarness {
             this.appendFallbackToolMessages(messages, fallbackToolCall, toolResult);
           }
 
+          const afterFallbackSpoken = runtime.spokenPhrases.join(" ").trim();
+          if (runtime.optionsSpokenList?.trim() && !afterFallbackSpoken) {
+            return { kind: "text", text: runtime.optionsSpokenList.trim() };
+          }
+
           if (runtime.endConversation) {
             return {
               kind: "end_conversation",
-              text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now.",
+              text: afterFallbackSpoken || "Goodbye for now.",
             };
           }
 
