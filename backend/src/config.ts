@@ -11,6 +11,13 @@ export type AppConfig = {
   reminders: {
     enabled: boolean;
   };
+  gemini: {
+    apiKey: string;
+  };
+  camera: {
+    captureScript: string;
+    deviceIndex: number;
+  };
   browserUse: {
     apiKey?: string;
     baseUrl: string;
@@ -184,6 +191,13 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     allowedOrigins: parseOrigins(source.ALLOWED_ORIGINS),
     reminders: {
       enabled: parseBoolean(source.REMINDER_SCHEDULER_ENABLED, true),
+    },
+    gemini: {
+      apiKey: source.GEMINI_API_KEY?.trim() || "",
+    },
+    camera: {
+      captureScript: source.CAMERA_CAPTURE_SCRIPT?.trim() || "../bot/capture_image.py",
+      deviceIndex: parseInteger(source.CAMERA_DEVICE_INDEX, 0),
     },
     browserUse,
     agent: {

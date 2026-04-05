@@ -1,5 +1,5 @@
-import { mkdir, readFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { mkdir, readFile, unlink } from "node:fs/promises";
+import { basename, extname, join, resolve } from "node:path";
 import { inflateSync } from "node:zlib";
 
 import type { AppConfig } from "./config";
@@ -145,6 +145,81 @@ export class UploadedFileService {
     const updated = this.database.replaceUploadedFileStorage(record.id, storagePath);
     await this.extractTextIfPossible(updated.id);
     return this.database.getUploadedFile(updated.id) ?? updated;
+  }
+
+  private async describeImageWithGemini(imageBuffer: Buffer, mimeType: string): Promise<string | null> {
+    const apiKey = this.config.gemini.apiKey;
+    if (!apiKey) return null;
+
+    type GeminiResponse = {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: "Describe what you see in this image in detail. Include objects, people, the setting, any activities happening, and notable features. This description will be used by a senior care robot to understand its surroundings.",
+                },
+                { inline_data: { mime_type: mimeType, data: imageBuffer.toString("base64") } },
+              ],
+            },
+          ],
+          generationConfig: { maxOutputTokens: 512 },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      console.error(`[vision] Gemini API error ${response.status}: ${await response.text()}`);
+      return null;
+    }
+
+    const data = (await response.json()) as GeminiResponse;
+    return data.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+  }
+
+  async captureAndDescribeImage(): Promise<{ file: UploadedFile; description: string | null }> {
+    const scriptPath = resolve(process.cwd(), this.config.camera.captureScript);
+    const tmpPath = join(this.config.uploadsDir, `capture_tmp_${Date.now()}.jpg`);
+
+    const proc = Bun.spawn(["python3", scriptPath, tmpPath, String(this.config.camera.deviceIndex)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`Camera capture failed: ${stderr.trim()}`);
+    }
+
+    const buffer = await readFile(tmpPath);
+    await unlink(tmpPath).catch(() => {});
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `camera_capture_${timestamp}.jpg`;
+    const jsFile = new File([buffer], fileName, { type: "image/jpeg" });
+    const uploadedFile = await this.saveUpload(jsFile, { displayName: fileName });
+
+    const description = await this.describeImageWithGemini(buffer, "image/jpeg");
+    if (description) {
+      this.database.updateUploadedFileExtraction(uploadedFile.id, {
+        textStatus: "ready",
+        extractedText: description,
+      });
+    }
+
+    return {
+      file: this.database.getUploadedFile(uploadedFile.id) ?? uploadedFile,
+      description,
+    };
   }
 
   async extractTextIfPossible(fileId: string): Promise<UploadedFile> {

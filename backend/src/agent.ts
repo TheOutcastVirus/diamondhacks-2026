@@ -235,6 +235,15 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "capture_image",
+      description:
+        "Capture a photo using the robot's camera and get an AI-generated description of what the robot currently sees. Use this to understand the robot's surroundings, check on the user, or identify objects in the environment.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "request_user_input",
       description:
         'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
@@ -557,6 +566,17 @@ TOOL USE RULES - follow exactly:
           if (file) {
             result = await this.uploadedFileService.extractTextIfPossible(fileId);
           }
+          break;
+        }
+
+        case "capture_image": {
+          const { file, description } = await this.uploadedFileService.captureAndDescribeImage();
+          result = {
+            fileId: file.id,
+            fileName: file.name,
+            capturedAt: new Date().toISOString(),
+            description: description ?? "No description available (check GEMINI_API_KEY configuration).",
+          };
           break;
         }
 
