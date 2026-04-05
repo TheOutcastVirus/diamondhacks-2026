@@ -15,7 +15,7 @@ import type {
 } from "./contracts";
 import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { BrowserUseService } from "./browser-use";
-import type { GazabotDatabase } from "./db";
+import type { SodiumDatabase } from "./db";
 import type { UploadedFileService } from "./files";
 import type { TranscriptEventBus } from "./transcript-bus";
 import { buildRecentActivitySnapshot } from "./activity";
@@ -239,6 +239,31 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "present_options",
+      description:
+        'Present a numbered list of options to the user and wait for their choice. Use when the user needs to pick from multiple products, restaurants, search results, or any list of choices. The options appear as a selectable list on the frontend AND are spoken aloud for voice users. The user can respond by voice (saying the number or name) or by tapping on screen. After the user picks, the selection is saved to memory under the given memory_key.',
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Title shown to the user, e.g. 'Which chips would you like?'" },
+          description: { type: "string", description: "Optional context about the options" },
+          options_json: {
+            type: "string",
+            description:
+              'JSON array of option objects. Each: {"label":"Display name","value":"unique_id","detail":"optional price or description"}. Example: [{"label":"Lay\'s Classic","value":"lays_classic","detail":"$3.49"},{"label":"Doritos Nacho","value":"doritos_nacho","detail":"$4.29"}]',
+          },
+          memory_key: {
+            type: "string",
+            description: "Memory key to store the selection under, e.g. 'pending_shop_choice'",
+          },
+        },
+        required: ["title", "options_json"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "end_conversation",
       description:
         "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
@@ -290,12 +315,13 @@ type TurnRuntime = {
   pauseRequested: boolean;
   promptSent: boolean;
   endConversation: boolean;
+  optionsSpokenList?: string;
 };
 
 const EMPTY_OBJECT_SCHEMA = z.object({});
 
 const SPEAK_SCHEMA = z.object({
-  message: z.string().min(1).describe("Exactly what Gazabot should say to the user right now."),
+  message: z.string().min(1).describe("Exactly what Sodium should say to the user right now."),
 });
 
 const PAUSE_SCHEMA = z.object({
@@ -397,6 +423,19 @@ const REQUEST_USER_INPUT_SCHEMA = z.object({
   memory_label: z.string().optional().describe("Human-friendly label for the saved memory."),
   fields_json: z.string().min(2).describe("JSON array string defining the prompt fields."),
   fields: z.string().optional().describe("Optional JSON array string defining the prompt fields."),
+});
+
+const PRESENT_OPTIONS_SCHEMA = z.object({
+  title: z.string().min(1).describe("Title shown to the user, e.g. Which item would you like?"),
+  description: z.string().optional().describe("Optional context about the options."),
+  options_json: z
+    .string()
+    .min(2)
+    .describe('JSON array of {label, value, detail?} for each selectable option.'),
+  memory_key: z
+    .string()
+    .optional()
+    .describe("Memory key for the pending choice; defaults to pending_shop_choice."),
 });
 
 function safeParseJsonObject(raw: unknown): Record<string, unknown> | undefined {
@@ -578,7 +617,7 @@ export class AgentHarness {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
     private readonly browserUseService: BrowserUseService,
     private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
@@ -642,22 +681,33 @@ export class AgentHarness {
             .map((file) => `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]`)
             .join("\n");
 
-    const interactionStyle = request.source === "voice" ? "Turn type: voice." : "Turn type: dashboard.";
+    const voiceNote =
+      request.source === "voice"
+        ? "This is a VOICE interaction. Your reply will be spoken aloud automatically. Default to one short sentence. Never exceed two short sentences unless the user explicitly asks for more detail. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
+        : "This is a dashboard interaction. Keep replies extremely short by default. Use one short sentence unless the user explicitly asks for more detail.";
 
     const browserState = request.forceBrowser
       ? "Browser request: the user explicitly requested browser automation for this turn."
       : "Browser request: only use browser automation when the user explicitly asks for browsing, searching the web, opening a site, ordering, booking, or checking a website. If you are merely unsure, ask the user directly instead of using the browser.";
 
     return [
-      "You are Gazabot, a concise household assistant for reminders, memory, uploaded files, forms, and browser tasks.",
+        `You are Sodium. Your name is Sodium. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.`,
+    `Be warm, calm, concise, and practical. Do not sound grandiose, theatrical, or overly chatty. If you are unsure, a clarification question. If you are still unsure, ask another. If you feel the conversation is going nowhere, research using the browser tool.`,
       interactionStyle,
       browserState,
       "Speech rule: the only user-visible spoken words you produce are the messages passed to the speak tool.",
-      "Speech rule: never rely on plain assistant text as the reply. Any assistant text that is not a tool call and is not a speak tool message is treated as hidden thinking tokens.",
+      "Think about your response when outputing text. The only thing the user hears is the output from the speak tool.",
       "Reasoning rule: use a bit of reasoning before acting on anything complicated, but keep that reasoning private and express the user-facing result through tools.",
       "Clarification rule: if something important is ambiguous, ask the user directly instead of guessing or launching browser automation.",
       "Cron rule: reminder schedules use exactly five cron fields in this order: minute hour day-of-month month day-of-week.",
-      "Cron examples: '0 9 * * *' means every day at 9:00 AM. '30 19 * * 2' means every Tuesday at 7:30 PM. There is no seconds field.",
+        "Cron examples: '0 9 * * *' means every day at 9:00 AM. '30 19 * * 2' means every Tuesday at 7:30 PM. There is no seconds field.",
+        `Response style:
+  - Keep messages short.
+  - Default to one short sentence.
+  - Never exceed three sentences unless the user explicitly asks for detail.
+  - For simple confirmations, use very short replies like "Okay.", "Done.", "I can do that.", or one short question.
+  - If a tool already did the work, briefly state the result and stop.
+  - Do not add extra suggestions unless they are necessary.`,
       `Default reminder timezone: ${DEFAULT_REMINDER_TIMEZONE}.`,
       `Current date and time: ${new Date().toLocaleString("en-US", {
         timeZone: DEFAULT_REMINDER_TIMEZONE,
@@ -975,17 +1025,93 @@ export class AgentHarness {
               : data
                 ? JSON.stringify(data, null, 2)
                 : "";
-
-          result = this.database.writeMemory(String(args.title ?? ""), content, {
+          const memoryTitle = String(args.title ?? "");
+          result = this.database.writeMemory(memoryTitle, content, {
             ...(fields !== undefined && { schema: fields }),
             ...(data !== undefined && { data }),
           });
+
+          // Auto-cancel any pending prompt for this memory key (e.g. voice user
+          // picked an option that was also shown as a form on the frontend)
+          const pendingPrompt = this.database.findPendingPromptByMemoryKey(memoryTitle);
+          if (pendingPrompt) {
+            this.database.cancelPrompt(pendingPrompt.id);
+          }
           break;
         }
 
         case "end_conversation": {
           runtime.endConversation = true;
           result = { ended: true };
+          break;
+        }
+
+        case "present_options": {
+          type OptionItem = { label: string; value: string; detail?: string };
+          let options: OptionItem[] = [];
+          try {
+            const rawOptions = args.options_json ?? "[]";
+            const parsed = JSON.parse(typeof rawOptions === "string" ? rawOptions : JSON.stringify(rawOptions));
+            options = Array.isArray(parsed) ? (parsed as OptionItem[]) : [];
+          } catch {
+            options = [];
+          }
+
+          if (options.length === 0) {
+            result = { error: "No options provided" };
+            break;
+          }
+
+          // Build select field for the frontend form
+          const selectField: PromptField = {
+            name: "chosen_option",
+            label: String(args.title ?? "Pick one"),
+            type: "select",
+            required: true,
+            options: options.map((opt, i) => ({
+              label: opt.detail ? `${i + 1}. ${opt.label} — ${opt.detail}` : `${i + 1}. ${opt.label}`,
+              value: opt.value,
+            })),
+          };
+
+          const memoryKey = typeof args.memory_key === "string" ? args.memory_key : "pending_shop_choice";
+          const promptInput: {
+            title: string;
+            fields: PromptField[];
+            description?: string;
+            memoryKey?: string;
+            memoryLabel?: string;
+          } = {
+            title: String(args.title ?? "Choose an option"),
+            fields: [selectField],
+            memoryKey,
+            memoryLabel: String(args.title ?? "User choice"),
+          };
+          if (typeof args.description === "string" && args.description.trim()) {
+            promptInput.description = args.description;
+          }
+          const prompt = this.database.createPrompt(promptInput);
+          this.transcriptBus.publishPrompt(prompt);
+
+          // Also save the full options list to memory so voice resolution can match
+          this.database.writeMemory(memoryKey, JSON.stringify(options, null, 2), {
+            data: { options, promptId: prompt.id, status: "pending" },
+          });
+
+          // Build a voice-friendly numbered list
+          const spokenList = options
+            .map((opt, i) => `${i + 1}: ${opt.label}${opt.detail ? `, ${opt.detail}` : ""}`)
+            .join(". ");
+
+          const spokenListFull = `Here are your options. ${spokenList}. Which one would you like?`;
+          runtime.optionsSpokenList = spokenListFull;
+          runtime.promptSent = true;
+          result = {
+            promptId: prompt.id,
+            status: "pending",
+            message: "Options sent to user.",
+            spokenList: spokenListFull,
+          };
           break;
         }
 
@@ -1058,7 +1184,12 @@ export class AgentHarness {
     return new ToolLoopAgent({
       model,
       instructions: this.buildInstructions(request),
-      stopWhen: [hasToolCall("pause_until_output"), hasToolCall("end_conversation"), stepCountIs(12)],
+      stopWhen: [
+        hasToolCall("pause_until_output"),
+        hasToolCall("end_conversation"),
+        hasToolCall("present_options"),
+        stepCountIs(12),
+      ],
       tools: {
         speak: tool({
           description:
@@ -1145,6 +1276,12 @@ export class AgentHarness {
           inputSchema: REQUEST_USER_INPUT_SCHEMA,
           execute: async (input) => this.executeToolByName("request_user_input", input, runtime, request.profileId),
         }),
+        present_options: tool({
+          description:
+            "Present numbered choices (screen dropdown + voice). Wait for the user's reply before ordering or run_browser_task.",
+          inputSchema: PRESENT_OPTIONS_SCHEMA,
+          execute: async (input) => this.executeToolByName("present_options", input, runtime, request.profileId),
+        }),
       },
     });
   }
@@ -1186,6 +1323,10 @@ export class AgentHarness {
       const spokenText = runtime.spokenPhrases.join(" ").trim();
       const fallbackText = result.text.trim();
 
+      if (runtime.optionsSpokenList?.trim() && !spokenText) {
+        return { kind: "text", text: runtime.optionsSpokenList.trim() };
+      }
+
       if (!spokenText && !runtime.browserTask && !runtime.endConversation && !runtime.promptSent) {
         const fallbackToolCalls = parseTextToolCalls(fallbackText);
         if (fallbackToolCalls.length > 0) {
@@ -1199,10 +1340,15 @@ export class AgentHarness {
             this.appendFallbackToolMessages(messages, fallbackToolCall, toolResult);
           }
 
+          const afterFallbackSpoken = runtime.spokenPhrases.join(" ").trim();
+          if (runtime.optionsSpokenList?.trim() && !afterFallbackSpoken) {
+            return { kind: "text", text: runtime.optionsSpokenList.trim() };
+          }
+
           if (runtime.endConversation) {
             return {
               kind: "end_conversation",
-              text: runtime.spokenPhrases.join(" ").trim() || "Goodbye for now.",
+              text: afterFallbackSpoken || "Goodbye for now.",
             };
           }
 

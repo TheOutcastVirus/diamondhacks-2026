@@ -488,7 +488,7 @@
                   <p class="contact-callout-text">
                     Use a number in <strong>E.164</strong> format (country code + number), for example
                     <code class="contact-callout-code">+14155551234</code>. This is the only number used when
-                    Gazabot places an urgent wellness call through Bland AI.
+                    Sodium places an urgent wellness call through Bland AI.
                   </p>
                 </div>
               </section>
@@ -1381,6 +1381,27 @@
 
     span.document-toggle-label {
       text-align: left;
+    }
+  }
+
+  @media (max-width: 480px) {
+    button.action,
+    button.ghost,
+    button.memory-item {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+
+    button.chip-action {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    input.field-input,
+    textarea.field-input,
+    select.field-input {
+      font-size: 1rem;
+      min-height: 3rem;
     }
   }
 </style>

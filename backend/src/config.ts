@@ -124,7 +124,7 @@ function parseOrigins(value: string | undefined): string[] {
 }
 
 function resolveDatabasePath(rawPath: string | undefined): string {
-  const configured = rawPath?.trim() || "data/gazabot.sqlite";
+  const configured = rawPath?.trim() || "data/sodium.sqlite";
   const resolved = resolve(process.cwd(), configured);
   mkdirSync(dirname(resolved), { recursive: true });
   return resolved;
@@ -235,7 +235,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
   }
 
   return {
-    appName: source.APP_NAME?.trim() || "Gazabot Backend",
+    appName: source.APP_NAME?.trim() || "Sodium Backend",
     host: source.HOST?.trim() || "127.0.0.1",
     port: parseInteger(source.PORT, 8000),
     databasePath: resolveDatabasePath(source.DATABASE_PATH),

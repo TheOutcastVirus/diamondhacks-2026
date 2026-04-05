@@ -1,7 +1,7 @@
 import type { AppConfig } from "./config";
 import type { BrowserStatus, HitlNeed, HitlNeedKind, HitlRequest, PromptField } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
-import { GazabotDatabase } from "./db";
+import { SodiumDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
 import {
   buildCvsTask,
@@ -146,7 +146,7 @@ function parseBrowserUseApiErrorBody(body: string, status: number): string {
  * Stored in `browser_task_templates.workspace_id` when Browser Use rejects creating a workspace.
  * Never send this value to the Cloud API as `workspaceId`.
  */
-const BROWSER_WORKSPACE_SKIPPED_MARKER = "gazabot:workspace_skipped";
+const BROWSER_WORKSPACE_SKIPPED_MARKER = "sodium:workspace_skipped";
 
 function effectiveBrowserWorkspaceId(stored: string | null | undefined): string | undefined {
   if (!stored || stored === BROWSER_WORKSPACE_SKIPPED_MARKER) {
@@ -406,7 +406,7 @@ export class BrowserUseService {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
     private readonly transcriptBus: TranscriptEventBus,
     private readonly onLifecycleEvent?: (event: BrowserTaskLifecycleEvent) => Promise<void> | void,
   ) {}
@@ -522,7 +522,7 @@ export class BrowserUseService {
       const summary = extractSummary(completedSession.output);
       const failed = ["failed", "stopped"].includes(normalizeCloudStatus(completedSession.status));
 
-      const resumedUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const resumedUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: hitlRequest.browserSessionId,
         status: failed ? "blocked" : "idle",
         summary,
@@ -722,7 +722,7 @@ export class BrowserUseService {
         return;
       }
 
-      const initialUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const initialUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
         status: toBrowserStatus(initialSession.status),
         summary: "Browser Use is working on the task.",
@@ -865,7 +865,9 @@ export class BrowserUseService {
                 ? "browser_confirmation"
                 : need.kind === "login"
                   ? "browser_login"
-                  : "browser_hitl_info";
+                  : need.kind === "product_choice"
+                    ? "pending_shop_choice"
+                    : "browser_hitl_info";
         const promptTitle =
           need.kind === "payment_card"
             ? "Payment Information Needed"
@@ -873,7 +875,9 @@ export class BrowserUseService {
               ? "Delivery Address Needed"
               : need.kind === "login"
                 ? "Login Required"
-                : "Information Needed";
+                : need.kind === "product_choice"
+                  ? "Choose an Option"
+                  : "Information Needed";
         const promptDescription =
           need.kind === "payment_card"
             ? "The browser agent needs your payment card to complete checkout."
@@ -881,7 +885,9 @@ export class BrowserUseService {
               ? "The browser agent needs your delivery address to complete checkout."
               : need.kind === "login"
                 ? "The browser agent needs you to log in. Switch to the Browser tab, log in through the live view, then return here and click Done."
-                : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
+                : need.kind === "product_choice"
+                  ? `The browser found multiple options. Please pick one: ${currentSummary.slice(0, 300)}`
+                  : `The browser agent needs additional information: ${currentSummary.slice(0, 200)}`;
         const fields =
           need.kind === "payment_card"
             ? this.buildPaymentPromptFields()
@@ -891,7 +897,9 @@ export class BrowserUseService {
                 ? this.buildConfirmationPromptFields()
                 : need.kind === "login"
                   ? [] // No fields — user logs in via the live browser view
-                  : [{ name: "info", label: "Information", type: "text" as const, required: true }];
+                  : need.kind === "product_choice"
+                    ? [{ name: "chosen_option", label: "Your Choice", type: "text" as const, required: true, description: "Type the name or number of the option you want" }]
+                    : [{ name: "info", label: "Information", type: "text" as const, required: true }];
 
         const prompt = this.database.createPrompt({
           title: promptTitle,
@@ -901,7 +909,7 @@ export class BrowserUseService {
           memoryLabel: promptTitle,
         });
 
-        const hitlRequestCreateInput: Parameters<GazabotDatabase["createHitlRequest"]>[0] = {
+        const hitlRequestCreateInput: Parameters<SodiumDatabase["createHitlRequest"]>[0] = {
           browserSessionId: input.browserSessionId,
           remoteSessionId: currentSession.id,
           promptId: prompt.id,
@@ -955,7 +963,7 @@ export class BrowserUseService {
           : summary;
       const cacheStatus = this.describeCacheOutcome(preparedTask, finalSession);
 
-      const finalUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const finalUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
         status: failed ? "blocked" : "idle",
         summary: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
@@ -1309,6 +1317,12 @@ export class BrowserUseService {
       "confirm", "confirmation", "approve", "review order",
       "place order", "submit order", "verify", "authorize",
     ];
+    const productChoicePatterns = [
+      "which one", "choose from", "select from", "pick one",
+      "multiple options", "multiple results", "several options",
+      "which item", "which product", "which would you like",
+      "found several", "found multiple", "here are the options",
+    ];
 
     for (const p of loginPatterns) {
       if (lower.includes(p)) {
@@ -1323,6 +1337,11 @@ export class BrowserUseService {
     for (const p of addressPatterns) {
       if (lower.includes(p)) {
         return { kind: "delivery_address", rawMessage: output };
+      }
+    }
+    for (const p of productChoicePatterns) {
+      if (lower.includes(p)) {
+        return { kind: "product_choice", rawMessage: output };
       }
     }
     for (const p of confirmationPatterns) {
@@ -1415,6 +1434,17 @@ export class BrowserUseService {
     }
     if (needKind === "login") {
       return "The user has now logged in through the live browser view. Continue with the original task from where you left off.";
+    }
+    if (needKind === "product_choice") {
+      const choice = this.database.readMemory("pending_shop_choice");
+      if (choice?.data) {
+        const data = choice.data as Record<string, unknown>;
+        const chosen = data.chosen_option ?? data.chosen_value ?? data.label;
+        if (chosen) {
+          return `Continue from where you left off. The user chose: ${String(chosen)}. Select that option and proceed.`;
+        }
+      }
+      return "Continue from where you left off. The user has made their selection.";
     }
 
     const extraInfo = this.database.readMemory("browser_hitl_info");

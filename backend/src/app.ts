@@ -26,7 +26,7 @@ import {
   formatRecentActivityForBland,
   formatRecentActivityRecap,
 } from "./activity";
-import { GazabotDatabase } from "./db";
+import { SodiumDatabase } from "./db";
 import { UploadedFileService } from "./files";
 import { parseMultipartUpload } from "./multipart";
 import { ReminderScheduler } from "./reminder-scheduler";
@@ -573,7 +573,7 @@ function isRecentActivityRecapRequest(message: string): boolean {
   );
 }
 
-export class GazabotApp {
+export class SodiumApp {
   private readonly transcriptBus = new TranscriptEventBus();
 
   private readonly agentHarness: AgentHarness;
@@ -689,7 +689,7 @@ export class GazabotApp {
       const lines = entries
         .filter((e) => e.role === "robot" || e.role === "resident" || e.role === "guardian")
         .map((e) => {
-          const speaker = e.role === "robot" ? "Gazabot" : "User";
+          const speaker = e.role === "robot" ? "Sodium" : "User";
           return `${speaker}: ${e.text}`;
         });
 
@@ -708,7 +708,7 @@ export class GazabotApp {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
   ) {
     this.browserUseService = new BrowserUseService(
       config,
@@ -1323,7 +1323,7 @@ export class GazabotApp {
     // conversation and start fresh before entering the new one.
     if (
       this.lastActivityAt !== null &&
-      Date.now() - this.lastActivityAt.valueOf() > GazabotApp.SESSION_GAP_MS
+      Date.now() - this.lastActivityAt.valueOf() > SodiumApp.SESSION_GAP_MS
     ) {
       console.log("[session] Session gap exceeded — archiving conversation.");
       await this.archiveAndResetConversation();
@@ -1413,7 +1413,7 @@ export class GazabotApp {
     } catch (err) {
       console.error("[conversation] TTS/playback failed:", err);
     } finally {
-      await Bun.sleep(GazabotApp.POST_SPEECH_LISTEN_DELAY_MS);
+      await Bun.sleep(SodiumApp.POST_SPEECH_LISTEN_DELAY_MS);
       this.isSpeaking = false;
     }
 
@@ -2154,7 +2154,7 @@ export class GazabotApp {
 
     const prompt = this.database.createPrompt({
       title: "Primary family contact",
-      description: "A crisis phrase was detected. Save the primary family contact so Gazabot can call them immediately.",
+      description: "A crisis phrase was detected. Save the primary family contact so Sodium can call them immediately.",
       memoryKey: FAMILY_CONTACT_MEMORY_KEY,
       memoryLabel: "Primary family contact",
       fields: FAMILY_CONTACT_PROMPT_FIELDS,
@@ -2271,6 +2271,6 @@ export class GazabotApp {
   }
 }
 
-export function createApp(config: AppConfig, database = new GazabotDatabase(config.databasePath)): GazabotApp {
-  return new GazabotApp(config, database);
+export function createApp(config: AppConfig, database = new SodiumDatabase(config.databasePath)): SodiumApp {
+  return new SodiumApp(config, database);
 }

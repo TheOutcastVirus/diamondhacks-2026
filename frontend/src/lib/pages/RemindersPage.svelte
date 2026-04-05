@@ -326,7 +326,7 @@
       scheduleLabel: String(value.scheduleLabel ?? value.humanReadable ?? cronExpression),
       nextRun: value.nextRun ? String(value.nextRun) : null,
       status: normalizeStatus(value.status),
-      owner: value.owner ? String(value.owner) : 'Gazabot agent',
+      owner: value.owner ? String(value.owner) : 'Sodium agent',
       timezone: value.timezone ? String(value.timezone) : DEFAULT_REMINDER_TIMEZONE,
       attachments: Array.isArray(value.attachments)
         ? value.attachments
@@ -791,7 +791,7 @@
           <article class="list-card">
             <div class="list-head">
               <div>
-                <p class="panel-label">{reminder.owner ?? 'Gazabot agent'}</p>
+                <p class="panel-label">{reminder.owner ?? 'Sodium agent'}</p>
                 <h3 class="list-heading">{reminder.title}</h3>
               </div>
 
@@ -1353,6 +1353,31 @@
     button.ghost,
     button.mini-action {
       width: 100%;
+    }
+  }
+
+  @media (max-width: 480px) {
+    button.action,
+    button.ghost {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+
+    button.mini-action {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    button.chip {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    input.field-input,
+    textarea.field-input,
+    select.field-input {
+      font-size: 1rem;
+      min-height: 3rem;
     }
   }
 </style>

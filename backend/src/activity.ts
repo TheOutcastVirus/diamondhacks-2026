@@ -1,5 +1,5 @@
 import type { TranscriptEntry } from "./contracts";
-import type { GazabotDatabase } from "./db";
+import type { SodiumDatabase } from "./db";
 
 export type RecentActivityItem = {
   timestamp: string;
@@ -63,7 +63,7 @@ function summarizeTranscriptEntry(entry: TranscriptEntry): RecentActivityItem | 
 }
 
 export function buildRecentActivitySnapshot(
-  db: GazabotDatabase,
+  db: SodiumDatabase,
   opts: { lookbackMinutes?: number; limit?: number } = {},
 ): RecentActivitySnapshot {
   const windowMinutes = Number.isFinite(opts.lookbackMinutes) ? Math.max(1, opts.lookbackMinutes as number) : 240;

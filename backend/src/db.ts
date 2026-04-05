@@ -480,7 +480,7 @@ function nextRunForReminder(input: {
   return computeNextRun(input.cron, input.timezone);
 }
 
-export class GazabotDatabase {
+export class SodiumDatabase {
   private readonly database: Database;
 
   private readonly reminderListeners = new Set<() => void>();
@@ -716,7 +716,7 @@ export class GazabotDatabase {
         status: "active",
       }),
       status: "active",
-      owner: "Gazabot agent",
+      owner: "Sodium agent",
       timezone,
       created_at: nowIso(),
       attachments_json: JSON.stringify(attachments),
@@ -1550,6 +1550,19 @@ export class GazabotDatabase {
       },
     );
     return { prompt: updated, memoryEntry };
+  }
+
+  findPendingPromptByMemoryKey(memoryKey: string): UserPrompt | null {
+    const row = this.database
+      .query("SELECT * FROM user_prompts WHERE memory_key = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1")
+      .get(memoryKey) as UserPromptRow | null;
+    return row ? serializePrompt(row) : null;
+  }
+
+  cancelPrompt(id: string): void {
+    this.database
+      .query("UPDATE user_prompts SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'")
+      .run(id);
   }
 
   listUploadedFiles(): UploadedFile[] {

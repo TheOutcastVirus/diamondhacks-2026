@@ -15,6 +15,7 @@ export type EndpointKey =
 export type PageDefinition = {
   id: PageId;
   label: string;
+  shortLabel: string;
   eyebrow: string;
   title: string;
   description: string;
