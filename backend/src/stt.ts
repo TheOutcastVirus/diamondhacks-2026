@@ -32,6 +32,7 @@ export class SttService {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private stdoutBuf = "";
   private ready = false;
+  private closed = false;
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
   private readyReject!: (err: Error) => void;
@@ -50,6 +51,9 @@ export class SttService {
   }
 
   private _startSubprocess(): void {
+    if (this.closed) {
+      return;
+    }
     const botDir = pathResolve(import.meta.dir, "../../bot");
     const script = pathResolve(botDir, "whisper_stt.py");
     const venvPython =
@@ -84,6 +88,11 @@ export class SttService {
     });
 
     child.on("close", (code) => {
+      if (this.closed) {
+        this.proc = null;
+        this.ready = false;
+        return;
+      }
       console.warn(`[whisper-stt] Process exited (code=${code}). Restarting in 3 s…`);
       this.proc = null;
       this.ready = false;
@@ -94,6 +103,20 @@ export class SttService {
       this._drainPendingWithError(new Error(`whisper_stt.py exited (code=${code})`));
       setTimeout(() => this._startSubprocess(), 3000);
     });
+  }
+
+  close(): void {
+    this.closed = true;
+    const child = this.proc;
+    this.proc = null;
+    this.ready = false;
+    if (child) {
+      try {
+        child.kill();
+      } catch {
+        // Ignore shutdown races if the process already exited.
+      }
+    }
   }
 
   private _handleLine(line: string): void {

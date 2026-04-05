@@ -19,7 +19,7 @@ import { resolve } from "node:path";
 import { AgentHarness, type AgentTurnResult } from "./agent";
 import { AudioService } from "./audio";
 import { BlandService } from "./bland";
-import { BrowserUseService } from "./browser-use";
+import { BrowserUseService, type BrowserTaskLifecycleEvent } from "./browser-use";
 import { detectCrisis } from "./crisis";
 import {
   buildRecentActivitySnapshot,
@@ -602,6 +602,7 @@ export class SodiumApp {
   private wakeWordProcess: ReturnType<typeof spawn> | null = null;
   private wakeWordRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private wakeWordListenerEnabled = false;
+  private wakeWordStartupTimer: ReturnType<typeof setTimeout> | null = null;
   private interactionOwner: "conversation" | "voice-http" | "reminder" | null = null;
   private interactionPhase: "idle" | "user_listening" | "agent_thinking" | "agent_speaking" = "idle";
   private static readonly SESSION_GAP_MS = 10 * 60 * 1000; // 10 minutes
@@ -709,7 +710,12 @@ export class SodiumApp {
     private readonly config: AppConfig,
     private readonly database: SodiumDatabase,
   ) {
-    this.browserUseService = new BrowserUseService(config, database, this.transcriptBus);
+    this.browserUseService = new BrowserUseService(
+      config,
+      database,
+      this.transcriptBus,
+      (event) => this.handleBrowserTaskLifecycleEvent(event),
+    );
     this.blandService = new BlandService(config);
     this.uploadedFileService = new UploadedFileService(config, database);
     this.agentHarness = new AgentHarness(
@@ -730,7 +736,9 @@ export class SodiumApp {
     this.reminderScheduler.start();
     this.sttService = new SttService(config);
     this.ttsService = new TtsService(config);
-    this.startWakeWordListener();
+    if (this.config.wakeWord.enabled) {
+      this.startWakeWordListener();
+    }
     // Pre-warm the Silero VAD model so the first conversation turn has no load delay
     this.audioService.startPersistentVad({ threshold: 0.5, silenceDuration: 1.0 }).catch((err) => {
       console.warn(`[silero-vad] Pre-warm failed: ${err.message}`);
@@ -1204,16 +1212,36 @@ export class SodiumApp {
       if (!this.wakeWordListenerEnabled || this.wakeWordProcess) {
         return;
       }
-      child = spawn(python, [script], { stdio: ["ignore", "pipe", "pipe"] });
+      console.log(`[wake-word] Starting listener with ${python} ${script}`);
+      child = spawn(python, ["-u", script], { stdio: ["ignore", "pipe", "pipe"] });
       this.wakeWordProcess = child;
+      let sawStartupOutput = false;
+      this.wakeWordStartupTimer = setTimeout(() => {
+        this.wakeWordStartupTimer = null;
+        if (this.wakeWordProcess === child && !sawStartupOutput) {
+          console.warn(
+            "[wake-word] Process started but produced no output within 5 s. On Windows this can mean sounddevice is hanging during import when launched headlessly.",
+          );
+        }
+      }, 5000);
 
       // Forward Python stderr so wake_word startup logs appear in the Bun console
       child.stderr?.on("data", (chunk: Buffer) => {
+        sawStartupOutput = true;
+        if (this.wakeWordStartupTimer) {
+          clearTimeout(this.wakeWordStartupTimer);
+          this.wakeWordStartupTimer = null;
+        }
         process.stderr.write(`[wake-word] ${chunk.toString()}`);
       });
 
       let buf = "";
       child.stdout?.on("data", (chunk: Buffer) => {
+        sawStartupOutput = true;
+        if (this.wakeWordStartupTimer) {
+          clearTimeout(this.wakeWordStartupTimer);
+          this.wakeWordStartupTimer = null;
+        }
         buf += chunk.toString();
         const lines = buf.split("\n");
         buf = lines[lines.length - 1] ?? "";
@@ -1233,6 +1261,10 @@ export class SodiumApp {
       });
 
       child.on("close", (code: number | null) => {
+        if (this.wakeWordStartupTimer) {
+          clearTimeout(this.wakeWordStartupTimer);
+          this.wakeWordStartupTimer = null;
+        }
         if (this.wakeWordProcess === child) {
           this.wakeWordProcess = null;
         }
@@ -1252,6 +1284,10 @@ export class SodiumApp {
 
   private stopWakeWordListener(): void {
     this.wakeWordListenerEnabled = false;
+    if (this.wakeWordStartupTimer) {
+      clearTimeout(this.wakeWordStartupTimer);
+      this.wakeWordStartupTimer = null;
+    }
     if (this.wakeWordRestartTimer) {
       clearTimeout(this.wakeWordRestartTimer);
       this.wakeWordRestartTimer = null;
@@ -1657,6 +1693,64 @@ export class SodiumApp {
     }
   }
 
+  private async handleBrowserTaskLifecycleEvent(event: BrowserTaskLifecycleEvent): Promise<void> {
+    try {
+      if (event.kind === "awaiting_input") {
+        await this.executeRecordedTurn(
+          {
+            message:
+              `The browser task "${event.task}" is paused. A form titled "${event.promptTitle}" was sent to the user ` +
+              `for ${event.needKind}. Tell the user what they need to do next. Do not start another browser task or send another form.`,
+            source: "dashboard",
+          },
+          "system",
+          `Browser task needs user input: ${event.promptTitle}. ${event.promptDescription}`,
+          {
+            browserSessionId: event.browserSessionId,
+            promptId: event.promptId,
+            needKind: event.needKind,
+            source: "browser-use",
+          },
+        );
+        return;
+      }
+
+      await this.executeRecordedTurn(
+        {
+          message:
+            `The browser task "${event.task}" ${event.failed ? "failed" : "completed"}. Summary: ${event.summary} ` +
+            `Tell the user the result in one concise message. Do not start another browser task.`,
+          source: "dashboard",
+        },
+        "system",
+        `Browser task ${event.failed ? "failed" : "completed"}: ${event.summary}`,
+        {
+          browserSessionId: event.browserSessionId,
+          previewUrl: event.previewUrl,
+          source: "browser-use",
+        },
+      );
+    } catch (error) {
+      console.error("[browser-use] Failed to continue browser lifecycle through agent:", error);
+      const fallbackText =
+        event.kind === "awaiting_input"
+          ? `I need some information to continue. ${event.promptDescription} Please check the Requested Info panel.`
+          : event.failed
+            ? `I couldn't finish that task. ${event.summary}`
+            : `I just finished that task. ${event.summary}`;
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: fallbackText,
+        metadata: {
+          browserSessionId: event.browserSessionId,
+          source: "browser-use-fallback",
+        },
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+    }
+  }
+
   private async handleFileUpload(request: Request): Promise<{ file: UploadedFile }> {
     const fallbackRequest = request.clone();
     let uploadedFile: File;
@@ -1713,7 +1807,10 @@ export class SodiumApp {
   }
 
   close(): void {
+    this.browserUseService.close();
     this.stopWakeWordListener();
+    this.sttService.close();
+    this.audioService.close();
     this.unsubscribeReminderChanges();
     this.reminderScheduler.stop();
   }

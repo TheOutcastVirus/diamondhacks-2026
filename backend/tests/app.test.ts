@@ -18,6 +18,30 @@ function jsonResponse(data: unknown, status = 200) {
   });
 }
 
+function toolCallChoice(name: string, args: Record<string, unknown>, id = `call_${name}`) {
+  return {
+    message: {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id,
+          type: "function",
+          function: {
+            name,
+            arguments: JSON.stringify(args),
+          },
+        },
+      ],
+    },
+    finish_reason: "tool_calls",
+  };
+}
+
+function speakChoice(message: string, id = "call_speak_1") {
+  return toolCallChoice("speak", { message }, id);
+}
+
 function withFetchStub(stub: (url: string, init?: RequestInit) => Promise<Response>) {
   const orig = globalThis.fetch;
   globalThis.fetch = ((input: string | Request | URL, init?: RequestInit) => {
@@ -61,6 +85,7 @@ function createTestApp(overrides: Record<string, string> = {}) {
     APP_NAME: "Sodium Backend Test",
     DATABASE_PATH: join(directory, "test.sqlite"),
     UPLOADS_DIR: join(directory, "uploads"),
+    WAKE_WORD_ENABLED: "false",
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
     BROWSER_USE_API_KEY: "test-browser-key",
     BLAND_API_KEY: "test-bland-key",
@@ -292,12 +317,7 @@ describe("Sodium Bun backend", () => {
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Noted for later.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Noted for later.")],
         });
       }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
@@ -835,12 +855,7 @@ describe("Sodium Bun backend", () => {
           });
         }
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Browser task finished.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Browser task finished.")],
         });
       }
 
@@ -904,6 +919,265 @@ describe("Sodium Bun backend", () => {
     }
   });
 
+  test("routes browser completion back through the agent for the final user update", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_browser_1",
+                      type: "function",
+                      function: {
+                        name: "run_browser_task",
+                        arguments: JSON.stringify({
+                          task: "Find the nearest pharmacy hours in the browser.",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        if (completionRound === 2) {
+          return jsonResponse({
+            choices: [speakChoice("Okay. I'll handle that now.")],
+          });
+        }
+
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          messages?: Array<{ role?: string; content?: string | null }>;
+        };
+        expect(String(body.messages?.at(-1)?.content ?? "")).toContain("completed");
+        expect(String(body.messages?.at(-1)?.content ?? "")).toContain("Pharmacy hours");
+        return jsonResponse({
+          choices: [speakChoice("Hey! I just finished this task. Pharmacy hours are 9am to 5pm weekdays.")],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/sessions") && init?.method === "POST") {
+          return jsonResponse({ id: "remote-sess-finish", status: "running", liveUrl: null });
+        }
+        if (init?.method === "GET" && /\/sessions\/[^/]+$/.test(path) && !path.endsWith("/stop")) {
+          return jsonResponse({
+            id: "remote-sess-finish",
+            status: "completed",
+            output: { summary: "Pharmacy hours: 9am to 5pm weekdays." },
+            title: "Nearby pharmacy",
+            url: "https://example.com/pharmacy",
+          });
+        }
+        if (init?.method === "POST" && path.endsWith("/stop")) {
+          return jsonResponse({});
+        }
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Find the nearest pharmacy hours in the browser.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as Record<string, unknown>;
+        expect(payload.route).toBe("browser_task");
+        expect(payload.reply).toBe("Okay. I'll handle that now.");
+
+        await Bun.sleep(200);
+
+        const transcript = database.listTranscriptEntries().filter((entry) => entry.role === "robot");
+        expect(transcript.some((entry) => entry.text.includes("Hey! I just finished this task."))).toBe(true);
+        expect(completionRound).toBe(3);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("treats plain assistant text as hidden reasoning instead of user-visible speech", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "I can help with that.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Say hello.",
+              source: "guardian",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as { reply: string };
+        expect(payload.reply).toBe("I'm sorry, I couldn't complete that request.");
+        expect(payload.reply).not.toBe("I can help with that.");
+        expect(completionRound).toBe(6);
+
+        const transcript = database.listTranscriptEntries().filter((entry) => entry.role === "robot");
+        expect(transcript).toHaveLength(1);
+        expect(transcript[0]?.text).toBe("I'm sorry, I couldn't complete that request.");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("routes browser HITL prompts back through the agent for next-step guidance", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url, init) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_browser_1",
+                      type: "function",
+                      function: {
+                        name: "run_browser_task",
+                        arguments: JSON.stringify({
+                          task: "Order a pizza in the browser.",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        if (completionRound === 2) {
+          return jsonResponse({
+            choices: [speakChoice("Okay. I'll handle that now.")],
+          });
+        }
+
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          messages?: Array<{ role?: string; content?: string | null }>;
+        };
+        expect(String(body.messages?.at(-1)?.content ?? "")).toContain("paused");
+        expect(String(body.messages?.at(-1)?.content ?? "")).toContain("payment_card");
+        return jsonResponse({
+          choices: [speakChoice("Please fill out the requested payment information so I can continue.")],
+        });
+      }
+
+      if (url.includes("browser-use.com")) {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/sessions") && init?.method === "POST") {
+          return jsonResponse({ id: "remote-sess-hitl", status: "running", liveUrl: null });
+        }
+        if (init?.method === "GET" && /\/sessions\/[^/]+$/.test(path) && !path.endsWith("/stop")) {
+          return jsonResponse({
+            id: "remote-sess-hitl",
+            status: "failed",
+            output: "Payment method required. Enter card details to continue checkout.",
+            title: "Checkout",
+            url: "https://example.com/checkout",
+          });
+        }
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Order a pizza in the browser.",
+              source: "dashboard",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as Record<string, unknown>;
+        expect(payload.route).toBe("browser_task");
+
+        await Bun.sleep(200);
+
+        const prompts = database.listPrompts("pending");
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]?.title).toBe("Payment Information Needed");
+
+        const transcript = database.listTranscriptEntries().filter((entry) => entry.role === "robot");
+        expect(
+          transcript.some((entry) => entry.text.includes("Please fill out the requested payment information")),
+        ).toBe(true);
+        expect(completionRound).toBe(3);
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("defaults agent-created reminders to Los Angeles when timezone is omitted", async () => {
     let completionRound = 0;
     const restore = withFetchStub(async (url) => {
@@ -940,12 +1214,7 @@ describe("Sodium Bun backend", () => {
         }
 
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Reminder saved.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Reminder saved.")],
         });
       }
 
@@ -995,12 +1264,7 @@ describe("Sodium Bun backend", () => {
         };
         capturedSystemPrompt = String(body.messages?.[0]?.content ?? "");
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Goodbye for now.")],
         });
       }
 
@@ -1025,6 +1289,14 @@ describe("Sodium Bun backend", () => {
         expect(result.replyText).toBe("Goodbye for now.");
         expect(capturedSystemPrompt).toContain("You are Sodium");
         expect(capturedSystemPrompt).toContain("Turn type: voice.");
+        expect(capturedSystemPrompt).toContain(
+          "Speech rule: the only user-visible spoken words you produce are the messages passed to the speak tool.",
+        );
+        expect(capturedSystemPrompt).toContain(
+          "Any assistant text that is not a tool call and is not a speak tool message is treated as hidden thinking tokens.",
+        );
+        expect(capturedSystemPrompt).toContain("only use browser automation when the user explicitly asks");
+        expect(capturedSystemPrompt).toContain("Cron rule: reminder schedules use exactly five cron fields");
         expect(capturedSystemPrompt).toContain("Current date and time:");
       } finally {
         app.close();
@@ -1116,39 +1388,34 @@ describe("Sodium Bun backend", () => {
   });
 
   test("archives and clears conversation when end_conversation is called", async () => {
-    let completionRound = 0;
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
-        completionRound += 1;
-        if (completionRound === 1) {
-          return jsonResponse({
-            choices: [
-              {
-                message: {
-                  role: "assistant",
-                  content: null,
-                  tool_calls: [
-                    {
-                      id: "call_end_1",
-                      type: "function",
-                      function: {
-                        name: "end_conversation",
-                        arguments: "{}",
-                      },
-                    },
-                  ],
-                },
-                finish_reason: "tool_calls",
-              },
-            ],
-          });
-        }
-
         return jsonResponse({
           choices: [
             {
-              message: { role: "assistant", content: "Goodbye for now.", tool_calls: undefined },
-              finish_reason: "stop",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_speak_end_1",
+                    type: "function",
+                    function: {
+                      name: "speak",
+                      arguments: JSON.stringify({ message: "Goodbye for now." }),
+                    },
+                  },
+                  {
+                    id: "call_end_1",
+                    type: "function",
+                    function: {
+                      name: "end_conversation",
+                      arguments: "{}",
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
             },
           ],
         });
@@ -1236,12 +1503,7 @@ describe("Sodium Bun backend", () => {
         }
 
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Paused it.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Paused it.")],
         });
       }
 
@@ -1309,12 +1571,7 @@ describe("Sodium Bun backend", () => {
         }
 
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "You have 1 reminder: Hydration reminder.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("You have 1 reminder: Hydration reminder.")],
         });
       }
 
@@ -1439,12 +1696,7 @@ describe("Sodium Bun backend", () => {
         }
 
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Deleted it.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Deleted it.")],
         });
       }
 
@@ -1675,12 +1927,7 @@ describe("Sodium Bun backend", () => {
         }
 
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Reminder saved.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Reminder saved.")],
         });
       }
 
@@ -1981,12 +2228,7 @@ trailer <<>>
         const body = JSON.parse(String(init?.body ?? "{}")) as { messages?: Array<Record<string, unknown>> };
         secondRequestMessages = body.messages ?? [];
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Reviewed the file.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Reviewed the file.")],
         });
       }
 
@@ -2098,12 +2340,7 @@ trailer <<>>
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Reminder handled.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Reminder handled.")],
         });
       }
       if (url.includes("elevenlabs.io")) {
@@ -2204,12 +2441,7 @@ trailer <<>>
     const restore = withFetchStub(async (url) => {
       if (url.includes("/chat/completions")) {
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Hello, it is time to take your medicine.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Hello, it is time to take your medicine.")],
         });
       }
       return new Response(`unexpected fetch: ${url}`, { status: 501 });
@@ -2528,12 +2760,7 @@ trailer <<>>
           });
         }
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Done." },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Done.")],
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         });
       }
@@ -2634,12 +2861,7 @@ trailer <<>>
           });
         }
         return jsonResponse({
-          choices: [
-            {
-              message: { role: "assistant", content: "Browser task finished.", tool_calls: undefined },
-              finish_reason: "stop",
-            },
-          ],
+          choices: [speakChoice("Browser task finished.")],
         });
       }
 

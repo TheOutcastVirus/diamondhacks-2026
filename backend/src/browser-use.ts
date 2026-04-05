@@ -41,6 +41,25 @@ type PreparedBrowserTask = {
   };
 };
 
+export type BrowserTaskLifecycleEvent =
+  | {
+      kind: "awaiting_input";
+      browserSessionId: string;
+      task: string;
+      promptId: string;
+      needKind: HitlNeedKind;
+      promptTitle: string;
+      promptDescription: string;
+    }
+  | {
+      kind: "finished";
+      browserSessionId: string;
+      task: string;
+      failed: boolean;
+      summary: string;
+      previewUrl: string | null;
+    };
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -121,38 +140,6 @@ function parseBrowserUseApiErrorBody(body: string, status: number): string {
     /* not JSON */
   }
   return trimmed.length > 600 ? `${trimmed.slice(0, 597)}…` : trimmed;
-}
-
-function formatBrowserFailureForUser(message: string): string {
-  const lower = message.toLowerCase();
-
-  if (message.includes("BROWSER_USE_API_KEY is not configured")) {
-    return "I couldn't start Browser Use because the API key is not configured yet.";
-  }
-
-  if (message.includes("Browser Use is unreachable")) {
-    return "I couldn't reach Browser Use right now. Check the network connection and Browser Use API settings, then try again.";
-  }
-
-  if (lower.includes("timed out")) {
-    return "Browser Use took too long to respond. Please try again.";
-  }
-
-  if (
-    lower.includes("subscription") ||
-    lower.includes("workspace") ||
-    lower.includes("upgrade your plan") ||
-    lower.includes("payment required") ||
-    lower.includes("quota")
-  ) {
-    return "Browser automation didn't start—the Browser Use account hit a limit (subscription or workspaces). Open the Browser panel for the exact message, fix your Browser Use plan or free a workspace, then try again.";
-  }
-
-  if (lower.includes("unauthorized") || lower.includes("invalid api key") || lower.includes("401")) {
-    return "Browser Use rejected the API key. Check BROWSER_USE_API_KEY in backend/.env, then try again.";
-  }
-
-  return "The browser agent failed to run and isn't working for that task. Check Recent Actions in the Browser panel, then try again.";
 }
 
 /**
@@ -421,7 +408,14 @@ export class BrowserUseService {
     private readonly config: AppConfig,
     private readonly database: SodiumDatabase,
     private readonly transcriptBus: TranscriptEventBus,
+    private readonly onLifecycleEvent?: (event: BrowserTaskLifecycleEvent) => Promise<void> | void,
   ) {}
+
+  close(): void {
+    this.browserRunAbort?.abort();
+    this.browserRunAbort = null;
+    this.activeBrowserSessionId = null;
+  }
 
   async runBrowserTask(input: {
     browserSessionId: string;
@@ -435,7 +429,6 @@ export class BrowserUseService {
       this.recordBrowserTaskFailure(
         input,
         "BROWSER_USE_API_KEY is not configured. Set it in backend/.env.",
-        "I couldn't start browser automation. Configure BROWSER_USE_API_KEY in backend/.env.",
       );
       return;
     }
@@ -473,7 +466,7 @@ export class BrowserUseService {
       console.error("[browser-use] Browser task failed:", error);
       const detail = error instanceof Error ? error.message.trim() : String(error);
       const technical = detail ? `Browser task failed: ${detail}` : "Browser task failed.";
-      this.recordBrowserTaskFailure(input, technical, formatBrowserFailureForUser(technical));
+      this.recordBrowserTaskFailure(input, technical);
     }
   }
 
@@ -571,13 +564,15 @@ export class BrowserUseService {
           liveUrl: completedSession.liveUrl ?? undefined,
         },
       });
-      const robotEntry = this.database.createTranscriptEntry({
-        kind: "message",
-        role: "robot",
-        text: failed ? `I couldn't finish that task. ${summary}` : `I just finished that task. ${summary}`,
-      });
       this.transcriptBus.publish("tool", transcriptEntry);
-      this.transcriptBus.publish("transcript", robotEntry);
+      await this.emitLifecycleEvent({
+        kind: "finished",
+        browserSessionId: hitlRequest.browserSessionId,
+        task: hitlRequest.originalTask,
+        failed,
+        summary,
+        previewUrl: resumedPreviewUrl ?? null,
+      });
     } catch (error) {
       const message =
         error instanceof Error
@@ -616,7 +611,6 @@ export class BrowserUseService {
   private recordBrowserTaskFailure(
     input: { browserSessionId: string; task: string },
     message: string,
-    robotUserMessage = "I couldn't complete that browser task. Check the guardian console for details.",
   ): void {
     this.database.updateBrowserSession({
       browserSessionId: input.browserSessionId,
@@ -639,13 +633,15 @@ export class BrowserUseService {
       toolStatus: "failed",
       metadata: { task: input.task },
     });
-    const robot = this.database.createTranscriptEntry({
-      kind: "message",
-      role: "robot",
-      text: robotUserMessage,
-    });
     this.transcriptBus.publish("tool", failed);
-    this.transcriptBus.publish("transcript", robot);
+    void this.emitLifecycleEvent({
+      kind: "finished",
+      browserSessionId: input.browserSessionId,
+      task: input.task,
+      failed: true,
+      summary: message,
+      previewUrl: null,
+    });
   }
 
   private async runRemoteTask(
@@ -940,14 +936,17 @@ export class BrowserUseService {
           toolStatus: "started",
           metadata: { promptId: prompt.id, needKind: need.kind },
         });
-        const robotMsg = this.database.createTranscriptEntry({
-          kind: "message",
-          role: "robot",
-          text: `I need some information to continue. ${promptDescription} Please check the Requested Info panel.`,
-        });
         this.transcriptBus.publish("tool", waitingEntry);
-        this.transcriptBus.publish("transcript", robotMsg);
         this.transcriptBus.publishPrompt(prompt);
+        await this.emitLifecycleEvent({
+          kind: "awaiting_input",
+          browserSessionId: input.browserSessionId,
+          task: preparedTask.task,
+          promptId: prompt.id,
+          needKind: need.kind,
+          promptTitle,
+          promptDescription,
+        });
 
         // Return early — resume will happen when user submits the prompt (via app.ts hook)
         return;
@@ -1022,15 +1021,15 @@ export class BrowserUseService {
           cacheStatus: cacheStatus ?? undefined,
         },
       });
-      const robot = this.database.createTranscriptEntry({
-        kind: "message",
-        role: "robot",
-        text: failed
-          ? `I couldn't finish that task. ${cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary}`
-          : `I just finished that task. ${cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary}`,
-      });
       this.transcriptBus.publish("tool", completed);
-      this.transcriptBus.publish("transcript", robot);
+      await this.emitLifecycleEvent({
+        kind: "finished",
+        browserSessionId: input.browserSessionId,
+        task: preparedTask.task,
+        failed,
+        summary: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,
+        previewUrl: finalPreviewUrl ?? null,
+      });
       if (finalSession.id) {
         await this.stopRemoteSession(finalSession.id);
       }
@@ -1044,7 +1043,19 @@ export class BrowserUseService {
       console.error("[browser-use] Remote task failed:", error);
       const message =
         error instanceof Error ? `Browser task failed: ${error.message}` : "Browser task failed.";
-      this.recordBrowserTaskFailure(input, message, formatBrowserFailureForUser(message));
+      this.recordBrowserTaskFailure(input, message);
+    }
+  }
+
+  private async emitLifecycleEvent(event: BrowserTaskLifecycleEvent): Promise<void> {
+    if (!this.onLifecycleEvent) {
+      return;
+    }
+
+    try {
+      await this.onLifecycleEvent(event);
+    } catch (error) {
+      console.error("[browser-use] Lifecycle callback failed:", error);
     }
   }
 

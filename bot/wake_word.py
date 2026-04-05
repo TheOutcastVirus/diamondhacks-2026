@@ -14,10 +14,6 @@ The first run downloads the TFLite model (~2 MB) and caches it locally.
 
 import sys
 import time
-import numpy as np
-import sounddevice as sd
-import openwakeword.utils
-from openwakeword.model import Model
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # openWakeWord ships several built-in models.  "hey_jarvis" is a solid default;
@@ -34,6 +30,16 @@ CHUNK_FRAMES = 1280   # 80 ms at 16 kHz — recommended by openWakeWord docs
 
 
 def main() -> None:
+    print("[wake_word] Importing numpy…", file=sys.stderr, flush=True)
+    import numpy as np
+
+    print("[wake_word] Importing sounddevice…", file=sys.stderr, flush=True)
+    import sounddevice as sd
+
+    print("[wake_word] Importing openwakeword…", file=sys.stderr, flush=True)
+    import openwakeword.utils
+    from openwakeword.model import Model
+
     print(f"[wake_word] Loading model '{WAKE_WORD_MODEL}'…", file=sys.stderr, flush=True)
     openwakeword.utils.download_models()
     model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")

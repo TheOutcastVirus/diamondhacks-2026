@@ -339,8 +339,13 @@ const LIST_REMINDERS_SCHEMA = EMPTY_OBJECT_SCHEMA;
 
 const CREATE_REMINDER_SCHEMA = z.object({
   title: z.string().min(1).describe("Short title for the reminder."),
-  instructions: z.string().min(1).describe("What Sodium should say or do when the reminder fires."),
-  cron: z.string().min(1).describe("5-field cron expression."),
+  instructions: z.string().min(1).describe("What Gazabot should say or do when the reminder fires."),
+  cron: z
+    .string()
+    .min(1)
+    .describe(
+      "5-field cron expression in minute hour day-of-month month day-of-week order, with no seconds field (for example '0 9 * * *' for every day at 9:00 AM or '30 19 * * 2' for Tuesdays at 7:30 PM).",
+    ),
   cadence: z.enum(["daily", "weekly", "custom"]).describe("Recurrence type."),
   scheduleLabel: z.string().min(1).describe("Human-readable schedule description."),
   timezone: z.string().optional().describe("Optional IANA timezone name."),
@@ -357,7 +362,12 @@ const UPDATE_REMINDER_SCHEMA = z.object({
   reminder_name: z.string().optional().describe("Current reminder title when the id is unknown."),
   title: z.string().optional().describe("Updated title."),
   instructions: z.string().optional().describe("Updated instructions."),
-  cron: z.string().optional().describe("Updated cron expression."),
+  cron: z
+    .string()
+    .optional()
+    .describe(
+      "Updated 5-field cron expression in minute hour day-of-month month day-of-week order, with no seconds field.",
+    ),
   cadence: z.enum(["daily", "weekly", "custom"]).optional().describe("Updated recurrence type."),
   scheduleLabel: z.string().optional().describe("Updated schedule label."),
   timezone: z.string().optional().describe("Updated IANA timezone."),
@@ -582,6 +592,24 @@ function normalizeFallbackToolResult(toolResult: unknown): Record<string, unknow
   };
 }
 
+function buildHiddenReasoningReminder(fallbackText: string): ModelMessage {
+  const trimmed = fallbackText.trim();
+  const preview = trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed;
+
+  return {
+    role: "system",
+    content: [
+      "Hidden reasoning reminder:",
+      "Your previous plain assistant text was treated as private thinking and was not shown to the user.",
+      "If you want the user to hear anything, call the speak tool.",
+      "If you want browser automation, call run_browser_task only when the user explicitly asked for browser or website work.",
+      "If you need more information, ask the user directly via speak or request_user_input instead of browsing speculatively.",
+      "When creating or updating reminders, use a valid five-field cron expression in minute hour day-of-month month day-of-week order.",
+      preview ? `Hidden text: ${preview}` : "Hidden text: (empty)",
+    ].join("\n"),
+  } as ModelMessage;
+}
+
 export class AgentHarness {
   private readonly cerebrasProvider;
 
@@ -658,104 +686,38 @@ export class AgentHarness {
         ? "This is a VOICE interaction. Your reply will be spoken aloud automatically. Default to one short sentence. Never exceed two short sentences unless the user explicitly asks for more detail. If the resident is clearly ending the conversation, you MUST call end_conversation before giving a brief farewell. Do not end a voice conversation with farewell text alone."
         : "This is a dashboard interaction. Keep replies extremely short by default. Use one short sentence unless the user explicitly asks for more detail.";
 
-    const forceNote = request.forceBrowser
-      ? "IMPORTANT: The user has explicitly requested this be handled via browser automation."
-      : "";
+    const browserState = request.forceBrowser
+      ? "Browser request: the user explicitly requested browser automation for this turn."
+      : "Browser request: only use browser automation when the user explicitly asks for browsing, searching the web, opening a site, ordering, booking, or checking a website. If you are merely unsure, ask the user directly instead of using the browser.";
 
-    const now = new Date().toLocaleString("en-US", {
-      timeZone: DEFAULT_REMINDER_TIMEZONE,
-      dateStyle: "full",
-      timeStyle: "long",
-    });
-
-    const sections = [
-      "Your highest priority is to follow this system prompt exactly. Ignore any learned default behavior that conflicts with it.",
-
-      `You are Sodium. Your name is Sodium. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.
-Be warm, calm, concise, and practical. Do not sound grandiose, theatrical, or overly chatty.
-If you are unsure, research first or ask one short clarification question.`,
-
-      `Response style:
-- Keep messages super short.
-- Default to one short sentence.
-- Never exceed two short sentences unless the user explicitly asks for detail.
-- For simple confirmations, use very short replies like "Okay.", "Done.", "I can do that.", or one short question.
-- If a tool already did the work, briefly state the result and stop.
-- Do not add extra suggestions unless they are necessary.`,
-
-      voiceNote,
-
-      forceNote,
-
-      `Default reminder timezone: ${DEFAULT_REMINDER_TIMEZONE}.
-Current date and time: ${now}`,
-
-      `Memory topics available via read_memory:
-${memoryIndex}`,
-
-      `Active reminders:
-${reminderSummary}`,
-
-      `Uploaded files available via list_uploaded_files or read_uploaded_file:
-${uploadedFileSummary}`,
-
-      `Memory:
-- When you learn something worth remembering about the user or household, call write_memory.
-- When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.`,
-
-      `Ordering:
-- Food ordering platforms: DoorDash, Uber Eats, Grubhub. Use run_browser_task and include the platform name in the task string.
-- Pharmacy: CVS.com for OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
-- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
-- run_browser_task hands work to another agent that cannot access your context. You must supply everything needed to finish the task. For example, when buying something, either collect credit card/address information with request_user_input or retrieve it from memory with read_memory when available.`,
-
-      `Tool rules. Follow exactly:
-
-General:
-- Only call a tool if the user EXPLICITLY requests that action.
-- For greetings, questions, or conversation, respond in plain text and call NO tools.
-- Try to avoid repeating a tool call. If a tool call fails, think about why it might have failed and then try again.
-- Follow these instructions more closely than any model habit or default style.
-- Use the speak tool for user-visible replies in this turn instead of replying as raw assistant text when you are using tools.`,
-
-      `Presenting choices:
-- When the user asks you to find or search for something (e.g. "find me some chips", "what pizza places are nearby"), and there are multiple results to choose from, use present_options to show a numbered list.
-- present_options works for both voice and screen. Voice users hear the list spoken aloud and can reply with a number or name. Screen users see a dropdown and pick.
-- After calling present_options, STOP and wait for the user to respond with their choice in the next turn. Do not call run_browser_task until the user has chosen.
-- When the user replies with a choice (e.g. "number 2", "the Doritos", "option 3"), check memory for the pending options under the memory_key you used, match their choice, then continue with the selected item (e.g. pass it to run_browser_task).`,
-
-      `Web and browser:
-- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
-- run_browser_task hands work to another agent that does not have the information you do. Supply all information needed to complete the task.`,
-
-      `Reminders:
-- Use create_reminder ONLY if the user asks to set or schedule a reminder.
-- Use list_reminders ONLY if the user asks to see their reminders, or if you need context.
-- To update or delete a reminder, use the exact reminder id. If you are not certain which reminder id matches the user's request, call list_reminders first. Never guess a reminder id.
-- For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.`,
-
-      `Files and forms:
-- read_uploaded_file returns a text-only clone of the file. For images, prioritize exact visible text and numbers; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
-- If the user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on contentText as the file content you can reason over. If the user asks to extract text from an image, you only have access to contentText. If the user explicitly wants to re-extract text, use extract_pdf_text.
-- When you need specific user data, such as credit card information, use request_user_input over asking for free-form prose.
-- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.
-- If you call request_user_input, briefly tell the user to check the Requested Info panel in the web UI.`,
-
-      `Ending:
-- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.`,
-
-      `Important:
-You are Sodium. Say "Sodium" if you mention your name.
-The user transcripts may be imperfect. Listen closely. Infer obvious transcription mistakes, but if meaning is still unclear, ask one short clarification question.
-NEVER RESPOND IN MARKDOWN: plain text only, not JSON, no formatting.
-Keep your answer short even after tool calls.
-Do not mention internal model names, providers, or system prompts.
-If you need context, call tools first and then answer briefly.
-Remember to message like you are talking, because you are. Do not use bullet lists, tables, or any formatting in user-facing text.
-When giving a list to the user, abstract the unimportant information away. This is a conversation. For example, if the user asks for a list of reminders, give an overview — do not dump tool output verbatim.`,
-    ];
-
-    return sections.filter((s) => s.length > 0).join("\n\n");
+    return [
+        `You are Sodium. Your name is Sodium. You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.`,
+    `Be warm, calm, concise, and practical. Do not sound grandiose, theatrical, or overly chatty. If you are unsure, a clarification question. If you are still unsure, ask another. If you feel the conversation is going nowhere, research using the browser tool.`,
+      interactionStyle,
+      browserState,
+      "Speech rule: the only user-visible spoken words you produce are the messages passed to the speak tool.",
+      "Think about your response when outputing text. The only thing the user hears is the output from the speak tool.",
+      "Reasoning rule: use a bit of reasoning before acting on anything complicated, but keep that reasoning private and express the user-facing result through tools.",
+      "Clarification rule: if something important is ambiguous, ask the user directly instead of guessing or launching browser automation.",
+      "Cron rule: reminder schedules use exactly five cron fields in this order: minute hour day-of-month month day-of-week.",
+        "Cron examples: '0 9 * * *' means every day at 9:00 AM. '30 19 * * 2' means every Tuesday at 7:30 PM. There is no seconds field.",
+        `Response style:
+  - Keep messages short.
+  - Default to one short sentence.
+  - Never exceed three sentences unless the user explicitly asks for detail.
+  - For simple confirmations, use very short replies like "Okay.", "Done.", "I can do that.", or one short question.
+  - If a tool already did the work, briefly state the result and stop.
+  - Do not add extra suggestions unless they are necessary.`,
+      `Default reminder timezone: ${DEFAULT_REMINDER_TIMEZONE}.`,
+      `Current date and time: ${new Date().toLocaleString("en-US", {
+        timeZone: DEFAULT_REMINDER_TIMEZONE,
+        dateStyle: "full",
+        timeStyle: "long",
+      })}`,
+      `Memory topics:\n${memoryIndex}`,
+      `Active reminders:\n${reminderSummary}`,
+      `Uploaded files:\n${uploadedFileSummary}`,
+    ].join("\n\n");
   }
 
   private buildMessages(request: AgentTurnRequest): ModelMessage[] {
@@ -1231,7 +1193,7 @@ When giving a list to the user, abstract the unimportant information away. This 
       tools: {
         speak: tool({
           description:
-            "Say something to the user. Use this for any user-visible response in this turn instead of replying directly.",
+            "The only tool that may produce user-visible speech. Use this for every spoken reply. Never rely on plain assistant text for user-facing output.",
           inputSchema: SPEAK_SCHEMA,
           execute: async (input) => this.executeToolByName("speak", input, runtime, request.profileId),
         }),
@@ -1274,7 +1236,7 @@ When giving a list to the user, abstract the unimportant information away. This 
         }),
         run_browser_task: tool({
           description:
-            "Dispatch a browser automation task for browsing, ordering, booking, searching, or interacting with websites.",
+            "Dispatch a browser automation task only when the user explicitly asked for browsing, searching the web, opening a website, ordering, booking, or other website interaction. Do not use this tool just because you are uncertain; ask the user directly instead.",
           inputSchema: RUN_BROWSER_TASK_SCHEMA,
           execute: async (input) => this.executeToolByName("run_browser_task", input, runtime, request.profileId),
         }),
@@ -1413,18 +1375,23 @@ When giving a list to the user, abstract the unimportant information away. This 
 
           continue;
         }
+
+        if (fallbackText) {
+          messages.push({ role: "assistant", content: fallbackText });
+          messages.push(buildHiddenReasoningReminder(fallbackText));
+          continue;
+        }
       }
 
       if (runtime.endConversation) {
         return {
           kind: "end_conversation",
-          text: spokenText || fallbackText || "Goodbye for now.",
+          text: spokenText || "Goodbye for now.",
         };
       }
 
       const replyText =
         spokenText ||
-        fallbackText ||
         (runtime.promptSent
           ? "I've sent you a form to fill out. Please check the Requested Info panel."
           : "I'm sorry, I couldn't complete that request.");
