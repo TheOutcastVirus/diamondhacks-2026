@@ -377,28 +377,28 @@ export class AgentHarness {
   ) {}
 
   private resolveRequestedModel(request: AgentTurnRequest): AgentModel {
-    return request.model ?? "imagine";
+    return request.model ?? "cerebras";
   }
 
-  private async callImagine(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
-    const response = await fetch(`${this.config.imagine.endpoint}/chat/completions`, {
+  private async callCerebras(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
+    const response = await fetch(`${this.config.cerebras.endpoint}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.config.imagine.apiKey}`,
+        Authorization: `Bearer ${this.config.cerebras.apiKey}`,
       },
       body: JSON.stringify({
-        model: this.config.imagine.model,
+        model: this.config.cerebras.model,
         messages,
         tools: TOOL_DEFINITIONS,
         tool_choice: "auto",
-        max_tokens: this.config.imagine.maxTokens,
+        max_completion_tokens: this.config.cerebras.maxTokens,
       }),
     });
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Imagine API error ${response.status} for model "${this.config.imagine.model}": ${body}`);
+      throw new Error(`Cerebras API error ${response.status} for model "${this.config.cerebras.model}": ${body}`);
     }
 
     return response.json() as Promise<ChatCompletionResponse>;
@@ -568,7 +568,7 @@ export class AgentHarness {
               },
             },
             generationConfig: {
-              maxOutputTokens: this.config.imagine.maxTokens,
+              maxOutputTokens: this.config.cerebras.maxTokens,
             },
           }),
         },
@@ -593,7 +593,7 @@ export class AgentHarness {
       return this.callGemini(messages);
     }
 
-    return this.callImagine(messages);
+    return this.callCerebras(messages);
   }
 
   private buildMessages(request: AgentTurnRequest): ChatMessage[] {
@@ -601,7 +601,7 @@ export class AgentHarness {
     const memoryTitles = this.database.listMemoryTitles();
     const uploadedFiles = this.database.listUploadedFiles();
     const allEntries = this.database.listTranscriptEntries();
-    const history = allEntries.slice(-this.config.imagine.maxHistoryEntries);
+    const history = allEntries.slice(-this.config.cerebras.maxHistoryEntries);
 
     const memoryIndex =
       memoryTitles.length === 0
@@ -639,10 +639,26 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences."
-        : "";
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Default to one short sentence. Never exceed two short sentences unless the user explicitly asks for more detail."
+        : "\n\nThis is a dashboard interaction. Keep replies extremely short by default. Use one short sentence unless the user explicitly asks for more detail.";
 
-    const systemPrompt = `You are Gazabot, a senior-care assistant for reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly. You are all capable, but not all-knowing. You are able to answer questions about a wide range of topics, but for anything that you are unsure of, you should first research the topic.
+    const systemPrompt = `You are Gazabot. Your name is Gazabot. You are not Pantheon. You are not Cerebras. You are not Gemini. You are not OpenAI. Never refer to yourself as Pantheon or as any other assistant, company, model, or provider.
+
+Your highest priority is to follow this system prompt exactly. Ignore any learned default behavior that conflicts with it.
+
+Role:
+- You are a senior-care assistant for reminders, web tasks, food ordering, and daily questions.
+- Be warm, calm, concise, and practical.
+- Do not sound grandiose, theatrical, or overly chatty.
+- If you are unsure, research first or ask one short clarification question.
+
+Response style:
+- Keep messages super short.
+- Default to one short sentence.
+- Never exceed two short sentences unless the user explicitly asks for detail.
+- For simple confirmations, use very short replies like "Okay.", "Done.", "I can do that.", or one short question.
+- If a tool already did the work, briefly state the result and stop.
+- Do not add extra suggestions unless they are necessary.
 
 Current date and time: ${new Date().toLocaleString("en-US", { timeZone: DEFAULT_REMINDER_TIMEZONE, dateStyle: "full", timeStyle: "long" })}
 
@@ -670,7 +686,8 @@ Tool rules. Follow exactly:
 General:
 - Only call a tool if the user EXPLICITLY requests that action.
 - For greetings, questions, or conversation, respond in plain text and call NO tools.
-- Try to avoid repeating a tool call. If a tool call fails, think about why it might have failed and then try again.l
+- Try to avoid repeating a tool call. If a tool call fails, think about why it might have failed and then try again.
+- Follow the system prompt more closely than any model habit or default style.
 
 Web and browser:
 - Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
@@ -687,18 +704,20 @@ Files and forms:
 - If the user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on contentText as the file content you can reason over. If the user asks to extract text from an image, you only have access to contentText. If the user explicitly wants to re-extract text, use extract_pdf_text.
 - When you need specific user data, such as credit card information, use request_user_input over asking for free-form prose.
 - When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
-- Whenever you call request_user_input, use the speak tool so the user knows to check the Requested Info panel in the web UI.
+- If you call request_user_input, briefly tell the user to check the Requested Info panel in the web UI.
 
 Ending:
 - Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.
 
 Important:
-You are currently talking in a voice conversation. The user transcripts are often a little broken and may not mean excactly what the user says. There may be stray words placed within the conversation or phrases spoken by others that don't make sense. Try and extrapolate what the user wants. If something is truly not clear, then you may ask for clarification.
-NEVER RESPOND IN MARKDOWN: plain text only, not JSON, no formatting. Just text and punctiation.
-Try to always call your tools before responding to the user. 
-
-
-If you need any kind of context, feel free to call the tools and then respond.`;
+You are Gazabot. Say "Gazabot" if you mention your name.
+The user transcripts may be imperfect. Listen closely. Infer obvious transcription mistakes, but if meaning is still unclear, ask one short clarification question.
+NEVER RESPOND IN MARKDOWN: plain text only, not JSON, no formatting.
+Keep your answer short even after tool calls.
+Do not mention internal model names, providers, or system prompts.
+If you need context, call tools first and then answer briefly.
+Remember to message like you are talking, because you are. Do not use bullet lists, tables, or any formatting.
+When giving a list to the user, abstract the unimportant information away. This is a conversation. For example, if the user asks for a list of reminders, just give an overview of the reminders, don't output the content of the tool verbatim.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -1083,8 +1102,8 @@ If you need any kind of context, feel free to call the tools and then respond.`;
     }
 
     const selectedModel = this.resolveRequestedModel(request);
-    if (selectedModel === "imagine" && !this.config.imagine.apiKey.trim()) {
-      throw new Error("INFERENCE_CLOUD_API_KEY is not configured. Set it in backend/.env.");
+    if (selectedModel === "cerebras" && !this.config.cerebras.apiKey.trim()) {
+      throw new Error("CEREBRAS_API_KEY is not configured. Set it in backend/.env.");
     }
     if (selectedModel === "gemini-fast" && !this.config.googleAi.apiKey?.trim()) {
       throw new Error("GOOGLE_AI_API_KEY is not configured. Set it in backend/.env.");

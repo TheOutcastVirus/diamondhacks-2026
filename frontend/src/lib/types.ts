@@ -1,7 +1,7 @@
 export type ThemeMode = 'light' | 'dark';
 export type ConversationState = 'idle' | 'conversation';
 export type RecordingState = 'idle' | 'recording' | 'processing';
-export type AgentModel = 'imagine' | 'gemini-fast';
+export type AgentModel = 'cerebras' | 'gemini-fast';
 export type PageId = 'reminders' | 'transcription' | 'browser' | 'requested-info';
 export type EndpointKey =
   | 'reminders'

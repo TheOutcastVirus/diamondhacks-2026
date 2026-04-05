@@ -13,6 +13,7 @@
 
   type StreamState = 'connecting' | 'live' | 'offline';
   type FilterMode = 'all' | 'message' | 'tool';
+  const HISTORY_LOAD_TIMEOUT_MS = 4000;
 
   let entries: TranscriptEntry[] = [];
   let streamState: StreamState = 'connecting';
@@ -24,14 +25,7 @@
   let expandedTools: Set<string> = new Set();
   let conversationState: ConversationState = 'idle';
   let newConversationBusy = false;
-  let agentModel: AgentModel = 'imagine';
-  let agentModelHydrated = false;
-
-  const agentModelStorageKey = 'gazabot-agent-model';
-  const agentModelOptions: Array<{ value: AgentModel; label: string; detail: string }> = [
-    { value: 'imagine', label: 'Imagine', detail: 'Default Cirrascale-backed agent runtime.' },
-    { value: 'gemini-fast', label: 'Gemini Fast', detail: 'Google Gemini 3 Flash for faster turns.' },
-  ];
+  let agentModel: AgentModel = 'cerebras';
 
   async function startNewConversation() {
     if (newConversationBusy) return;
@@ -153,12 +147,23 @@
     }
   }
 
-  function appendEntries(nextEntries: TranscriptEntry[]) {
+  function mergeEntries(nextEntries: TranscriptEntry[], mode: 'append' | 'replace' = 'append') {
     if (nextEntries.length === 0) {
+      if (mode === 'replace') {
+        entries = [];
+      }
       return;
     }
 
-    entries = [...entries, ...nextEntries].slice(-250);
+    const merged = mode === 'replace' ? [...nextEntries] : [...entries, ...nextEntries];
+    const deduped = new Map<string, TranscriptEntry>();
+    for (const entry of merged) {
+      deduped.set(entry.id, entry);
+    }
+
+    entries = Array.from(deduped.values())
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp))
+      .slice(-250);
 
     if (autoScroll) {
       requestAnimationFrame(() => {
@@ -171,18 +176,26 @@
   async function loadTranscriptHistory() {
     isBootstrapping = true;
     streamError = '';
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), HISTORY_LOAD_TIMEOUT_MS);
 
     try {
-      const payload = await get<unknown>('transcript');
-      entries = normalizeTranscriptResponse(payload);
+      const payload = await get<unknown>('transcript', { signal: controller.signal });
+      mergeEntries(normalizeTranscriptResponse(payload));
       if (autoScroll) {
         await tick();
         const feed = document.querySelector<HTMLElement>('[data-transcript-feed]');
         feed?.scrollTo({ top: feed.scrollHeight, behavior: 'auto' });
       }
     } catch (error) {
-      streamError = error instanceof Error ? error.message : 'Unable to load transcript history.';
+      streamError =
+        error instanceof Error && error.name === 'AbortError'
+          ? 'Transcript history is taking too long to load. Live updates are still connected.'
+          : error instanceof Error
+            ? error.message
+            : 'Unable to load transcript history.';
     } finally {
+      window.clearTimeout(timeoutId);
       isBootstrapping = false;
     }
   }
@@ -196,23 +209,29 @@
   }
 
   function attachStreamListeners(source: EventSource) {
+    const markBootstrapped = () => {
+      isBootstrapping = false;
+    };
+
     const processMessage = (eventType: string, event: MessageEvent<string>) => {
       const payload = parseEventData(event.data);
       const record = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : null;
+      markBootstrapped();
 
       if (Array.isArray(record?.entries)) {
-        appendEntries(
+        mergeEntries(
           record.entries.map((item, index) => normalizeTranscriptEntry(item, index, eventType)),
         );
         return;
       }
 
-      appendEntries([normalizeTranscriptEntry(payload, entries.length, eventType)]);
+      mergeEntries([normalizeTranscriptEntry(payload, entries.length, eventType)]);
     };
 
     source.onopen = () => {
       streamState = 'live';
       streamError = '';
+      markBootstrapped();
     };
 
     source.onerror = () => {
@@ -245,7 +264,7 @@
         const payload = JSON.parse((event as MessageEvent<string>).data) as { action?: string };
         if (payload.action === 'reset') {
           entries = [];
-          isBootstrapping = false;
+          markBootstrapped();
         }
       } catch {
         // ignore
@@ -271,14 +290,8 @@
   }
 
   onMount(async () => {
-    const storedAgentModel = window.localStorage.getItem(agentModelStorageKey);
-    if (storedAgentModel === 'imagine' || storedAgentModel === 'gemini-fast') {
-      agentModel = storedAgentModel;
-    }
-    agentModelHydrated = true;
-
-    await loadTranscriptHistory();
     connectStream();
+    await loadTranscriptHistory();
   });
 
   onDestroy(() => {
@@ -481,31 +494,6 @@
       {#if streamError}
         <p class="feedback feedback-error">{streamError}</p>
       {/if}
-
-      <div class="su-divider" aria-hidden="true"></div>
-
-      <div class="su-model" aria-label="Agent model">
-        <div class="su-model-copy">
-          <span class="su-section-label">Agent model</span>
-          <p class="su-model-note">
-            Switch between the current Imagine path and Gemini Fast for dashboard voice turns.
-          </p>
-        </div>
-        <div class="model-switcher" role="tablist" aria-label="Choose agent model">
-          {#each agentModelOptions as option}
-            <button
-              class:model-active={agentModel === option.value}
-              class="model-btn"
-              type="button"
-              on:click={() => (agentModel = option.value)}
-              aria-pressed={agentModel === option.value}
-              title={option.detail}
-            >
-              {option.label}
-            </button>
-          {/each}
-        </div>
-      </div>
 
       <div class="su-divider" aria-hidden="true"></div>
 
@@ -1191,73 +1179,12 @@
     background: color-mix(in srgb, var(--color-line-strong) 9%, transparent);
   }
 
-  div.su-model {
-    display: flex;
-    flex-direction: column;
-    gap: 0.8rem;
-    padding: 0.9rem;
-  }
-
-  div.su-model-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
   span.su-section-label {
     font-size: 0.6875rem;
     font-weight: 700;
     letter-spacing: 0.09em;
     text-transform: uppercase;
     color: var(--color-ink-soft);
-  }
-
-  p.su-model-note {
-    margin: 0;
-    font-size: 0.9rem;
-    line-height: 1.45;
-    color: var(--color-ink-soft);
-  }
-
-  div.model-switcher {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.5rem;
-  }
-
-  button.model-btn {
-    font: inherit;
-    font-size: 0.92rem;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    cursor: pointer;
-    border: 1px solid color-mix(in srgb, var(--color-line-strong) 10%, transparent);
-    border-radius: 0.9rem;
-    padding: 0.8rem 0.9rem;
-    background: color-mix(in srgb, var(--color-bg-strong) 65%, var(--color-panel-muted));
-    color: var(--color-ink);
-    transition:
-      border-color 0.2s var(--tx-ease),
-      background 0.2s var(--tx-ease),
-      color 0.2s var(--tx-ease),
-      transform 0.2s var(--tx-ease);
-  }
-
-  button.model-btn:hover {
-    transform: translateY(-1px);
-    border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
-  }
-
-  button.model-btn:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--color-accent) 55%, var(--color-line));
-    outline-offset: 2px;
-  }
-
-  button.model-btn.model-active {
-    color: var(--color-ink-strong);
-    background: color-mix(in srgb, var(--color-accent) 13%, var(--color-panel-muted));
-    border-color: color-mix(in srgb, var(--color-accent) 42%, transparent);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
   }
 
   div.su-conn {

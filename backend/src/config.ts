@@ -43,7 +43,7 @@ export type AppConfig = {
     pathwayId?: string;
     baseUrl: string;
   };
-  imagine: {
+  cerebras: {
     apiKey: string;
     endpoint: string;
     model: string;
@@ -198,12 +198,12 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     browserUse.authStatePath = authStatePath;
   }
 
-  const imagine: AppConfig["imagine"] = {
-    apiKey: source.INFERENCE_CLOUD_API_KEY?.trim() || "",
-    endpoint: source.INFERENCE_CLOUD_ENDPOINT?.trim() || "https://aisuite.cirrascale.com/apis/v2",
-    model: source.INFERENCE_CLOUD_MODEL?.trim() || "Llama-3.1-8B",
-    maxTokens: parseInteger(source.INFERENCE_CLOUD_MAX_TOKENS, 1024),
-    maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
+  const cerebras: AppConfig["cerebras"] = {
+    apiKey: source.CEREBRAS_API_KEY?.trim() || "",
+    endpoint: source.CEREBRAS_ENDPOINT?.trim() || "https://api.cerebras.ai/v1",
+    model: source.CEREBRAS_MODEL?.trim() || "llama3.1-8b",
+    maxTokens: parseInteger(source.CEREBRAS_MAX_TOKENS, 1024),
+    maxHistoryEntries: parseInteger(source.CEREBRAS_MAX_HISTORY, 20),
   };
 
   const bland: AppConfig["bland"] = {
@@ -257,7 +257,7 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
       callCooldownSeconds: parseInteger(source.CRISIS_CALL_COOLDOWN_SECONDS, 300),
     },
     bland,
-    imagine,
+    cerebras,
     tts,
     elevenLabs: {
       apiKey: source.ELEVEN_LABS_API_KEY?.trim() || "",

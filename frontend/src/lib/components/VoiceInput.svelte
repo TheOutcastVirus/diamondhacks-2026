@@ -4,7 +4,7 @@
 
   let state: RecordingState = 'idle';
   let error = '';
-  export let agentModel: AgentModel = 'imagine';
+  export let agentModel: AgentModel = 'cerebras';
 
   async function startRecording() {
     error = '';
