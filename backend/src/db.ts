@@ -121,6 +121,21 @@ type ShoppingOrderRow = {
   created_at: string;
 };
 
+type UploadedFileRow = {
+  id: string;
+  name: string;
+  original_name: string;
+  storage_path: string;
+  mime_type: string;
+  size_bytes: number;
+  text_status: UploadedFileTextStatus;
+  extracted_text: string | null;
+  reminder_id: string | null;
+  prompt_id: string | null;
+  prompt_field_name: string | null;
+  created_at: string;
+};
+
 export type BrowserTaskSession = {
   id: string;
   previewUrl: string | null;
@@ -239,6 +254,22 @@ function parseUploadedFileReferences(value: string | null | undefined): Uploaded
   } catch {
     return [];
   }
+}
+
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    ...(row.reminder_id ? { reminderId: row.reminder_id } : {}),
+    ...(row.prompt_id ? { promptId: row.prompt_id } : {}),
+    ...(row.prompt_field_name ? { promptFieldName: row.prompt_field_name } : {}),
+    ...(row.extracted_text ? { extractedText: row.extracted_text } : {}),
+  };
 }
 
 function serializeReminder(row: ReminderRow): Reminder {

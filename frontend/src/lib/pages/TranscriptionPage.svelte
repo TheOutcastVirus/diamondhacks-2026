@@ -216,7 +216,7 @@
 <section class="page-grid tx-console" aria-label="Live transcript">
   <section class="panel panel-feed">
     <header class="feed-toolbar">
-      <div class="segmented" role="tablist" aria-label="Transcript filters">
+      <div class="segmented" role="tablist" aria-label="What to show in the feed">
         <button class:active-filter={filterMode === 'all'} class="seg-btn" type="button" on:click={() => (filterMode = 'all')}>
           All
         </button>
@@ -237,17 +237,17 @@
           <div class="skeleton-line wide"></div>
           <div class="skeleton-line"></div>
           <div class="skeleton-line narrow"></div>
-          <p class="feed-state-label">Loading history…</p>
+          <p class="feed-state-label">Syncing transcript…</p>
         </div>
       {:else if filteredEntries.length === 0}
         <div class="feed-state feed-state-empty">
           <p class="feed-empty-title">
-            {entries.length === 0 ? 'Quiet channel' : 'Nothing in this view'}
+            {entries.length === 0 ? 'Nothing in the feed yet' : 'No rows for this filter'}
           </p>
           <p class="feed-empty-body">
             {entries.length === 0
-              ? 'Events will appear here as soon as the agent speaks or runs a tool.'
-              : 'Switch to All or another filter to see buffered events.'}
+              ? 'Agent replies and tool runs land here the moment they happen.'
+              : 'Switch to All, Chat, or Tools to see what is buffered.'}
           </p>
         </div>
       {:else}

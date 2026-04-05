@@ -55,7 +55,7 @@
   </button>
 
   <p class="voice-label">
-    {#if state === 'idle'}Tap to speak{:else if state === 'recording'}Recording… tap to stop{:else}Processing…{/if}
+    {#if state === 'idle'}Tap the mic — talk to the agent{:else if state === 'recording'}Recording. Tap again to stop.{:else}Wrapping up…{/if}
   </p>
 
   {#if error}
@@ -71,7 +71,7 @@
     justify-content: center;
     gap: 1.25rem;
     width: 100%;
-    animation: tx-fade-up 0.4s var(--tx-ease) forwards;
+    animation: tx-fade-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   }
 
   @keyframes tx-fade-up {
@@ -216,6 +216,6 @@
     border-radius: 6px;
     text-align: center;
     max-width: 16rem;
-    animation: tx-fade-up 0.2s var(--tx-ease) forwards;
+    animation: tx-fade-up 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   }
 </style>

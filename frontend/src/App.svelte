@@ -20,7 +20,7 @@
       label: 'Transcript',
       eyebrow: '',
       title: 'Transcript',
-      description: 'Conversation, tools, and agent actions in one stream.',
+      description: 'One timeline: live chat, tool calls, and what the agent is doing.',
       metricLabel: 'Live',
     },
     {
