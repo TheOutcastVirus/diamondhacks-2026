@@ -18,6 +18,7 @@ import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
 import type { UploadedFileService } from "./files";
 import type { TranscriptEventBus } from "./transcript-bus";
+import { buildRecentActivitySnapshot } from "./activity";
 
 export type AgentTurnResult =
   | { kind: "text"; text: string }
@@ -28,6 +29,254 @@ type BrowserTaskInfo = {
   browserSessionId: string;
   previewUrl: string | null;
 };
+/*
+const TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "list_recent_activity",
+      description:
+        "Summarize recent activity across the household, including transcript messages, tool calls, and browser automation history. Use when the user asks what happened recently or wants a recap.",
+      parameters: {
+        type: "object",
+        properties: {
+          lookback_minutes: {
+            type: "number",
+            description: "How far back to look, in minutes. Defaults to 240 (4 hours).",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of activity items to return. Defaults to 30.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_reminders",
+      description: "Get all scheduled reminders for the household.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_reminder",
+      description: "Create a new scheduled reminder.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Short title for the reminder" },
+          instructions: { type: "string", description: "What to do or say when the reminder fires" },
+          cron: { type: "string", description: "5-field cron expression (e.g. '0 9 * * *' for 9am daily)" },
+          cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Recurrence type" },
+          scheduleLabel: { type: "string", description: "Human-readable schedule description (e.g. 'Every day at 9am')" },
+          timezone: {
+            type: "string",
+            description: `Optional IANA timezone name (e.g. 'America/New_York'). Defaults to ${DEFAULT_REMINDER_TIMEZONE}.`,
+          },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional uploaded file ids to associate with the reminder.",
+          },
+        },
+        required: ["title", "instructions", "cron", "cadence", "scheduleLabel"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_reminder",
+      description:
+        "Update an existing reminder. Use to pause, resume, rename, edit the schedule, change the timezone, or change reminder instructions.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Reminder id to update" },
+          title: { type: "string", description: "Updated reminder title" },
+          instructions: { type: "string", description: "Updated reminder instructions" },
+          cron: { type: "string", description: "Updated 5-field cron expression" },
+          cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Updated recurrence type" },
+          scheduleLabel: { type: "string", description: "Updated human-readable schedule description" },
+          timezone: { type: "string", description: "Updated IANA timezone name" },
+          status: { type: "string", enum: ["active", "paused", "draft"], description: "Reminder status" },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Replace the reminder's attached uploaded files with these file ids.",
+          },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_reminder",
+      description: "Delete an existing reminder by id.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Reminder id to delete" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_browser_state",
+      description: "Get the current browser automation state and recent actions.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_browser_task",
+      description:
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Always dispatch the task immediately — the browser agent will automatically pause and ask the user for payment or delivery details if needed during checkout.",
+      parameters: {
+        type: "object",
+        properties: {
+          task: {
+            type: "string",
+            description:
+              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
+          },
+        },
+        required: ["task"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_uploaded_files",
+      description:
+        "List all uploaded files available to the household, including filenames, types, reminder links, and whether text extraction succeeded.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_uploaded_file",
+      description:
+        "Read an uploaded file by id. Returns filename, file metadata, and the extracted plain-text clone when available so a text-only model can use the file contents.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to inspect" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "extract_pdf_text",
+      description:
+        "Force text extraction for an uploaded file by id, especially PDFs, screenshots, photos, and other documents where visible text matters. Use when you need OCR-style contents for a task.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to extract text from" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_memory",
+      description:
+        "Fetch the full content of a stored memory entry by its title. Some entries are plain text and some are structured JSON-backed records, but they are all accessed through this same tool.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "The memory title to retrieve" },
+        },
+        required: ["title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_memory",
+      description:
+        "Store or update a memory entry about the user or household. Use a short descriptive title (e.g. 'user_name', 'health_notes', 'dietary_restrictions', 'communication_preferences'). For normal notes, write plain text in content. For machine-editable memory, provide content_json with a JSON object string and optionally fields_json describing the schema.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Short descriptive key for this memory" },
+          content: { type: "string", description: "Full details to store" },
+          content_json: {
+            type: "string",
+            description:
+              'Optional JSON object string for machine-editable memory, e.g. {"preferred_name":"Pat","allergies":["peanuts"]}',
+          },
+          fields_json: {
+            type: "string",
+            description:
+              'Optional JSON array string describing the schema when content_json is used. Same field format as request_user_input.',
+          },
+        },
+        required: ["title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "end_conversation",
+      description:
+        "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "request_user_input",
+      description:
+        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Form title shown to the user" },
+          description: { type: "string", description: "Explanation of why this information is needed" },
+          memory_key: {
+            type: "string",
+            description:
+              "Stable structured memory key where the response should be stored, e.g. 'medical_profile' or 'shopping_preferences'",
+          },
+          memory_label: {
+            type: "string",
+            description: "Human-friendly label for the saved memory record",
+          },
+          fields_json: {
+            type: "string",
+            description:
+              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select|file","required":true|false}. File fields may also include accept and multiple.',
+          },
+        },
+        required: ["title", "fields_json"],
+      },
+    },
+  },
+] as const;
+*/
 
 type FallbackToolCall = {
   toolCallId: string;
@@ -53,6 +302,11 @@ const PAUSE_SCHEMA = z.object({
   reason: z
     .enum(["background_task", "waiting_for_user_input", "waiting_for_external_output", "other"])
     .describe("Why this turn should pause now."),
+});
+
+const LIST_RECENT_ACTIVITY_SCHEMA = z.object({
+  lookback_minutes: z.number().int().positive().optional().describe("How far back to look, in minutes."),
+  limit: z.number().int().positive().optional().describe("Maximum number of activity items to return."),
 });
 
 const LIST_REMINDERS_SCHEMA = EMPTY_OBJECT_SCHEMA;
@@ -360,10 +614,7 @@ export class AgentHarness {
             .map((file) => `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]`)
             .join("\n");
 
-    const interactionStyle =
-      request.source === "voice"
-        ? "Turn type: voice."
-        : "Turn type: dashboard.";
+    const interactionStyle = request.source === "voice" ? "Turn type: voice." : "Turn type: dashboard.";
 
     const browserState = request.forceBrowser
       ? "Browser request: the user explicitly requested browser automation for this turn."
@@ -511,6 +762,19 @@ export class AgentHarness {
       let result: unknown;
 
       switch (name) {
+        case "list_recent_activity": {
+          const lookbackMinutes =
+            typeof args.lookback_minutes === "number"
+              ? args.lookback_minutes
+              : typeof args.lookbackMinutes === "number"
+                ? args.lookbackMinutes
+                : 240;
+          const limit =
+            typeof args.limit === "number" ? args.limit : typeof args.maxItems === "number" ? args.maxItems : 30;
+          result = buildRecentActivitySnapshot(this.database, { lookbackMinutes, limit });
+          break;
+        }
+
         case "speak": {
           const message = String(args.message ?? "").trim();
           if (message) {
@@ -773,6 +1037,12 @@ export class AgentHarness {
             "Pause this turn after you have already spoken. Use when background work continues elsewhere or when waiting for user-provided information.",
           inputSchema: PAUSE_SCHEMA,
           execute: async (input) => this.executeToolByName("pause_until_output", input, runtime, request.profileId),
+        }),
+        list_recent_activity: tool({
+          description:
+            "Summarize recent household activity, including transcript messages, tool calls, and browser automation history.",
+          inputSchema: LIST_RECENT_ACTIVITY_SCHEMA,
+          execute: async (input) => this.executeToolByName("list_recent_activity", input, runtime, request.profileId),
         }),
         list_reminders: tool({
           description: "Get all scheduled reminders for the household.",

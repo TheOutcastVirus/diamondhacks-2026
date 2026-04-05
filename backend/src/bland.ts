@@ -14,6 +14,13 @@ type BlandCallInput = {
 
 const E164_PHONE_PATTERN = /^\+[1-9]\d{7,14}$/;
 
+function redactPhoneNumber(phoneNumber: string): string {
+  if (phoneNumber.length <= 6) {
+    return `${phoneNumber.slice(0, 2)}***`;
+  }
+  return `${phoneNumber.slice(0, 5)}******${phoneNumber.slice(-2)}`;
+}
+
 function normalizePhoneNumber(phoneNumber: string): string {
   const normalized = phoneNumber.trim().replace(/[\s()-]+/g, "");
   if (!E164_PHONE_PATTERN.test(normalized)) {
@@ -77,6 +84,17 @@ export class BlandService {
       };
     if (pathwayId && input.requestData && Object.keys(input.requestData).length > 0) {
       body.request_data = input.requestData;
+    }
+
+    const requestDataKeys = input.requestData ? Object.keys(input.requestData).sort() : [];
+    const hasRecentActivity = Boolean(input.requestData?.recent_activity?.trim());
+    console.log(
+      `[bland] Placing call → phone=${redactPhoneNumber(phoneNumber)} pathway=${pathwayId ? "yes" : "no"} request_data_keys=[${requestDataKeys.join(
+        ",",
+      )}] recent_activity=${hasRecentActivity ? "yes" : "no"}`,
+    );
+    if (hasRecentActivity) {
+      console.log(`[bland] request_data.recent_activity: ${String(input.requestData?.recent_activity).trim()}`);
     }
 
     const response = await fetch(`${this.config.bland.baseUrl}/v1/calls`, {

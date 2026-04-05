@@ -21,6 +21,11 @@ import { AudioService } from "./audio";
 import { BlandService } from "./bland";
 import { BrowserUseService } from "./browser-use";
 import { detectCrisis } from "./crisis";
+import {
+  buildRecentActivitySnapshot,
+  formatRecentActivityForBland,
+  formatRecentActivityRecap,
+} from "./activity";
 import { GazabotDatabase } from "./db";
 import { UploadedFileService } from "./files";
 import { parseMultipartUpload } from "./multipart";
@@ -498,11 +503,15 @@ function redactPhoneNumber(phoneNumber: string): string {
 
 /** Copy for Bland `request_data` — use in the pathway as variables (e.g. {{emergency_brief}}) so the voice agent sounds human and clear. */
 function emergencyCallRequestData(relationship: string, recentActivity?: string): Record<string, string> {
+  const activitySuffix = recentActivity ? ` Recent activity: ${recentActivity}` : "";
   const requestData: Record<string, string> = {
     emergency_brief:
       "This is an automated wellness alert from a home care assistant. Someone you support may be in distress or need urgent help. Please try to reach them right away, or ask someone nearby to check on them. Thank you for responding as quickly as you can.",
     relationship_to_resident: relationship,
   };
+  if (activitySuffix) {
+    requestData.emergency_brief = `${requestData.emergency_brief}${activitySuffix}`;
+  }
   if (recentActivity) {
     requestData.recent_activity = recentActivity;
   }
@@ -542,6 +551,26 @@ function summarizeRecentActivity(entries: TranscriptEntry[]): string | undefined
     return undefined;
   }
   return snippets.reverse().join(" | ");
+}
+
+function normalizeRecapMessage(message: string): string {
+  return message
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isRecentActivityRecapRequest(message: string): boolean {
+  const normalized = normalizeRecapMessage(message);
+  if (!normalized) return false;
+  return (
+    normalized.includes("what happened recently") ||
+    normalized.includes("what did i miss") ||
+    normalized.includes("catch me up") ||
+    normalized.includes("recap what happened")
+  );
 }
 
 export class GazabotApp {
@@ -1005,6 +1034,29 @@ export class GazabotApp {
       text: payload.message,
     });
     this.transcriptBus.publish("transcript", userEntry);
+
+    if (isRecentActivityRecapRequest(payload.message)) {
+      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 30 });
+      const recap = formatRecentActivityRecap(snapshot, { voice: payload.source === "voice" });
+
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: recap,
+        metadata: { recapWindowMinutes: snapshot.windowMinutes, recapItems: snapshot.items.length },
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+
+      const stream = new ReadableStream<string>({
+        start: (controller) => {
+          controller.enqueue(encodeSseFrame("ready", { source: payload.source }));
+          controller.enqueue(encodeSseFrame("chunk", { delta: recap, done: false }));
+          controller.enqueue(encodeSseFrame("done", { text: recap, done: true }));
+          controller.close();
+        },
+      });
+      return eventStreamResponse(request, this.config, stream);
+    }
 
     const crisisResult = await this.handleCrisisTurn(payload);
     if (crisisResult?.kind === "text") {
@@ -1512,7 +1564,8 @@ export class GazabotApp {
     const normalizedResponse = normalizePromptResponse(prompt, response as Record<string, unknown>);
     const { prompt: completed, memoryEntry } = this.database.respondToPrompt(promptId, normalizedResponse);
 
-    const responseText = `User submitted form "${completed.title}" for ${completed.memoryKey}: ${JSON.stringify(completed.response)}`;
+    const responseKeys = Object.keys(completed.response ?? {});
+    const responseText = `User submitted form "${completed.title}" for ${completed.memoryKey}. Fields: ${responseKeys.join(", ") || "(none)"}`;
     const responseEntry = this.database.createTranscriptEntry({
       kind: "tool",
       role: "resident",
@@ -1522,8 +1575,8 @@ export class GazabotApp {
       metadata: {
         promptId: completed.id,
         memoryKey: completed.memoryKey,
-        response: completed.response,
-        memory: memoryEntry,
+        formTitle: completed.title,
+        submittedFields: responseKeys,
       },
     });
     this.transcriptBus.publish("tool", responseEntry);
@@ -1688,6 +1741,19 @@ export class GazabotApp {
     const userEntry = this.database.createTranscriptEntry(entryInput);
     this.transcriptBus.publish("transcript", userEntry);
 
+    if (isRecentActivityRecapRequest(payload.message)) {
+      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 30 });
+      const recap = formatRecentActivityRecap(snapshot, { voice: payload.source === "voice" });
+      const robotEntry = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: recap,
+        metadata: { recapWindowMinutes: snapshot.windowMinutes, recapItems: snapshot.items.length },
+      });
+      this.transcriptBus.publish("transcript", robotEntry);
+      return { kind: "text", text: recap };
+    }
+
     const crisisResult = await this.handleCrisisTurn(payload);
     if (crisisResult) {
       if (crisisResult.kind === "text") {
@@ -1794,7 +1860,9 @@ export class GazabotApp {
     this.transcriptBus.publish("tool", started);
 
     try {
-      const recentActivity = summarizeRecentActivity(this.database.listTranscriptEntries());
+      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 18 });
+      const recentActivity =
+        formatRecentActivityForBland(snapshot) ?? summarizeRecentActivity(this.database.listTranscriptEntries());
       const blandCall = await this.blandService.placePathwayCall({
         phoneNumber: contact.phoneNumber,
         requestData: emergencyCallRequestData(contact.relationship, recentActivity),
@@ -1811,6 +1879,7 @@ export class GazabotApp {
           relationship: contact.relationship,
           targetPhoneRedacted: redactPhoneNumber(contact.phoneNumber),
           blandCallId: blandCall.callId,
+          recentActivityIncluded: Boolean(recentActivity),
         },
       });
       this.transcriptBus.publish("tool", completed);
@@ -1926,9 +1995,11 @@ export class GazabotApp {
     }
 
     try {
+      const snapshot = buildRecentActivitySnapshot(this.database, { lookbackMinutes: 240, limit: 18 });
+      const recentActivity = formatRecentActivityForBland(snapshot);
       const blandCall = await this.blandService.placePathwayCall({
         phoneNumber,
-        requestData: emergencyCallRequestData(relationship),
+        requestData: emergencyCallRequestData(relationship, recentActivity),
       });
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
@@ -1943,6 +2014,7 @@ export class GazabotApp {
           targetPhoneRedacted: redactPhoneNumber(phoneNumber),
           blandCallId: blandCall.callId,
           normalizedMessage: detection.normalizedMessage,
+          recentActivityIncluded: Boolean(recentActivity),
         },
       });
       this.transcriptBus.publish("tool", completed);
