@@ -422,7 +422,7 @@ export class AudioService {
     const { cmd, args } = await resolveRecordingCommandWithSilence(outPath, silenceDb, silenceDuration);
 
     return new Promise<Buffer>((resolve, reject) => {
-      const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
+      const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"] });
       this.proc          = child;
       this.recordingPath = outPath;
 
@@ -439,9 +439,25 @@ export class AudioService {
         this.proc          = null;
         this.recordingPath = null;
 
-        child.kill("SIGTERM");
+        // Ask ffmpeg to stop gracefully by writing 'q' to stdin so it can flush
+        // the WAV container before exiting.  On Windows, kill("SIGTERM") is a
+        // hard TerminateProcess and skips the flush, producing a corrupt file.
+        let forcedKillTimer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          child.stdin?.write("q\n");
+          child.stdin?.end();
+          forcedKillTimer = setTimeout(() => {
+            try { child.kill(); } catch { /* ignore */ }
+          }, 2000);
+        } catch {
+          try { child.kill(); } catch { /* ignore */ }
+        }
 
+        let settled = false;
         const afterClose = async () => {
+          if (settled) return;
+          settled = true;
+          if (forcedKillTimer) { clearTimeout(forcedKillTimer); forcedKillTimer = null; }
           try {
             const buf = await readFile(outPath);
             unlink(outPath).catch(() => {});

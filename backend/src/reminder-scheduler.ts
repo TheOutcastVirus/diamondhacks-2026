@@ -12,11 +12,10 @@ type ReminderCallback = (payload: ReminderFirePayload) => Promise<void>;
 
 export function buildReminderPrompt(reminder: Pick<Reminder, "title" | "instructions">, dueAt: string): string {
   return [
-    `A scheduled reminder is due now.`,
+    `A scheduled reminder is firing now.`,
     `Title: ${reminder.title}`,
-    `Scheduled for: ${dueAt}`,
     `Instructions: ${reminder.instructions}`,
-    `Deliver the reminder to the resident now. Respond naturally and use speech if appropriate.`,
+    `Deliver this reminder to the resident in 1-3 warm, natural sentences. Do not call any reminder management tools.`,
   ].join("\n");
 }
 

@@ -464,6 +464,37 @@ export class GazabotApp {
 
   private readonly audioService = new AudioService();
 
+  // ── Conversation state ─────────────────────────────────────────────────────
+  private conversationState: "idle" | "conversation" = "idle";
+  private conversationTimer: ReturnType<typeof setTimeout> | null = null;
+  private isSpeaking = false;
+
+  private enterConversationMode(): void {
+    this.conversationState = "conversation";
+    this.resetConversationTimer();
+    this.transcriptBus.publishState("conversation");
+    console.log("[conversation] Entered conversation mode.");
+  }
+
+  private exitConversationMode(): void {
+    if (this.conversationState === "idle") return;
+    this.conversationState = "idle";
+    if (this.conversationTimer) {
+      clearTimeout(this.conversationTimer);
+      this.conversationTimer = null;
+    }
+    this.transcriptBus.publishState("idle");
+    console.log("[conversation] Returned to idle (inactivity timeout).");
+  }
+
+  private resetConversationTimer(): void {
+    if (this.conversationTimer) clearTimeout(this.conversationTimer);
+    this.conversationTimer = setTimeout(
+      () => this.exitConversationMode(),
+      this.config.agent.conversationTimeoutSeconds * 1000,
+    );
+  }
+
   constructor(
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
@@ -797,7 +828,9 @@ export class GazabotApp {
     return eventStreamResponse(request, this.config, stream);
   }
 
-  private async processVoiceAudio(audio: File | Blob | Buffer): Promise<{ transcript: string; replyText: string }> {
+  private async processVoiceAudio(
+    audio: File | Blob | Buffer,
+  ): Promise<{ transcript: string; replyText: string; endConversation: boolean }> {
     const transcript = await this.sttService.transcribe(audio);
     if (!transcript.trim()) {
       throw Object.assign(new Error("No speech detected."), { noSpeech: true });
@@ -816,6 +849,8 @@ export class GazabotApp {
     });
 
     let replyText: string;
+    const endConversation = result.kind === "end_conversation";
+
     if (result.kind === "browser_task") {
       replyText = "I'm on it - I'll handle that for you now.";
     } else {
@@ -828,7 +863,7 @@ export class GazabotApp {
       this.transcriptBus.publish("transcript", robotEntry);
     }
 
-    return { transcript, replyText };
+    return { transcript, replyText, endConversation };
   }
 
   // ── Wake word ──────────────────────────────────────────────────────────────
@@ -881,43 +916,77 @@ export class GazabotApp {
   }
 
   private async handleWakeWord(): Promise<void> {
-    if (this.audioService.isRecording) {
-      console.log("[wake-word] Already recording — ignoring trigger.");
+    if (this.isSpeaking) {
+      console.log("[wake-word] Bot is speaking — ignoring trigger.");
       return;
     }
 
-    console.log("[wake-word] Wake word detected — recording command…");
+    if (this.conversationState === "conversation" && this.audioService.isRecording) {
+      // Already in a conversation turn, ignore duplicate triggers
+      return;
+    }
+
+    console.log("[wake-word] Wake word detected — entering conversation mode.");
+    this.enterConversationMode();
+    await this.runConversationTurn();
+  }
+
+  private async runConversationTurn(): Promise<void> {
+    if (this.conversationState !== "conversation" || this.audioService.isRecording || this.isSpeaking) {
+      return;
+    }
 
     let audioBuffer: Buffer;
     try {
-      // Stop after 2 s of silence (-20 dB floor), hard cap at 10 s.
-      // Raise silenceDb toward -15 if it still runs long in noisy environments.
       audioBuffer = await this.audioService.recordUntilSilence({
         silenceDb: -20,
         silenceDuration: 1,
         maxDuration: 10,
       });
     } catch (err) {
-      console.error("[wake-word] Recording failed:", err);
+      console.error("[conversation] Recording failed:", err);
       return;
     }
 
-    let result: { transcript: string; replyText: string };
+    let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       result = await this.processVoiceAudio(audioBuffer);
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException & { noSpeech?: boolean }).noSpeech) {
-        console.log("[wake-word] No speech detected after wake word.");
+        // No speech — let the inactivity timer decide when to exit
+        console.log("[conversation] No speech detected, waiting for activity…");
         return;
       }
-      console.error("[wake-word] Processing failed:", err);
+      console.error("[conversation] Processing failed:", err);
       return;
     }
 
-    console.log(`[wake-word] Command: "${result.transcript}"`);
+    console.log(`[conversation] User: "${result.transcript}"`);
 
-    const audioOut = await this.ttsService.synthesize(result.replyText);
-    await this.audioService.playAudio(audioOut);
+    // User spoke — reset the inactivity timer
+    this.resetConversationTimer();
+
+    this.isSpeaking = true;
+    try {
+      const audioOut = await this.ttsService.synthesize(result.replyText);
+      await this.audioService.playAudio(audioOut);
+    } catch (err) {
+      console.error("[conversation] TTS/playback failed:", err);
+    } finally {
+      this.isSpeaking = false;
+    }
+
+    // Agent explicitly ended the conversation — exit immediately, no further listening
+    if (result.endConversation) {
+      console.log("[conversation] Agent ended conversation.");
+      this.exitConversationMode();
+      return;
+    }
+
+    // Loop: immediately listen for the next utterance
+    if (this.conversationState === "conversation") {
+      void this.runConversationTurn();
+    }
   }
 
   // ── HTTP voice routes ───────────────────────────────────────────────────────
@@ -935,7 +1004,7 @@ export class GazabotApp {
       return errorResponse(request, this.config, 422, "Missing audio field.");
     }
 
-    let result: { transcript: string; replyText: string };
+    let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       result = await this.processVoiceAudio(audioField);
     } catch (err) {
@@ -959,7 +1028,7 @@ export class GazabotApp {
     const audioBuffer = await this.audioService.stopRecording();
     console.log(`[voice] Recorded buffer size: ${audioBuffer.length} bytes`);
 
-    let result: { transcript: string; replyText: string };
+    let result: { transcript: string; replyText: string; endConversation: boolean };
     try {
       result = await this.processVoiceAudio(audioBuffer);
     } catch (err) {

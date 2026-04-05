@@ -36,7 +36,8 @@ type ChatCompletionResponse = {
 
 export type AgentTurnResult =
   | { kind: "text"; text: string }
-  | { kind: "browser_task"; browserSessionId: string; previewUrl: string | null };
+  | { kind: "browser_task"; browserSessionId: string; previewUrl: string | null }
+  | { kind: "end_conversation"; text: string };
 
 const TOOL_DEFINITIONS = [
   {
@@ -184,21 +185,6 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "speak",
-      description:
-        "Speak a response aloud via text-to-speech. Use this to give voice feedback, confirmations, or spoken answers to the user.",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string", description: "Text to speak aloud" },
-        },
-        required: ["text"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "read_memory",
       description:
         "Fetch the full content of a stored memory entry by its title. Some entries are plain text and some are structured JSON-backed records, but they are all accessed through this same tool.",
@@ -240,6 +226,15 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "end_conversation",
+      description:
+        "End the current voice conversation and return to idle listening mode. Call this when the user clearly wants to stop (e.g. says 'no', 'stop', 'goodbye', 'that's all', 'I'm done', or declines an offer to continue). Do not call this speculatively — only when the user has clearly signalled they are finished.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "request_user_input",
       description:
         'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
@@ -268,6 +263,57 @@ const TOOL_DEFINITIONS = [
     },
   },
 ] as const;
+
+// Maximum number of tool-call groups (assistant + results) to keep in the active
+// context window. Older groups are dropped before each API call to prevent context rot.
+const MAX_TOOL_GROUPS_IN_CONTEXT = 10;
+
+/**
+ * Prune the messages array sent to the model on each iteration.
+ *
+ * Strategy:
+ *  - Everything up to and including the current user message is kept (system
+ *    prompt + conversation history + the user's current request).
+ *  - After that point we have the agentic tool-call chain for this turn
+ *    (repeated assistant→tool_results pairs). We keep only the most recent
+ *    MAX_TOOL_GROUPS_IN_CONTEXT groups so the context doesn't bloat.
+ */
+function pruneMessages(messages: ChatMessage[]): ChatMessage[] {
+  // Locate the last plain user message (not a tool result) — this is the pivot
+  let pivotIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && !messages[i].tool_call_id) {
+      pivotIdx = i;
+      break;
+    }
+  }
+  if (pivotIdx === -1) return messages;
+
+  const prefix = messages.slice(0, pivotIdx + 1);
+  const toolChain = messages.slice(pivotIdx + 1);
+
+  // Group the tool chain into (assistant + its tool results) pairs
+  const groups: ChatMessage[][] = [];
+  let i = 0;
+  while (i < toolChain.length) {
+    const msg = toolChain[i];
+    if (msg.role === "assistant" && msg.tool_calls?.length) {
+      const group: ChatMessage[] = [msg];
+      i++;
+      while (i < toolChain.length && toolChain[i].role === "tool") {
+        group.push(toolChain[i]);
+        i++;
+      }
+      groups.push(group);
+    } else {
+      groups.push([msg]);
+      i++;
+    }
+  }
+
+  const kept = groups.slice(-MAX_TOOL_GROUPS_IN_CONTEXT);
+  return [...prefix, ...kept.flat()];
+}
 
 // Some model deployments output tool calls as plain JSON text instead of using the
 // tool_calls field. This parser detects and normalizes that pattern.
@@ -380,12 +426,12 @@ export class AgentHarness {
 
     const voiceNote =
       request.source === "voice"
-        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically, so do NOT call the speak tool. Keep your response to 1-3 sentences."
-        : "\n\nUse the speak tool ONCE if you want to vocalize a reply.";
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically. Keep your response to 1-3 sentences."
+        : "";
 
     const systemPrompt = `You are Gazabot, a senior care assistant specializing in reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
 
-Current date and time: ${new Date().toISOString()}
+Current date and time: ${new Date().toLocaleString("en-US", { timeZone: DEFAULT_REMINDER_TIMEZONE, dateStyle: "full", timeStyle: "long" })}
 
 Stored memory topics (call read_memory to get full details):
 ${memoryIndex}
@@ -417,7 +463,7 @@ TOOL USE RULES - follow exactly:
 - When you need specific user data (such as credit card information), prefer request_user_input over asking for free-form prose.
 - When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
 - The run_browser_task tool hands off the task to another agent, who does not have access to the information you do. It is your job to supply the browser agent with all the information needed to complete the task (For example, when buying something, ensure to either collect credit card information and address information - request_user_input - or retrieve it from memory - read_memory - when available)
-- Whenever you call request_user_input, ensure to use the speak tool to notify the user that they have information to fill out through the web UI Requested Info panel.`;
+- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", declining a follow-up offer). After calling it, say a brief farewell in your next reply.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -450,6 +496,7 @@ TOOL USE RULES - follow exactly:
       text: `Calling tool: ${name}`,
       toolName: name,
       toolStatus: "started",
+      metadata: { params: args },
     });
     this.transcriptBus.publish("tool", startEntry);
 
@@ -585,13 +632,6 @@ TOOL USE RULES - follow exactly:
           break;
         }
 
-        case "speak": {
-          const text = String(args.text ?? "");
-          await this.invokeTts(text);
-          result = { spoken: true };
-          break;
-        }
-
         case "read_memory": {
           result = this.database.readMemory(String(args.title ?? "")) ?? { error: "Memory entry not found" };
           break;
@@ -635,6 +675,11 @@ TOOL USE RULES - follow exactly:
             ...(fields !== undefined && { schema: fields }),
             ...(data !== undefined && { data }),
           });
+          break;
+        }
+
+        case "end_conversation": {
+          result = { ended: true };
           break;
         }
 
@@ -702,24 +747,6 @@ TOOL USE RULES - follow exactly:
     }
   }
 
-  private async invokeTts(text: string): Promise<void> {
-    // Publish TTS event so the frontend can play the audio
-    this.transcriptBus.publishTts(text);
-
-    const endpoint = this.config.tts.endpoint;
-    if (!endpoint) return;
-
-    try {
-      await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-    } catch {
-      // TTS is non-critical; ignore failures
-    }
-  }
-
   async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
     if (request.forceBrowser) {
       const { browserTask } = await this.executeTool(
@@ -747,7 +774,7 @@ TOOL USE RULES - follow exactly:
     let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
     for (let iteration = 0; iteration < 10; iteration++) {
-      const response = await this.callImagine(messages);
+      const response = await this.callImagine(pruneMessages(messages));
       const choice = response.choices[0];
       if (!choice) break;
 
@@ -764,10 +791,12 @@ TOOL USE RULES - follow exactly:
         messages.push({ ...choice.message, tool_calls: toolCalls });
 
         let promptSent = false;
+        let endConversation = false;
         for (const toolCall of toolCalls) {
           const { result, browserTask: bt } = await this.executeTool(toolCall, request.profileId);
           if (bt) browserTask = bt;
           if (toolCall.function.name === "request_user_input") promptSent = true;
+          if (toolCall.function.name === "end_conversation") endConversation = true;
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -777,6 +806,12 @@ TOOL USE RULES - follow exactly:
         // Stop looping once a user input form has been sent — further iterations would duplicate it
         if (promptSent) {
           return { kind: "text", text: "I've sent you a form to fill out. Please complete it and I'll continue." };
+        }
+        // Let the model produce a farewell text before we signal end_conversation
+        if (endConversation) {
+          const farewell = await this.callImagine(pruneMessages(messages));
+          const farewellText = (farewell.choices[0]?.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
+          return { kind: "end_conversation", text: farewellText };
         }
         continue;
       }
