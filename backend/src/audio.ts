@@ -667,25 +667,31 @@ export class AudioService {
           process.stderr.write(`[ffmpeg:silence:win] ${text}`);
         }
 
+        const lines = stderrTail.split("\n");
+        stderrTail = lines[lines.length - 1] ?? "";
+
+        for (const rawLine of lines.slice(0, -1)) {
+          const line = rawLine.trim();
+          if (!line) {
+            continue;
+          }
+
+          // silence_end means audio rose above threshold, so speech has started.
+          if (line.includes("silence_end")) {
+            hasDetectedSpeech = true;
+          }
+
+          // Stop only when a new silence_start arrives after speech onset.
+          if (hasDetectedSpeech && line.includes("silence_start")) {
+            stop();
+            break;
+          }
+        }
+
         // Set the max-duration timer on first stderr output (ffmpeg is running)
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
-
-        // silence_end means audio went above the threshold — user has started speaking
-        if (stderrTail.includes("silence_end")) {
-          hasDetectedSpeech = true;
-        }
-
-        // Only stop on silence_start after speech was detected; otherwise the
-        // recording would end immediately if the environment starts quiet.
-        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
-          stop();
-        }
-
-        // Trim the buffer so it doesn't grow indefinitely
-        const nl = stderrTail.lastIndexOf("\n");
-        if (nl !== -1) stderrTail = stderrTail.slice(nl + 1);
       });
 
       // Fallback: treat ffmpeg as started after 600 ms even with no stderr
@@ -805,19 +811,22 @@ export class AudioService {
           maxTimer = setTimeout(stop, maxDuration * 1000);
         }
 
-        // silence_end means audio went above the threshold — user has started speaking
-        if (stderrTail.includes("silence_end")) {
-          hasDetectedSpeech = true;
-        }
+        const lines = stderrTail.split("\n");
+        stderrTail = lines[lines.length - 1] ?? "";
 
-        // Only stop on silence_start after speech was detected; otherwise the
-        // recording would end immediately if the environment starts quiet.
-        if (hasDetectedSpeech && stderrTail.includes("silence_start")) {
-          stop();
+        for (const rawLine of lines.slice(0, -1)) {
+          const line = rawLine.trim();
+          if (!line) {
+            continue;
+          }
+          if (line.includes("silence_end")) {
+            hasDetectedSpeech = true;
+          }
+          if (hasDetectedSpeech && line.includes("silence_start")) {
+            stop();
+            break;
+          }
         }
-
-        const nl = stderrTail.lastIndexOf("\n");
-        if (nl !== -1) stderrTail = stderrTail.slice(nl + 1);
       });
 
       // Start the max-duration timer even if stderr is slow

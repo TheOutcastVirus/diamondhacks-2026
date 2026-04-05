@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import { createEventStream, get, post } from '../api';
-  import type {
-    AgentModel,
-    ConversationState,
-    ToolStatus,
-    TranscriptEntry,
-    TranscriptKind,
-    TranscriptRole,
+  import {
+    ApiError,
+    type AgentModel,
+    type ConversationState,
+    type ToolStatus,
+    type TranscriptEntry,
+    type TranscriptKind,
+    type TranscriptRole,
   } from '../types';
   import VoiceInput from '../components/VoiceInput.svelte';
 
@@ -26,6 +27,8 @@
   let newConversationBusy = false;
   let agentModel: AgentModel = 'imagine';
   let agentModelHydrated = false;
+  let emergencyCallBusy = false;
+  let emergencyCallFlash = '';
 
   const agentModelStorageKey = 'gazabot-agent-model';
   const agentModelOptions: Array<{ value: AgentModel; label: string; detail: string }> = [
@@ -43,6 +46,33 @@
       // non-critical — the SSE event will still arrive if the server handled it
     } finally {
       newConversationBusy = false;
+    }
+  }
+
+  async function requestEmergencyFamilyCall() {
+    const ok = window.confirm(
+      'Place an emergency call to your saved primary family contact now?\n\n' +
+        'Bland AI will call them and explain there may be an urgent wellness situation and they should try to reach the person they care for or get someone nearby to check in.\n\n' +
+        'Cancel if this was accidental.',
+    );
+    if (!ok) return;
+
+    emergencyCallBusy = true;
+    emergencyCallFlash = '';
+    try {
+      await post<{ ok: boolean; callId?: string }>('/api/emergency-family-call', {});
+      emergencyCallFlash = 'Emergency call queued. Watch the feed for tool status.';
+    } catch (error) {
+      if (error instanceof ApiError) {
+        emergencyCallFlash =
+          error.status === 400
+            ? 'Save a primary family contact first, then try emergency call again.'
+            : error.message;
+      } else {
+        emergencyCallFlash = 'Could not reach the server to place the call.';
+      }
+    } finally {
+      emergencyCallBusy = false;
     }
   }
 
@@ -306,12 +336,24 @@
       </div>
 
       <div class="toolbar-right">
+        {#if emergencyCallFlash}
+          <p class="emergency-call-flash" role="status" aria-live="polite">{emergencyCallFlash}</p>
+        {/if}
         {#if conversationState === 'conversation'}
           <div class="convo-badge" role="status" aria-live="polite">
             <span class="convo-dot" aria-hidden="true"></span>
             Listening…
           </div>
         {/if}
+        <button
+          class="emergency-family-btn"
+          type="button"
+          disabled={emergencyCallBusy}
+          on:click={requestEmergencyFamilyCall}
+          title="Calls the saved primary family contact via Bland AI with an urgent wellness message"
+        >
+          {emergencyCallBusy ? 'Calling…' : 'Emergency family call'}
+        </button>
         <button
           class="new-convo-btn"
           type="button"
@@ -634,6 +676,53 @@
   button.new-convo-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+
+  p.emergency-call-flash {
+    margin: 0;
+    max-width: 14rem;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    color: var(--color-ink-soft);
+  }
+
+  button.emergency-family-btn {
+    padding: 0.25rem 0.75rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, #c2410c 35%, var(--color-line-strong));
+    background: color-mix(in srgb, #c2410c 12%, transparent);
+    color: color-mix(in srgb, #9a3412 70%, var(--color-ink-strong));
+    font-size: 0.8125rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.12s ease-out;
+  }
+
+  button.emergency-family-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, #c2410c 22%, transparent);
+    border-color: color-mix(in srgb, #c2410c 55%, var(--color-line-strong));
+    color: var(--color-ink-strong);
+  }
+
+  button.emergency-family-btn:focus-visible {
+    outline: 2px solid color-mix(in srgb, #c2410c 65%, transparent);
+    outline-offset: 2px;
+  }
+
+  button.emergency-family-btn:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+
+  button.emergency-family-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    button.emergency-family-btn:active:not(:disabled) {
+      transform: none;
+    }
   }
 
   div.convo-badge {

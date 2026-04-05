@@ -477,15 +477,28 @@
             {/if}
 
             {#if prompt.memoryKey === 'family_contact_primary'}
-              <section class="contact-callout">
-                <p class="panel-label">Crisis Call Setup</p>
-                <p class="panel-copy">
-                  Enter the family contact phone number in E.164 format, like <code>+14155551234</code>. This is the number the backend passes to Bland for emergency family calls.
-                </p>
+              <section class="contact-callout" aria-labelledby={`contact-callout-title-${prompt.id}`}>
+                <div class="contact-callout-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z" />
+                  </svg>
+                </div>
+                <div class="contact-callout-body">
+                  <p id={`contact-callout-title-${prompt.id}`} class="contact-callout-title">Emergency contact calling</p>
+                  <p class="contact-callout-text">
+                    Use a number in <strong>E.164</strong> format (country code + number), for example
+                    <code class="contact-callout-code">+14155551234</code>. This is the only number used when
+                    Gazabot places an urgent wellness call through Bland AI.
+                  </p>
+                </div>
               </section>
             {/if}
 
-            <form class="dynamic-form" on:submit|preventDefault={() => submitPrompt(prompt)}>
+            <form
+              class="dynamic-form"
+              class:dynamic-form-contact={prompt.memoryKey === 'family_contact_primary'}
+              on:submit|preventDefault={() => submitPrompt(prompt)}
+            >
               {#each prompt.fields as field}
                 <label class={`field ${field.type === 'text' || field.type === 'file' ? 'field-span' : ''}`}>
                   <span class="field-label">
@@ -887,6 +900,12 @@
     gap: 1rem;
   }
 
+  /* Single column for emergency contact: clearer flow than cramped two-up rows */
+  form.dynamic-form-contact {
+    grid-template-columns: 1fr;
+    max-width: 32rem;
+  }
+
   label.field {
     display: flex;
     flex-direction: column;
@@ -1074,15 +1093,72 @@
   }
 
   section.contact-callout {
-    border: 1px solid rgba(196, 123, 74, 0.28);
-    background: linear-gradient(180deg, rgba(255, 246, 238, 0.95), rgba(255, 240, 225, 0.92));
-    border-radius: 1rem;
-    padding: 0.95rem 1rem;
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+    border: 1px solid color-mix(in srgb, var(--color-accent) 32%, var(--color-line));
+    background: color-mix(in srgb, var(--color-accent) 9%, var(--color-panel));
+    border-radius: 0.875rem;
+    padding: 1rem 1.15rem;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-ink-strong) 10%, transparent);
   }
 
-  section.contact-callout code {
+  div.contact-callout-icon {
+    flex-shrink: 0;
+    width: 2.5rem;
+    height: 2.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.65rem;
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-accent) 28%, transparent);
+  }
+
+  div.contact-callout-icon svg {
+    width: 1.25rem;
+    height: 1.25rem;
+  }
+
+  div.contact-callout-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+
+  p.contact-callout-title {
+    margin: 0;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-ink-strong);
+  }
+
+  p.contact-callout-text {
+    margin: 0;
+    font-size: 0.94rem;
+    line-height: 1.55;
+    color: var(--color-ink);
+  }
+
+  p.contact-callout-text strong {
+    color: var(--color-ink-strong);
+    font-weight: 600;
+  }
+
+  code.contact-callout-code {
     font-family: var(--font-mono);
-    font-size: 0.88rem;
+    font-size: 0.86em;
+    font-weight: 500;
+    padding: 0.12em 0.45em;
+    border-radius: 0.35rem;
+    color: var(--color-ink-strong);
+    background: var(--color-input);
+    border: 1px solid var(--color-line);
+    white-space: nowrap;
   }
 
   article.history-card {

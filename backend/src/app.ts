@@ -10,6 +10,7 @@ import type {
   ReminderCreateInput,
   ReminderUpdateInput,
   TranscriptRole,
+  TranscriptEntry,
   UploadedFile,
   UploadedFileReference,
 } from "./contracts";
@@ -495,6 +496,54 @@ function redactPhoneNumber(phoneNumber: string): string {
   return `${phoneNumber.slice(0, 5)}******${phoneNumber.slice(-2)}`;
 }
 
+/** Copy for Bland `request_data` — use in the pathway as variables (e.g. {{emergency_brief}}) so the voice agent sounds human and clear. */
+function emergencyCallRequestData(relationship: string, recentActivity?: string): Record<string, string> {
+  const requestData: Record<string, string> = {
+    emergency_brief:
+      "This is an automated wellness alert from a home care assistant. Someone you support may be in distress or need urgent help. Please try to reach them right away, or ask someone nearby to check on them. Thank you for responding as quickly as you can.",
+    relationship_to_resident: relationship,
+  };
+  if (recentActivity) {
+    requestData.recent_activity = recentActivity;
+  }
+  return requestData;
+}
+
+function formatTranscriptSnippet(entry: { role: TranscriptRole; text: string }): string {
+  const speaker = entry.role === "robot" ? "Assistant" : entry.role === "guardian" ? "Guardian" : "Resident";
+  return `${speaker}: ${entry.text}`;
+}
+
+function summarizeRecentActivity(entries: TranscriptEntry[]): string | undefined {
+  const now = Date.now();
+  const maxAgeMs = 30 * 60 * 1000;
+  const snippets: string[] = [];
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (!entry || entry.kind !== "message") {
+      continue;
+    }
+    if (entry.role !== "resident" && entry.role !== "robot" && entry.role !== "guardian") {
+      continue;
+    }
+    const ts = Date.parse(entry.timestamp);
+    if (Number.isNaN(ts) || now - ts > maxAgeMs) {
+      continue;
+    }
+    if (entry.text.trim().length === 0) {
+      continue;
+    }
+    snippets.push(formatTranscriptSnippet({ role: entry.role, text: entry.text.trim() }));
+    if (snippets.length >= 4) {
+      break;
+    }
+  }
+  if (snippets.length === 0) {
+    return undefined;
+  }
+  return snippets.reverse().join(" | ");
+}
+
 export class GazabotApp {
   private readonly transcriptBus = new TranscriptEventBus();
 
@@ -722,6 +771,10 @@ export class GazabotApp {
       if (request.method === "POST" && url.pathname === "/api/conversation/new") {
         await this.archiveAndResetConversation();
         return jsonResponse(request, this.config, { ok: true });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/emergency-family-call") {
+        return this.handleEmergencyFamilyCallRequest(request);
       }
 
       if (request.method === "GET" && url.pathname === "/api/transcript/stream") {
@@ -1602,6 +1655,133 @@ export class GazabotApp {
     return result;
   }
 
+  private readPrimaryFamilyContact(): { fullName: string; relationship: string; phoneNumber: string } | null {
+    const contactMemory = this.database.readMemory(FAMILY_CONTACT_MEMORY_KEY);
+    const contactData = contactMemory?.data;
+    const fullName = typeof contactData?.full_name === "string" ? contactData.full_name.trim() : "";
+    const relationship = typeof contactData?.relationship === "string" ? contactData.relationship.trim() : "";
+    const phoneNumber = typeof contactData?.phone_number === "string" ? contactData.phone_number.trim() : "";
+    if (!fullName || !relationship || !phoneNumber) {
+      return null;
+    }
+    return { fullName, relationship, phoneNumber };
+  }
+
+  private findRecentManualEmergencyCall(): boolean {
+    const thresholdMs = this.config.crisis.callCooldownSeconds * 1000;
+    const now = Date.now();
+    const entries = this.database.listTranscriptEntries();
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry) {
+        continue;
+      }
+      if (entry.kind !== "tool" || entry.toolName !== "crisis-escalation" || entry.toolStatus !== "completed") {
+        continue;
+      }
+      if (entry.metadata?.manualTrigger !== true) {
+        continue;
+      }
+      const timestampMs = Date.parse(entry.timestamp);
+      if (Number.isNaN(timestampMs) || now - timestampMs > thresholdMs) {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private async handleEmergencyFamilyCallRequest(request: Request): Promise<Response> {
+    if (this.findRecentManualEmergencyCall()) {
+      return errorResponse(
+        request,
+        this.config,
+        429,
+        "An emergency call was placed recently. Wait before trying again, or use your phone if the situation is critical.",
+      );
+    }
+
+    const contact = this.readPrimaryFamilyContact();
+    if (!contact) {
+      this.ensureFamilyContactPrompt();
+      return errorResponse(
+        request,
+        this.config,
+        400,
+        "Save a primary family contact (Request info) before placing an emergency call.",
+      );
+    }
+
+    if (!this.blandService.isConfigured()) {
+      return errorResponse(
+        request,
+        this.config,
+        503,
+        "Emergency calling is not configured. Add BLAND_API_KEY on the server.",
+      );
+    }
+
+    const started = this.database.createTranscriptEntry({
+      kind: "tool",
+      role: "system",
+      text: "Calling tool: crisis-escalation (guardian-initiated)",
+      toolName: "crisis-escalation",
+      toolStatus: "started",
+      metadata: { manualTrigger: true },
+    });
+    this.transcriptBus.publish("tool", started);
+
+    try {
+      const recentActivity = summarizeRecentActivity(this.database.listTranscriptEntries());
+      const blandCall = await this.blandService.placePathwayCall({
+        phoneNumber: contact.phoneNumber,
+        requestData: emergencyCallRequestData(contact.relationship, recentActivity),
+      });
+      const completed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Tool crisis-escalation completed (guardian-initiated)",
+        toolName: "crisis-escalation",
+        toolStatus: "completed",
+        metadata: {
+          manualTrigger: true,
+          targetName: contact.fullName,
+          relationship: contact.relationship,
+          targetPhoneRedacted: redactPhoneNumber(contact.phoneNumber),
+          blandCallId: blandCall.callId,
+        },
+      });
+      this.transcriptBus.publish("tool", completed);
+
+      const guardianNote = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "guardian",
+        text: "Guardian placed an emergency call to the primary family contact (Bland AI).",
+        metadata: { source: "emergency-family-call-button" },
+      });
+      this.transcriptBus.publish("transcript", guardianNote);
+
+      return jsonResponse(request, this.config, { ok: true, callId: blandCall.callId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: `Tool crisis-escalation failed: ${message}`,
+        toolName: "crisis-escalation",
+        toolStatus: "failed",
+        metadata: {
+          manualTrigger: true,
+          targetName: contact.fullName,
+          targetPhoneRedacted: redactPhoneNumber(contact.phoneNumber),
+          failureReason: message,
+        },
+      });
+      this.transcriptBus.publish("tool", failed);
+      return errorResponse(request, this.config, 502, `Could not place the call: ${message}`);
+    }
+  }
+
   private async handleCrisisTurn(payload: AgentTurnRequest): Promise<AgentTurnResult | null> {
     if (!this.config.crisis.enabled) {
       return null;
@@ -1623,11 +1803,10 @@ export class GazabotApp {
       };
     }
 
-    const contactMemory = this.database.readMemory(FAMILY_CONTACT_MEMORY_KEY);
-    const contactData = contactMemory?.data;
-    const fullName = typeof contactData?.full_name === "string" ? contactData.full_name.trim() : "";
-    const relationship = typeof contactData?.relationship === "string" ? contactData.relationship.trim() : "";
-    const phoneNumber = typeof contactData?.phone_number === "string" ? contactData.phone_number.trim() : "";
+    const contact = this.readPrimaryFamilyContact();
+    const fullName = contact?.fullName ?? "";
+    const relationship = contact?.relationship ?? "";
+    const phoneNumber = contact?.phoneNumber ?? "";
 
     const started = this.database.createTranscriptEntry({
       kind: "tool",
@@ -1678,13 +1857,17 @@ export class GazabotApp {
       });
       this.transcriptBus.publish("tool", failed);
       return {
+        
         kind: "text",
         text: "I'm trying to contact your family, but the calling system is not set up yet.",
       };
     }
 
     try {
-      const blandCall = await this.blandService.placePathwayCall({ phoneNumber });
+      const blandCall = await this.blandService.placePathwayCall({
+        phoneNumber,
+        requestData: emergencyCallRequestData(relationship),
+      });
       const completed = this.database.createTranscriptEntry({
         kind: "tool",
         role: "system",
@@ -1761,6 +1944,9 @@ export class GazabotApp {
         continue;
       }
       const metadata = entry.metadata ?? {};
+      if (metadata.manualTrigger === true) {
+        continue;
+      }
       if (metadata.normalizedMessage !== normalizedMessage) {
         continue;
       }
