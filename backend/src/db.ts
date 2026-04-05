@@ -257,6 +257,22 @@ function parseUploadedFileReferences(value: string | null | undefined): Uploaded
   }
 }
 
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    ...(row.reminder_id ? { reminderId: row.reminder_id } : {}),
+    ...(row.prompt_id ? { promptId: row.prompt_id } : {}),
+    ...(row.prompt_field_name ? { promptFieldName: row.prompt_field_name } : {}),
+    ...(row.extracted_text ? { extractedText: row.extracted_text } : {}),
+  };
+}
+
 function serializeReminder(row: ReminderRow): Reminder {
   return {
     id: row.id,

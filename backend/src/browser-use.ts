@@ -3,6 +3,14 @@ import type { BrowserStatus } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
 import { GazabotDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
+import {
+  buildCvsTask,
+  buildFoodOrderTask,
+  detectFoodPlatform,
+  isCvsTask,
+  type OrderCard,
+  type OrderItem,
+} from "./order-tasks";
 
 type BrowserUseSessionResponse = {
   id: string;
@@ -127,13 +135,55 @@ function parseOrderIntent(task: string):
   return undefined;
 }
 
-function buildMerchantOrderTemplate(merchant: string, itemName: string): string {
+function buildGenericOrderTemplate(merchant: string, itemName: string): string {
   return [
-    `Go to ${merchant} and order @{{${itemName}}} for the household.`,
+    `Go to ${merchant} and order ${itemName} for the household.`,
     "Reuse the saved browser profile if available.",
     "Add only the requested item to the cart.",
     "If checkout needs confirmation, payment, substitutions, delivery timing, or any missing info, stop and clearly report what is needed.",
   ].join(" ");
+}
+
+function parseCardFromMemory(raw: unknown): OrderCard | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const card = typeof obj.card_number === "string" ? obj.card_number : typeof obj.card === "string" ? obj.card : undefined;
+  const exp_month = obj.exp_month ?? obj.expiry_month;
+  const exp_year = obj.exp_year ?? obj.expiry_year;
+  if (!card || !exp_month || !exp_year) return undefined;
+  const cvv = typeof obj.cvv === "string" ? obj.cvv : typeof obj.security_code === "string" ? obj.security_code : undefined;
+  const name = typeof obj.cardholder_name === "string" ? obj.cardholder_name : undefined;
+  const billing_zip = typeof obj.billing_zip === "string" ? obj.billing_zip : typeof obj.postal_code === "string" ? obj.postal_code : undefined;
+  return {
+    card,
+    exp_month: String(exp_month),
+    exp_year: String(exp_year),
+    ...(cvv !== undefined ? { cvv } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(billing_zip !== undefined ? { billing_zip } : {}),
+  };
+}
+
+function parseAddressFromMemory(raw: unknown): string | undefined {
+  if (typeof raw === "string" && raw.trim()) return raw.trim();
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const parts = [
+    obj.full_name ?? obj.name,
+    obj.line_1,
+    obj.line_2,
+    obj.city,
+    obj.state_or_region ?? obj.state,
+    obj.postal_code,
+    obj.country,
+  ]
+    .map((v) => (typeof v === "string" ? v.trim() : ""))
+    .filter(Boolean);
+  return parts.length >= 2 ? parts.join(", ") : undefined;
+}
+
+function parseItemsFromTask(orderIntent: { itemName: string }): OrderItem[] {
+  return [{ name: orderIntent.itemName }];
 }
 
 function toBrowserStatus(status: string | undefined): BrowserStatus {
@@ -423,6 +473,60 @@ export class BrowserUseService {
     });
   }
 
+  private resolveCardFromMemory(): OrderCard | undefined {
+    const keys = ["payment_card", "credit_card", "card", "payment"];
+    for (const key of keys) {
+      const entry = this.database.readMemory(key);
+      if (!entry) continue;
+      const raw = entry.data ?? (() => { try { return JSON.parse(entry.content); } catch { return undefined; } })();
+      const card = parseCardFromMemory(raw);
+      if (card) return card;
+    }
+    return undefined;
+  }
+
+  private resolveAddressFromMemory(): string | undefined {
+    const keys = ["delivery_address", "home_address", "address", "shipping_address"];
+    for (const key of keys) {
+      const entry = this.database.readMemory(key);
+      if (!entry) continue;
+      const raw = entry.data ?? entry.content;
+      const addr = parseAddressFromMemory(raw);
+      if (addr) return addr;
+    }
+    return undefined;
+  }
+
+  private buildOrderTaskTemplate(
+    orderIntent: NonNullable<ReturnType<typeof parseOrderIntent>>,
+    task: string,
+  ): string {
+    const items = parseItemsFromTask(orderIntent);
+    const card = this.resolveCardFromMemory();
+    const deliveryAddress = this.resolveAddressFromMemory();
+
+    if (isCvsTask(task)) {
+      return buildCvsTask({
+        items,
+        ...(card !== undefined ? { card } : {}),
+        ...(deliveryAddress !== undefined ? { deliveryAddress } : {}),
+      });
+    }
+
+    const platform = detectFoodPlatform(task);
+    if (platform) {
+      return buildFoodOrderTask({
+        platform,
+        merchant: orderIntent.merchant,
+        items,
+        ...(card !== undefined ? { card } : {}),
+        ...(deliveryAddress !== undefined ? { deliveryAddress } : {}),
+      });
+    }
+
+    return buildGenericOrderTemplate(orderIntent.merchant, orderIntent.itemName);
+  }
+
   private async prepareBrowserTask(task: string): Promise<PreparedBrowserTask> {
     const orderIntent = parseOrderIntent(task);
     if (!orderIntent) {
@@ -430,7 +534,7 @@ export class BrowserUseService {
     }
 
     const templateKey = `merchant_order:${orderIntent.normalizedMerchant}`;
-    const taskTemplate = buildMerchantOrderTemplate(orderIntent.merchant, orderIntent.itemName);
+    const taskTemplate = this.buildOrderTaskTemplate(orderIntent, task);
     let template =
       this.database.findBrowserTaskTemplateByKey(templateKey) ??
       this.database.saveBrowserTaskTemplate({
