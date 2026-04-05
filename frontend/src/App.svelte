@@ -17,10 +17,10 @@
     },
     {
       id: 'transcription',
-      label: 'Transcription',
-      eyebrow: 'Transcript',
-      title: 'Transcription',
-      description: 'Live conversation and actions.',
+      label: 'Transcript',
+      eyebrow: '',
+      title: 'Transcript',
+      description: 'One timeline: live chat, tool calls, and what the agent is doing.',
       metricLabel: 'Live',
     },
     {
@@ -139,7 +139,9 @@
   <main class="workspace">
     <header class="page-header">
       <div class="page-title">
-        <p class="eyebrow">{currentPage.eyebrow}</p>
+        {#if currentPage.eyebrow}
+          <p class="eyebrow">{currentPage.eyebrow}</p>
+        {/if}
         <h1 class="heading">{currentPage.title}</h1>
       </div>
     </header>

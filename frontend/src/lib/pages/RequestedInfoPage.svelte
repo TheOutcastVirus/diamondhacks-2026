@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { createEventStream, get, post } from '../api';
-  import type { PromptField, UserMemoryEntry, UserPrompt } from '../types';
+  import { createEventStream, get, post, uploadFile } from '../api';
+  import type { PromptField, UploadedFile, UploadedFileReference, UserMemoryEntry, UserPrompt } from '../types';
 
   type FeedbackState = {
     tone: 'error' | 'success';
@@ -10,12 +10,17 @@
 
   let prompts: UserPrompt[] = [];
   let memoryEntries: UserMemoryEntry[] = [];
+  let uploadedFiles: UploadedFile[] = [];
   let isLoading = true;
   let loadError = '';
   let submitBusy: Record<string, boolean> = {};
   let submitFeedback: Record<string, FeedbackState | undefined> = {};
-  let formValues: Record<string, Record<string, string | number | boolean>> = {};
+  let uploadBusy: Record<string, boolean> = {};
+  let libraryUploadBusy = false;
+  let libraryUploadFeedback: FeedbackState | null = null;
+  let formValues: Record<string, Record<string, string | number | boolean | UploadedFileReference[]>> = {};
   let selectedMemoryTitle = '';
+  let expandedFileId = '';
   let eventSource: EventSource | null = null;
 
   function formatDate(value: string) {
@@ -28,7 +33,11 @@
         }).format(parsed);
   }
 
-  function getDefaultValue(field: PromptField): string | number | boolean {
+  function getDefaultValue(field: PromptField): string | number | boolean | UploadedFileReference[] {
+    if (field.type === 'file') {
+      return [];
+    }
+
     if (field.defaultValue !== undefined && field.defaultValue !== null) {
       return field.defaultValue;
     }
@@ -49,7 +58,7 @@
   }
 
   function ensurePromptState(prompt: UserPrompt) {
-    const nextValues: Record<string, string | number | boolean> = {
+    const nextValues: Record<string, string | number | boolean | UploadedFileReference[]> = {
       ...(formValues[prompt.id] ?? {}),
     };
 
@@ -74,12 +83,15 @@
         value.type === 'boolean' ||
         value.type === 'password' ||
         value.type === 'date' ||
-        value.type === 'select'
+        value.type === 'select' ||
+        value.type === 'file'
           ? value.type
           : 'string',
       required: Boolean(value.required),
       placeholder: value.placeholder ? String(value.placeholder) : undefined,
       description: value.description ? String(value.description) : undefined,
+      accept: value.accept ? String(value.accept) : undefined,
+      multiple: Boolean(value.multiple),
       options: Array.isArray(value.options)
         ? value.options.map((option, optionIndex) => {
             const item = typeof option === 'object' && option !== null ? (option as Record<string, unknown>) : {};
@@ -96,6 +108,21 @@
         typeof value.defaultValue === 'boolean'
           ? value.defaultValue
           : undefined,
+    };
+  }
+
+  function normalizeUploadedFileReference(raw: unknown): UploadedFileReference | null {
+    const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+    if (!value.id || !value.name || !value.mimeType) {
+      return null;
+    }
+
+    return {
+      id: String(value.id),
+      name: String(value.name),
+      mimeType: String(value.mimeType),
+      sizeBytes: Number(value.sizeBytes ?? 0),
+      textStatus: value.textStatus === 'ready' || value.textStatus === 'failed' ? value.textStatus : 'none',
     };
   }
 
@@ -118,6 +145,27 @@
     };
   }
 
+  function normalizeUploadedFile(raw: unknown, index: number): UploadedFile {
+    const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+    return {
+      id: String(value.id ?? `file_${index}`),
+      name: String(value.name ?? value.originalName ?? `Upload ${index + 1}`),
+      originalName: String(value.originalName ?? value.name ?? `upload_${index + 1}`),
+      mimeType: String(value.mimeType ?? 'application/octet-stream'),
+      sizeBytes: Number(value.sizeBytes ?? 0),
+      textStatus: value.textStatus === 'ready' || value.textStatus === 'failed' ? value.textStatus : 'none',
+      createdAt: String(value.createdAt ?? value.created_at ?? new Date().toISOString()),
+      promptId: value.promptId ? String(value.promptId) : value.prompt_id ? String(value.prompt_id) : undefined,
+      promptFieldName: value.promptFieldName
+        ? String(value.promptFieldName)
+        : value.prompt_field_name
+          ? String(value.prompt_field_name)
+          : undefined,
+      reminderId: value.reminderId ? String(value.reminderId) : value.reminder_id ? String(value.reminder_id) : undefined,
+      extractedText: value.extractedText ? String(value.extractedText) : undefined,
+    };
+  }
+
   function normalizeMemoryEntry(raw: unknown, index: number): UserMemoryEntry {
     const value = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
     return {
@@ -131,6 +179,21 @@
           ? (value.data as Record<string, unknown>)
           : undefined,
     };
+  }
+
+  function formatBytes(value: number) {
+    if (!Number.isFinite(value) || value <= 0) {
+      return '0 B';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
   }
 
   function setFeedback(promptId: string, tone: FeedbackState['tone'], text: string) {
@@ -152,13 +215,15 @@
     loadError = '';
 
     try {
-      const [promptPayload, memoryPayload] = await Promise.all([
+      const [promptPayload, memoryPayload, filePayload] = await Promise.all([
         get<{ prompts: unknown[] }>('prompts', { query: { status: 'all' } }),
         get<{ entries: unknown[] }>('memory'),
+        get<{ files: unknown[] }>('files'),
       ]);
 
       prompts = (promptPayload.prompts ?? []).map((prompt, index) => normalizePrompt(prompt, index));
       memoryEntries = (memoryPayload.entries ?? []).map((entry, index) => normalizeMemoryEntry(entry, index));
+      uploadedFiles = (filePayload.files ?? []).map((file, index) => normalizeUploadedFile(file, index));
 
       for (const prompt of prompts.filter((item) => item.status === 'pending')) {
         ensurePromptState(prompt);
@@ -169,10 +234,15 @@
       } else if (selectedMemoryTitle && !memoryEntries.some((entry) => entry.title === selectedMemoryTitle)) {
         selectedMemoryTitle = memoryEntries[0]?.title ?? '';
       }
+
+      expandedFileId = uploadedFiles.some((file) => file.id === expandedFileId)
+        ? expandedFileId
+        : (uploadedFiles[0]?.id ?? '');
     } catch (error) {
       loadError = error instanceof Error ? error.message : 'Unable to load requested information.';
       prompts = [];
       memoryEntries = [];
+      uploadedFiles = [];
     } finally {
       isLoading = false;
     }
@@ -190,7 +260,7 @@
     source.addEventListener('tool', handleEventRefresh);
   }
 
-  function setFieldValue(promptId: string, fieldName: string, value: string | number | boolean) {
+  function setFieldValue(promptId: string, fieldName: string, value: string | number | boolean | UploadedFileReference[]) {
     formValues = {
       ...formValues,
       [promptId]: {
@@ -200,6 +270,104 @@
     };
   }
 
+  async function uploadPromptFile(prompt: UserPrompt, field: PromptField, files: FileList | null) {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    const uploadKey = `${prompt.id}:${field.name}`;
+    uploadBusy = { ...uploadBusy, [uploadKey]: true };
+
+    try {
+      const uploaded = await Promise.all(
+        Array.from(files).map(async (file) => {
+          const payload = await uploadFile('files', file, {
+            promptId: prompt.id,
+            fieldName: field.name,
+          });
+          return normalizeUploadedFile((payload as { file: unknown }).file, 0);
+        }),
+      );
+
+      const current = Array.isArray(formValues[prompt.id]?.[field.name])
+        ? ((formValues[prompt.id]?.[field.name] as UploadedFileReference[]) ?? [])
+        : [];
+      const nextValue = field.multiple ? [...current, ...uploaded] : uploaded.slice(0, 1);
+      setFieldValue(prompt.id, field.name, nextValue);
+      uploadedFiles = [...uploaded, ...uploadedFiles.filter((item) => !uploaded.some((entry) => entry.id === item.id))];
+      if (uploaded.length > 0) {
+        expandFileSection(uploaded[0].id);
+      }
+    } catch (error) {
+      setFeedback(prompt.id, 'error', error instanceof Error ? error.message : 'Unable to upload file.');
+    } finally {
+      uploadBusy = { ...uploadBusy, [uploadKey]: false };
+    }
+  }
+
+  async function uploadLibraryFiles(files: FileList | null) {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    libraryUploadBusy = true;
+    libraryUploadFeedback = null;
+
+    try {
+      const uploaded = await Promise.all(
+        Array.from(files).map(async (file) => {
+          const payload = await uploadFile('files', file);
+          return normalizeUploadedFile((payload as { file: unknown }).file, 0);
+        }),
+      );
+
+      uploadedFiles = [...uploaded, ...uploadedFiles.filter((item) => !uploaded.some((entry) => entry.id === item.id))];
+      if (uploaded.length > 0) {
+        expandedFileId = uploaded[0].id;
+      }
+      libraryUploadFeedback = { tone: 'success', text: 'Files added to the document library.' };
+    } catch (error) {
+      libraryUploadFeedback = {
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Unable to upload files.',
+      };
+    } finally {
+      libraryUploadBusy = false;
+    }
+  }
+
+  function removePromptFile(promptId: string, fieldName: string, fileId: string) {
+    const current = Array.isArray(formValues[promptId]?.[fieldName])
+      ? ((formValues[promptId]?.[fieldName] as UploadedFileReference[]) ?? [])
+      : [];
+    setFieldValue(
+      promptId,
+      fieldName,
+      current.filter((file) => file.id !== fileId),
+    );
+  }
+
+  function isFileExpanded(fileId: string) {
+    return expandedFileId === fileId;
+  }
+
+  function expandFileSection(fileId: string) {
+    if (expandedFileId === fileId) {
+      return;
+    }
+
+    expandedFileId = fileId;
+  }
+
+  function toggleFileSection(fileId: string) {
+    if (expandedFileId === fileId) {
+      expandedFileId = '';
+      return;
+    }
+
+    expandedFileId = fileId;
+  }
+
   async function submitPrompt(prompt: UserPrompt) {
     clearFeedback(prompt.id);
     submitBusy = { ...submitBusy, [prompt.id]: true };
@@ -207,7 +375,7 @@
     try {
       const response = formValues[prompt.id] ?? {};
       const payload = await post<{ memoryEntry?: UserMemoryEntry }>(
-        `prompts/${encodeURIComponent(prompt.id)}/respond`,
+        `/api/prompts/${encodeURIComponent(prompt.id)}/respond`,
         { response },
       );
       if (payload.memoryEntry?.title) {
@@ -290,7 +458,7 @@
 
             <form class="dynamic-form" on:submit|preventDefault={() => submitPrompt(prompt)}>
               {#each prompt.fields as field}
-                <label class={`field ${field.type === 'text' ? 'field-span' : ''}`}>
+                <label class={`field ${field.type === 'text' || field.type === 'file' ? 'field-span' : ''}`}>
                   <span class="field-label">
                     {field.label}
                     {#if field.required}
@@ -325,6 +493,36 @@
                         <option value={option.value}>{option.label}</option>
                       {/each}
                     </select>
+                  {:else if field.type === 'file'}
+                    <div class="file-field">
+                      <input
+                        class="field-input file-input"
+                        type="file"
+                        accept={field.accept ?? undefined}
+                        multiple={field.multiple}
+                        on:change={(event) => uploadPromptFile(prompt, field, event.currentTarget.files)}
+                      />
+
+                      {#if Array.isArray(formValues[prompt.id]?.[field.name])}
+                        <div class="upload-chip-list">
+                          {#each (formValues[prompt.id]?.[field.name] as UploadedFileReference[]) ?? [] as file}
+                            <div class="upload-chip">
+                              <button class="file-link" type="button" on:click={() => expandFileSection(file.id)}>
+                                {file.name}
+                              </button>
+                              <span class="field-note">{formatBytes(file.sizeBytes)} | {file.textStatus}</span>
+                              <button class="ghost chip-action" type="button" on:click={() => removePromptFile(prompt.id, field.name, file.id)}>
+                                Remove
+                              </button>
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+
+                      {#if uploadBusy[`${prompt.id}:${field.name}`]}
+                        <span class="field-note">Uploading file…</span>
+                      {/if}
+                    </div>
                   {:else}
                     <input
                       class="field-input"
@@ -399,7 +597,7 @@
       <section class="empty-state">
         <p class="panel-label">Memory</p>
         <h3 class="callout-heading">No memory entries</h3>
-        <p class="panel-copy">Normal notes and form-derived records will both appear here through the same memory surface.</p>
+        <p class="panel-copy">The robot's notes will appear here</p>
       </section>
     {:else}
       <div class="memory-layout">
@@ -462,6 +660,90 @@
         {/if}
       </div>
     {/if}
+
+    <section class="history-panel">
+      <div class="history-head">
+        <div>
+          <p class="panel-label">Uploaded Files</p>
+          <h3 class="callout-heading">Document Library</h3>
+        </div>
+      </div>
+
+      <div class="file-field">
+        <input class="field-input file-input" type="file" multiple on:change={(event) => uploadLibraryFiles(event.currentTarget.files)} />
+        <span class="field-note">Upload documents directly to the shared library or attach them while filling a request or editing a reminder.</span>
+        {#if libraryUploadBusy}
+          <span class="field-note">Uploading files...</span>
+        {/if}
+        {#if libraryUploadFeedback}
+          <p class={`feedback ${libraryUploadFeedback.tone === 'error' ? 'feedback-error' : 'feedback-success'}`}>
+            {libraryUploadFeedback.text}
+          </p>
+        {/if}
+      </div>
+
+      {#if uploadedFiles.length === 0}
+        <p class="panel-copy">Uploaded prescriptions, delivery instructions, and other documents will appear here.</p>
+      {:else}
+        <div class="document-library" aria-label="Uploaded files">
+          {#each uploadedFiles as file}
+            <article class={`document-card ${isFileExpanded(file.id) ? 'document-open' : ''}`}>
+              <button
+                aria-expanded={isFileExpanded(file.id)}
+                class="document-toggle"
+                type="button"
+                on:click={() => toggleFileSection(file.id)}
+              >
+                <div class="document-heading">
+                  <div class="document-title-block">
+                    <p class="panel-label">Uploaded File</p>
+                    <h4 class="document-title">{file.name}</h4>
+                  </div>
+
+                  <div class="document-summary">
+                    <span class="key-pill">{file.textStatus}</span>
+                    <span class="document-summary-copy">{formatBytes(file.sizeBytes)} | {formatDate(file.createdAt)}</span>
+                  </div>
+                </div>
+
+                <div class="document-subrow">
+                  <div class="schema-chips">
+                    <span class="schema-chip">{file.mimeType}</span>
+                    {#if file.promptId}
+                      <span class="schema-chip">prompt {file.promptId}</span>
+                    {/if}
+                    {#if file.reminderId}
+                      <span class="schema-chip">reminder {file.reminderId}</span>
+                    {/if}
+                  </div>
+                  <span class="document-toggle-label">{isFileExpanded(file.id) ? 'Collapse' : 'Expand'}</span>
+                </div>
+              </button>
+
+              {#if isFileExpanded(file.id)}
+                <div class="document-body">
+                  <dl class="detail-grid">
+                    <div>
+                      <dt class="detail-term">Uploaded</dt>
+                      <dd class="detail-value">{formatDate(file.createdAt)}</dd>
+                    </div>
+                    <div>
+                      <dt class="detail-term">Size</dt>
+                      <dd class="detail-value">{formatBytes(file.sizeBytes)}</dd>
+                    </div>
+                  </dl>
+
+                  <section class="json-panel">
+                    <p class="panel-label">Extracted Text</p>
+                    <pre class="json-block file-text-block">{file.extractedText ?? 'No extracted text available.'}</pre>
+                  </section>
+                </div>
+              {/if}
+            </article>
+          {/each}
+        </div>
+      {/if}
+    </section>
   </section>
 </section>
 
@@ -579,6 +861,30 @@
     gap: 0.5rem;
   }
 
+  div.file-field,
+  div.upload-chip-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  div.upload-chip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.8rem 0.9rem;
+    border: var(--border-width) solid var(--color-line);
+    background: var(--color-panel);
+  }
+
+  div.document-library {
+    display: flex;
+    flex-direction: column;
+    gap: 1.15rem;
+    margin-top: 0.4rem;
+  }
+
   label.field-span {
     grid-column: 1 / -1;
   }
@@ -608,12 +914,17 @@
     font: inherit;
   }
 
+  input.file-input {
+    padding-block: 0.75rem;
+  }
+
   input.field-input:focus-visible,
   textarea.field-input:focus-visible,
   select.field-input:focus-visible,
   button.ghost:focus-visible,
   button.action:focus-visible,
-  button.memory-item:focus-visible {
+  button.memory-item:focus-visible,
+  button.file-link:focus-visible {
     outline: 1px solid color-mix(in srgb, var(--color-accent) 60%, transparent);
     outline-offset: 1px;
     border-color: var(--color-accent);
@@ -650,6 +961,36 @@
       transform 160ms ease,
       background 160ms ease,
       border-color 160ms ease;
+  }
+
+  button.file-link {
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--color-ink-strong);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  button.document-toggle {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1.25rem 1.35rem;
+    text-align: left;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: inherit;
+  }
+
+  button.chip-action {
+    padding: 0.45rem 0.7rem;
+    white-space: nowrap;
   }
 
   button.action,
@@ -703,6 +1044,80 @@
   article.history-card {
     border-top: var(--border-width) solid var(--color-line);
     padding-top: 0.9rem;
+  }
+
+  article.document-card {
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 6%, transparent), transparent 50%),
+      color-mix(in srgb, var(--color-panel-muted) 82%, var(--color-panel));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-line) 45%, transparent);
+  }
+
+  article.document-open {
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 58%),
+      color-mix(in srgb, var(--color-panel-muted) 88%, var(--color-panel));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 28%, transparent);
+  }
+
+  div.document-heading,
+  div.document-subrow {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+
+  div.document-title-block,
+  div.document-summary,
+  div.document-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  div.document-summary {
+    align-items: flex-end;
+    text-align: right;
+    flex: 0 0 auto;
+  }
+
+  h4.document-title {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 1.05rem;
+    color: var(--color-ink-strong);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    text-wrap: balance;
+  }
+
+  span.document-summary-copy,
+  span.document-toggle-label {
+    font-size: 0.85rem;
+    color: var(--color-ink-soft);
+  }
+
+  span.document-toggle-label {
+    min-width: 4.75rem;
+    text-align: right;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  div.document-body {
+    gap: 1.15rem;
+    padding: 0 1.35rem 1.35rem;
+  }
+
+  article.document-card .key-pill,
+  article.document-card .schema-chip {
+    border: none;
+    background: color-mix(in srgb, var(--color-panel) 74%, transparent);
+  }
+
+  article.document-card .schema-chips {
+    gap: 0.55rem;
   }
 
   div.memory-layout {
@@ -793,6 +1208,16 @@
     font: 0.88rem/1.55 var(--font-mono);
   }
 
+  pre.file-text-block {
+    max-height: 26rem;
+    padding: 1.2rem 1.25rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    border: none;
+    background: color-mix(in srgb, var(--color-panel) 84%, transparent);
+  }
+
   @media (max-width: 1180px) {
     section.page-grid,
     div.memory-layout {
@@ -811,14 +1236,31 @@
     div.request-head,
     div.history-meta,
     div.memory-detail-head,
-    div.form-footer {
+    div.form-footer,
+    div.document-heading,
+    div.document-subrow {
       flex-direction: column;
     }
 
     button.action,
     button.ghost,
-    button.memory-item {
+    button.memory-item,
+    button.chip-action {
       width: 100%;
+    }
+
+    div.upload-chip {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    div.document-summary {
+      align-items: flex-start;
+      text-align: left;
+    }
+
+    span.document-toggle-label {
+      text-align: left;
     }
   }
 </style>

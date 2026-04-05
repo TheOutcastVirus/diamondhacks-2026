@@ -15,10 +15,14 @@ import type {
   TranscriptKind,
   TranscriptRole,
   ToolStatus,
+  UploadedFile,
+  UploadedFileReference,
+  UploadedFileTextStatus,
   UserMemoryEntry,
   UserPrompt,
 } from "./contracts";
 import { computeNextRun } from "./cron";
+import { resolveReminderTimezone } from "./reminders";
 
 type ReminderRow = {
   id: string;
@@ -32,6 +36,7 @@ type ReminderRow = {
   owner: string;
   timezone: string;
   created_at: string;
+  attachments_json: string | null;
 };
 
 type TranscriptRow = {
@@ -92,6 +97,46 @@ type UserMemoryRow = {
   updated_at: string;
 };
 
+type BrowserTaskTemplateRow = {
+  id: string;
+  template_key: string;
+  label: string;
+  merchant: string;
+  task_template: string;
+  workspace_id: string | null;
+  use_count: number;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string | null;
+};
+
+type ShoppingOrderRow = {
+  id: string;
+  merchant: string;
+  normalized_merchant: string;
+  item_name: string;
+  normalized_item_name: string;
+  source_task: string;
+  template_id: string | null;
+  browser_session_id: string | null;
+  created_at: string;
+};
+
+type UploadedFileRow = {
+  id: string;
+  name: string;
+  original_name: string;
+  storage_path: string;
+  mime_type: string;
+  size_bytes: number;
+  text_status: UploadedFileTextStatus;
+  extracted_text: string | null;
+  reminder_id: string | null;
+  prompt_id: string | null;
+  prompt_field_name: string | null;
+  created_at: string;
+};
+
 export type BrowserTaskSession = {
   id: string;
   previewUrl: string | null;
@@ -100,6 +145,31 @@ export type BrowserTaskSession = {
 export type ClaimedReminder = {
   reminder: Reminder;
   dueAt: string;
+};
+
+export type BrowserTaskTemplate = {
+  id: string;
+  templateKey: string;
+  label: string;
+  merchant: string;
+  taskTemplate: string;
+  workspaceId: string | null;
+  useCount: number;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+};
+
+export type ShoppingOrder = {
+  id: string;
+  merchant: string;
+  normalizedMerchant: string;
+  itemName: string;
+  normalizedItemName: string;
+  sourceTask: string;
+  templateId: string | null;
+  browserSessionId: string | null;
+  createdAt: string;
 };
 
 const IDLE_BROWSER_CONTEXT: BrowserContext = {
@@ -151,6 +221,58 @@ function parseMetadata(value: string | null): Record<string, unknown> | undefine
   return parseJsonObject(value);
 }
 
+function parseUploadedFileReferences(value: string | null | undefined): UploadedFileReference[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.flatMap((item) => {
+      if (typeof item !== "object" || item === null) {
+        return [];
+      }
+
+      const record = item as Record<string, unknown>;
+      const id = typeof record.id === "string" ? record.id : "";
+      const name = typeof record.name === "string" ? record.name : "";
+      const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
+      const sizeBytes =
+        typeof record.sizeBytes === "number" && Number.isFinite(record.sizeBytes) ? record.sizeBytes : 0;
+      const textStatus =
+        record.textStatus === "ready" || record.textStatus === "failed" ? record.textStatus : "none";
+
+      if (!id || !name || !mimeType) {
+        return [];
+      }
+
+      return [{ id, name, mimeType, sizeBytes, textStatus }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    ...(row.reminder_id ? { reminderId: row.reminder_id } : {}),
+    ...(row.prompt_id ? { promptId: row.prompt_id } : {}),
+    ...(row.prompt_field_name ? { promptFieldName: row.prompt_field_name } : {}),
+    ...(row.extracted_text ? { extractedText: row.extracted_text } : {}),
+  };
+}
+
 function serializeReminder(row: ReminderRow): Reminder {
   return {
     id: row.id,
@@ -163,6 +285,22 @@ function serializeReminder(row: ReminderRow): Reminder {
     status: row.status,
     owner: row.owner,
     timezone: row.timezone,
+    attachments: parseUploadedFileReferences(row.attachments_json),
+  };
+}
+
+function serializeUploadedFile(row: UploadedFileRow): UploadedFile {
+  return {
+    id: row.id,
+    name: row.name,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    textStatus: row.text_status,
+    createdAt: row.created_at,
+    reminderId: row.reminder_id ?? undefined,
+    promptId: row.prompt_id ?? undefined,
+    promptFieldName: row.prompt_field_name ?? undefined,
   };
 }
 
@@ -278,6 +416,35 @@ function serializeMemoryEntry(row: UserMemoryRow): UserMemoryEntry {
   return entry;
 }
 
+function serializeBrowserTaskTemplate(row: BrowserTaskTemplateRow): BrowserTaskTemplate {
+  return {
+    id: row.id,
+    templateKey: row.template_key,
+    label: row.label,
+    merchant: row.merchant,
+    taskTemplate: row.task_template,
+    workspaceId: row.workspace_id,
+    useCount: row.use_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastUsedAt: row.last_used_at,
+  };
+}
+
+function serializeShoppingOrder(row: ShoppingOrderRow): ShoppingOrder {
+  return {
+    id: row.id,
+    merchant: row.merchant,
+    normalizedMerchant: row.normalized_merchant,
+    itemName: row.item_name,
+    normalizedItemName: row.normalized_item_name,
+    sourceTask: row.source_task,
+    templateId: row.template_id,
+    browserSessionId: row.browser_session_id,
+    createdAt: row.created_at,
+  };
+}
+
 function nextRunForReminder(input: {
   cron: string;
   timezone: string;
@@ -387,6 +554,46 @@ export class GazabotDatabase {
         responded_at TEXT
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS browser_task_templates (
+        id TEXT PRIMARY KEY NOT NULL,
+        template_key TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        merchant TEXT NOT NULL,
+        task_template TEXT NOT NULL,
+        workspace_id TEXT,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS shopping_orders (
+        id TEXT PRIMARY KEY NOT NULL,
+        merchant TEXT NOT NULL,
+        normalized_merchant TEXT NOT NULL,
+        item_name TEXT NOT NULL,
+        normalized_item_name TEXT NOT NULL,
+        source_task TEXT NOT NULL,
+        template_id TEXT REFERENCES browser_task_templates(id) ON DELETE SET NULL,
+        browser_session_id TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        text_status TEXT NOT NULL,
+        extracted_text TEXT,
+        reminder_id TEXT,
+        prompt_id TEXT,
+        prompt_field_name TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
     `);
 
     this.ensureColumn("user_memory", "kind", "TEXT");
@@ -394,6 +601,7 @@ export class GazabotDatabase {
     this.ensureColumn("user_memory", "data_json", "TEXT");
     this.ensureColumn("user_prompts", "memory_key", "TEXT");
     this.ensureColumn("user_prompts", "memory_label", "TEXT");
+    this.ensureColumn("reminders", "attachments_json", "TEXT");
   }
 
   private ensureColumn(tableName: string, columnName: string, definition: string): void {
@@ -418,6 +626,8 @@ export class GazabotDatabase {
   }
 
   createReminder(input: ReminderCreateInput): Reminder {
+    const attachments = this.resolveUploadedFileReferences(input.attachmentFileIds);
+    const timezone = resolveReminderTimezone(input.timezone);
     const row: ReminderRow = {
       id: prefixedId("r"),
       title: input.title.trim(),
@@ -427,21 +637,22 @@ export class GazabotDatabase {
       schedule_label: input.scheduleLabel.trim(),
       next_run: nextRunForReminder({
         cron: input.cron.trim(),
-        timezone: input.timezone.trim(),
+        timezone,
         status: "active",
       }),
       status: "active",
       owner: "Gazabot agent",
-      timezone: input.timezone.trim(),
+      timezone,
       created_at: nowIso(),
+      attachments_json: JSON.stringify(attachments),
     };
 
     this.database
       .query(
         `
           INSERT INTO reminders (
-            id, title, instructions, cadence, cron, schedule_label, next_run, status, owner, timezone, created_at
-          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            id, title, instructions, cadence, cron, schedule_label, next_run, status, owner, timezone, created_at, attachments_json
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         `,
       )
       .run(
@@ -456,9 +667,11 @@ export class GazabotDatabase {
         row.owner,
         row.timezone,
         row.created_at,
+        row.attachments_json,
       );
 
     const reminder = serializeReminder(row);
+    this.linkUploadedFilesToReminder(reminder.id, attachments.map((attachment) => attachment.id));
     this.notifyReminderListeners();
     return reminder;
   }
@@ -539,8 +752,12 @@ export class GazabotDatabase {
     const cadence = input.cadence ?? existing.cadence;
     const cron = input.cron === undefined ? existing.cron : input.cron.trim();
     const scheduleLabel = input.scheduleLabel === undefined ? existing.schedule_label : input.scheduleLabel.trim();
-    const timezone = input.timezone === undefined ? existing.timezone : input.timezone.trim();
+    const timezone = input.timezone === undefined ? existing.timezone : resolveReminderTimezone(input.timezone);
     const status = input.status ?? existing.status;
+    const attachments =
+      input.attachmentFileIds === undefined
+        ? parseUploadedFileReferences((existing as ReminderRow & { attachments_json?: string | null }).attachments_json ?? null)
+        : this.resolveUploadedFileReferences(input.attachmentFileIds);
 
     const row: ReminderRow = {
       ...existing,
@@ -552,6 +769,7 @@ export class GazabotDatabase {
       next_run: nextRunForReminder({ cron, timezone, status }),
       status,
       timezone,
+      attachments_json: JSON.stringify(attachments),
     };
 
     this.database
@@ -565,7 +783,8 @@ export class GazabotDatabase {
               schedule_label = ?6,
               next_run = ?7,
               status = ?8,
-              timezone = ?9
+              timezone = ?9,
+              attachments_json = ?10
           WHERE id = ?1
         `,
       )
@@ -579,9 +798,13 @@ export class GazabotDatabase {
         row.next_run,
         row.status,
         row.timezone,
+        row.attachments_json,
       );
 
     const reminder = serializeReminder(row);
+    if (input.attachmentFileIds !== undefined) {
+      this.linkUploadedFilesToReminder(reminder.id, attachments.map((attachment) => attachment.id));
+    }
     this.notifyReminderListeners();
     return reminder;
   }
@@ -874,6 +1097,156 @@ export class GazabotDatabase {
     };
   }
 
+  findBrowserTaskTemplateByKey(templateKey: string): BrowserTaskTemplate | null {
+    const row = this.database
+      .query("SELECT * FROM browser_task_templates WHERE template_key = ?1")
+      .get(templateKey) as BrowserTaskTemplateRow | null;
+    return row ? serializeBrowserTaskTemplate(row) : null;
+  }
+
+  saveBrowserTaskTemplate(input: {
+    templateKey: string;
+    label: string;
+    merchant: string;
+    taskTemplate: string;
+    workspaceId?: string | null;
+    incrementUseCount?: boolean;
+  }): BrowserTaskTemplate {
+    const existing = this.database
+      .query("SELECT * FROM browser_task_templates WHERE template_key = ?1")
+      .get(input.templateKey) as BrowserTaskTemplateRow | null;
+    const timestamp = nowIso();
+
+    if (existing) {
+      const useCount = existing.use_count + (input.incrementUseCount ? 1 : 0);
+      const lastUsedAt = input.incrementUseCount ? timestamp : existing.last_used_at;
+      const row: BrowserTaskTemplateRow = {
+        ...existing,
+        label: input.label.trim(),
+        merchant: input.merchant.trim(),
+        task_template: input.taskTemplate.trim(),
+        workspace_id: input.workspaceId === undefined ? existing.workspace_id : input.workspaceId,
+        use_count: useCount,
+        updated_at: timestamp,
+        last_used_at: lastUsedAt,
+      };
+
+      this.database
+        .query(
+          `
+            UPDATE browser_task_templates
+            SET label = ?2,
+                merchant = ?3,
+                task_template = ?4,
+                workspace_id = ?5,
+                use_count = ?6,
+                updated_at = ?7,
+                last_used_at = ?8
+            WHERE id = ?1
+          `,
+        )
+        .run(
+          row.id,
+          row.label,
+          row.merchant,
+          row.task_template,
+          row.workspace_id,
+          row.use_count,
+          row.updated_at,
+          row.last_used_at,
+        );
+
+      return serializeBrowserTaskTemplate(row);
+    }
+
+    const row: BrowserTaskTemplateRow = {
+      id: prefixedId("btt"),
+      template_key: input.templateKey.trim(),
+      label: input.label.trim(),
+      merchant: input.merchant.trim(),
+      task_template: input.taskTemplate.trim(),
+      workspace_id: input.workspaceId ?? null,
+      use_count: input.incrementUseCount ? 1 : 0,
+      created_at: timestamp,
+      updated_at: timestamp,
+      last_used_at: input.incrementUseCount ? timestamp : null,
+    };
+
+    this.database
+      .query(
+        `
+          INSERT INTO browser_task_templates (
+            id, template_key, label, merchant, task_template, workspace_id, use_count, created_at, updated_at, last_used_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        `,
+      )
+      .run(
+        row.id,
+        row.template_key,
+        row.label,
+        row.merchant,
+        row.task_template,
+        row.workspace_id,
+        row.use_count,
+        row.created_at,
+        row.updated_at,
+        row.last_used_at,
+      );
+
+    return serializeBrowserTaskTemplate(row);
+  }
+
+  recordShoppingOrder(input: {
+    merchant: string;
+    normalizedMerchant: string;
+    itemName: string;
+    normalizedItemName: string;
+    sourceTask: string;
+    templateId?: string | null;
+    browserSessionId?: string | null;
+  }): ShoppingOrder {
+    const row: ShoppingOrderRow = {
+      id: prefixedId("so"),
+      merchant: input.merchant.trim(),
+      normalized_merchant: input.normalizedMerchant.trim(),
+      item_name: input.itemName.trim(),
+      normalized_item_name: input.normalizedItemName.trim(),
+      source_task: input.sourceTask.trim(),
+      template_id: input.templateId ?? null,
+      browser_session_id: input.browserSessionId ?? null,
+      created_at: nowIso(),
+    };
+
+    this.database
+      .query(
+        `
+          INSERT INTO shopping_orders (
+            id, merchant, normalized_merchant, item_name, normalized_item_name, source_task, template_id, browser_session_id, created_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        `,
+      )
+      .run(
+        row.id,
+        row.merchant,
+        row.normalized_merchant,
+        row.item_name,
+        row.normalized_item_name,
+        row.source_task,
+        row.template_id,
+        row.browser_session_id,
+        row.created_at,
+      );
+
+    return serializeShoppingOrder(row);
+  }
+
+  listShoppingOrders(): ShoppingOrder[] {
+    const rows = this.database
+      .query("SELECT * FROM shopping_orders ORDER BY created_at DESC")
+      .all() as ShoppingOrderRow[];
+    return rows.map(serializeShoppingOrder);
+  }
+
   createPrompt(input: {
     title: string;
     description?: string;
@@ -947,6 +1320,122 @@ export class GazabotDatabase {
       },
     );
     return { prompt: updated, memoryEntry };
+  }
+
+  listUploadedFiles(): UploadedFile[] {
+    const rows = this.database
+      .query("SELECT * FROM uploaded_files ORDER BY created_at DESC, name ASC")
+      .all() as UploadedFileRow[];
+    return rows.map(serializeUploadedFile);
+  }
+
+  getUploadedFile(id: string): UploadedFile | null {
+    const row = this.database.query("SELECT * FROM uploaded_files WHERE id = ?1").get(id) as UploadedFileRow | null;
+    return row ? serializeUploadedFile(row) : null;
+  }
+
+  getUploadedFileStoragePath(id: string): string | null {
+    const row = this.database
+      .query("SELECT storage_path FROM uploaded_files WHERE id = ?1")
+      .get(id) as { storage_path: string } | null;
+    return row?.storage_path ?? null;
+  }
+
+  createUploadedFile(input: {
+    name: string;
+    originalName: string;
+    storagePath: string;
+    mimeType: string;
+    sizeBytes: number;
+    promptId?: string;
+    promptFieldName?: string;
+    reminderId?: string;
+  }): UploadedFile {
+    const row: UploadedFileRow = {
+      id: prefixedId("file"),
+      name: input.name.trim(),
+      original_name: input.originalName.trim(),
+      storage_path: input.storagePath,
+      mime_type: input.mimeType.trim(),
+      size_bytes: input.sizeBytes,
+      text_status: "none",
+      extracted_text: null,
+      reminder_id: input.reminderId ?? null,
+      prompt_id: input.promptId ?? null,
+      prompt_field_name: input.promptFieldName ?? null,
+      created_at: nowIso(),
+    };
+
+    this.database
+      .query(
+        `INSERT INTO uploaded_files (
+          id, name, original_name, storage_path, mime_type, size_bytes, text_status, extracted_text,
+          reminder_id, prompt_id, prompt_field_name, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+      )
+      .run(
+        row.id,
+        row.name,
+        row.original_name,
+        row.storage_path,
+        row.mime_type,
+        row.size_bytes,
+        row.text_status,
+        row.extracted_text,
+        row.reminder_id,
+        row.prompt_id,
+        row.prompt_field_name,
+        row.created_at,
+      );
+
+    return serializeUploadedFile(row);
+  }
+
+  replaceUploadedFileStorage(id: string, storagePath: string): UploadedFile {
+    this.database.query("UPDATE uploaded_files SET storage_path = ?2 WHERE id = ?1").run(id, storagePath);
+    const updated = this.getUploadedFile(id);
+    if (!updated) {
+      throw new Error(`Uploaded file not found: ${id}`);
+    }
+    return updated;
+  }
+
+  updateUploadedFileExtraction(id: string, input: { textStatus: UploadedFileTextStatus; extractedText?: string }): UploadedFile {
+    this.database
+      .query("UPDATE uploaded_files SET text_status = ?2, extracted_text = ?3 WHERE id = ?1")
+      .run(id, input.textStatus, input.extractedText ?? null);
+    const updated = this.getUploadedFile(id);
+    if (!updated) {
+      throw new Error(`Uploaded file not found: ${id}`);
+    }
+    return updated;
+  }
+
+  private resolveUploadedFileReferences(fileIds: string[] | undefined): UploadedFileReference[] {
+    if (!fileIds || fileIds.length === 0) {
+      return [];
+    }
+
+    return fileIds.map((id) => {
+      const file = this.getUploadedFile(id);
+      if (!file) {
+        throw new Error(`Uploaded file not found: ${id}`);
+      }
+      return {
+        id: file.id,
+        name: file.name,
+        mimeType: file.mimeType,
+        sizeBytes: file.sizeBytes,
+        textStatus: file.textStatus,
+      };
+    });
+  }
+
+  private linkUploadedFilesToReminder(reminderId: string, fileIds: string[]): void {
+    this.database.query("UPDATE uploaded_files SET reminder_id = NULL WHERE reminder_id = ?1").run(reminderId);
+    for (const fileId of fileIds) {
+      this.database.query("UPDATE uploaded_files SET reminder_id = ?2 WHERE id = ?1").run(fileId, reminderId);
+    }
   }
 
   private notifyReminderListeners(): void {

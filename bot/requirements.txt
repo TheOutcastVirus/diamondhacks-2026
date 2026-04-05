@@ -1,0 +1,5 @@
+openwakeword
+sounddevice
+numpy
+onnxruntime
+faster-whisper

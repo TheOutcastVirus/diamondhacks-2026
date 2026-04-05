@@ -7,9 +7,12 @@ const endpointMap: Record<EndpointKey, string> = {
   transcriptStream: '/api/transcript/stream',
   prompts: '/api/prompts',
   memory: '/api/memory',
+  files: '/api/files',
 };
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
+const defaultDevApiBaseUrl = import.meta.env.DEV ? 'http://127.0.0.1:8000' : '';
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+const apiBaseUrl = (configuredApiBaseUrl || defaultDevApiBaseUrl).replace(/\/$/, '');
 
 type QueryValue = string | number | boolean | null | undefined;
 type RequestOptions = Omit<RequestInit, 'body' | 'method'> & {
@@ -25,7 +28,7 @@ function resolvePath(endpoint: EndpointKey | string) {
   return endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
 }
 
-function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
+export function buildUrl(endpoint: EndpointKey | string, query?: Record<string, QueryValue>) {
   const path = resolvePath(endpoint);
   const url = new URL(`${apiBaseUrl}${path}`, window.location.origin);
 
@@ -108,6 +111,41 @@ export function patch<T>(
 
 export function del<T>(endpoint: EndpointKey | string, options?: Omit<RequestOptions, 'body'>) {
   return request<T>('DELETE', endpoint, options);
+}
+
+export async function postAudio(endpoint: EndpointKey | string, blob: Blob): Promise<ArrayBuffer> {
+  const form = new FormData();
+  form.append('audio', blob, 'recording.webm');
+  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  if (!response.ok) {
+    throw new ApiError(`Audio request failed`, response.status, null);
+  }
+  return response.arrayBuffer();
+}
+
+export async function uploadFile(
+  endpoint: EndpointKey | string,
+  file: File,
+  metadata: Record<string, string | undefined> = {},
+) {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value) {
+      form.append(key, value);
+    }
+  }
+
+  const response = await fetch(buildUrl(endpoint), { method: 'POST', body: form });
+  const payload = await parseResponse(response);
+  if (!response.ok) {
+    const message =
+      typeof payload === 'object' && payload !== null && 'message' in payload
+        ? String(payload.message)
+        : `Upload failed with status ${response.status}`;
+    throw new ApiError(message, response.status, payload);
+  }
+  return payload;
 }
 
 export function createEventStream(

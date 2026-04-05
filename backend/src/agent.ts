@@ -7,6 +7,8 @@ import type {
 } from "./contracts";
 import type { BrowserUseService } from "./browser-use";
 import type { GazabotDatabase } from "./db";
+import type { UploadedFileService } from "./files";
+import { DEFAULT_REMINDER_TIMEZONE, resolveReminderTimezone } from "./reminders";
 import type { TranscriptEventBus } from "./transcript-bus";
 
 // OpenAI-compatible types for Imagine API
@@ -58,9 +60,17 @@ const TOOL_DEFINITIONS = [
           cron: { type: "string", description: "5-field cron expression (e.g. '0 9 * * *' for 9am daily)" },
           cadence: { type: "string", enum: ["daily", "weekly", "custom"], description: "Recurrence type" },
           scheduleLabel: { type: "string", description: "Human-readable schedule description (e.g. 'Every day at 9am')" },
-          timezone: { type: "string", description: "IANA timezone name (e.g. 'America/New_York')" },
+          timezone: {
+            type: "string",
+            description: `Optional IANA timezone name (e.g. 'America/New_York'). Defaults to ${DEFAULT_REMINDER_TIMEZONE}.`,
+          },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional uploaded file ids to associate with the reminder.",
+          },
         },
-        required: ["title", "instructions", "cron", "cadence", "scheduleLabel", "timezone"],
+        required: ["title", "instructions", "cron", "cadence", "scheduleLabel"],
       },
     },
   },
@@ -81,6 +91,11 @@ const TOOL_DEFINITIONS = [
           scheduleLabel: { type: "string", description: "Updated human-readable schedule description" },
           timezone: { type: "string", description: "Updated IANA timezone name" },
           status: { type: "string", enum: ["active", "paused", "draft"], description: "Reminder status" },
+          attachmentFileIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Replace the reminder's attached uploaded files with these file ids.",
+          },
         },
         required: ["id"],
       },
@@ -113,16 +128,56 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "run_browser_task",
       description:
-        "Dispatch a browser automation task. Use for web searches, ordering items, checking websites, booking, or any task requiring internet browsing.",
+        "Dispatch a browser automation task. Use for web searches, ordering food (DoorDash, Uber Eats, Grubhub), pharmacy orders (CVS — OTC items and prescription refills), booking, checking websites, or any task requiring internet browsing. Before placing any order, ensure payment_card and delivery_address are stored in memory; if missing, call request_user_input first.",
       parameters: {
         type: "object",
         properties: {
           task: {
             type: "string",
-            description: "Detailed description of what to do in the browser",
+            description:
+              "Natural-language description of what to do. Examples: 'Order a large pepperoni pizza from Dominos on DoorDash', 'Get Tylenol from CVS', 'Refill prescription rx:RX1234567 from CVS', 'Search for the best sushi near me on Uber Eats'.",
           },
         },
         required: ["task"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_uploaded_files",
+      description:
+        "List all uploaded files available to the household, including filenames, types, reminder links, and whether text extraction succeeded.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_uploaded_file",
+      description:
+        "Read an uploaded file by id. Returns filename, file metadata, and the extracted plain-text clone when available so a text-only model can use the file contents.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to inspect" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "extract_pdf_text",
+      description:
+        "Force text extraction for an uploaded file by id, especially PDFs, screenshots, photos, and other documents where visible text matters. Use when you need OCR-style contents for a task.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Uploaded file id to extract text from" },
+        },
+        required: ["id"],
       },
     },
   },
@@ -187,7 +242,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "request_user_input",
       description:
-        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details). The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string, e.g.: [{"name":"card_number","label":"Card Number","type":"string","required":true},{"name":"cvv","label":"CVV","type":"password","required":true}]',
+        'Send a structured JSON-defined form to the user to collect information you need. Use when you require data the user must provide (e.g. payment details, address, medical background, preferences, household details, uploaded documents). Prefer discrete fields over one large textbox. For credit cards include cardholder_name, card_number, expiry_month, expiry_year, security_code, and billing address fields unless the site clearly needs less. For addresses include full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number, and delivery_instructions when relevant. For uploads use type "file" and optionally accept/multiple. The form appears on the frontend and the response is stored as structured memory. fields_json must be a valid JSON array string.',
       parameters: {
         type: "object",
         properties: {
@@ -205,7 +260,7 @@ const TOOL_DEFINITIONS = [
           fields_json: {
             type: "string",
             description:
-              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select","required":true|false}',
+              'JSON array of field objects. Each object: {"name":"snake_case_key","label":"Display Label","type":"string|text|int|float|boolean|password|date|select|file","required":true|false}. File fields may also include accept and multiple.',
           },
         },
         required: ["title", "fields_json"],
@@ -256,6 +311,7 @@ export class AgentHarness {
     private readonly config: AppConfig,
     private readonly database: GazabotDatabase,
     private readonly browserUseService: BrowserUseService,
+    private readonly uploadedFileService: UploadedFileService,
     private readonly transcriptBus: TranscriptEventBus,
   ) {}
 
@@ -286,6 +342,7 @@ export class AgentHarness {
   private buildMessages(request: AgentTurnRequest): ChatMessage[] {
     const reminders = this.database.listReminders();
     const memoryTitles = this.database.listMemoryTitles();
+    const uploadedFiles = this.database.listUploadedFiles();
     const allEntries = this.database.listTranscriptEntries();
     const history = allEntries.slice(-this.config.imagine.maxHistoryEntries);
 
@@ -298,14 +355,35 @@ export class AgentHarness {
       reminders.length === 0
         ? "No active reminders."
         : reminders
-            .map((r) => `- ${r.title} (${r.scheduleLabel}): ${r.instructions}`)
+            .map((r) => {
+              const attachmentSummary =
+                r.attachments && r.attachments.length > 0
+                  ? ` | attached files: ${r.attachments.map((attachment) => attachment.name).join(", ")}`
+                  : "";
+              return `- ${r.title} (${r.scheduleLabel}): ${r.instructions}${attachmentSummary}`;
+            })
+            .join("\n");
+
+    const uploadedFileSummary =
+      uploadedFiles.length === 0
+        ? "No uploaded files."
+        : uploadedFiles
+            .map((file) => {
+              const linkedReminder = file.reminderId ? ` -> reminder ${file.reminderId}` : "";
+              return `- ${file.id}: ${file.name} [${file.mimeType}, text=${file.textStatus}]${linkedReminder}`;
+            })
             .join("\n");
 
     const forceNote = request.forceBrowser
       ? "\n\nIMPORTANT: The user has explicitly requested this be handled via browser automation."
       : "";
 
-    const systemPrompt = `You are Gazabot, a helpful AI assistant for a household. You help manage reminders, browse the web, answer questions, and assist with daily tasks. Be concise and friendly.
+    const voiceNote =
+      request.source === "voice"
+        ? "\n\nThis is a VOICE interaction. Your reply will be spoken aloud automatically, so do NOT call the speak tool. Keep your response to 1-3 sentences."
+        : "\n\nUse the speak tool ONCE if you want to vocalize a reply.";
+
+    const systemPrompt = `You are Gazabot, a senior care assistant specializing in reminders, web tasks, food ordering, and daily questions. Be warm, concise, and friendly.
 
 Current date and time: ${new Date().toISOString()}
 
@@ -317,7 +395,29 @@ ${reminderSummary}
 
 When you learn something worth remembering about the user or household, call write_memory to store it.
 When information should stay machine-editable as JSON, use write_memory with content_json or request_user_input with a memory_key.
-When you want to speak a response aloud (for voice interactions), use the speak tool with the text you want vocalized. You can speak AND also return a text response.${forceNote}`;
+Available uploaded files (call list_uploaded_files or read_uploaded_file for details):
+${uploadedFileSummary}
+
+ORDERING CAPABILITIES:
+- Food ordering platforms: DoorDash, Uber Eats, Grubhub — use run_browser_task with the platform name in the task string.
+- Pharmacy: CVS.com — OTC items and prescription refills. For Rx refills, include the Rx number as 'rx:RX1234567' in the item name.
+- Before any order, check memory for 'payment_card' (fields: card_number, exp_month, exp_year, cvv, cardholder_name) and 'delivery_address' (fields: full_name, line_1, line_2, city, state_or_region, postal_code, country, phone_number). If either is missing, call request_user_input to collect it and write_memory to store it before dispatching run_browser_task.
+
+TOOL USE RULES - follow exactly:
+- Only call a tool if the user EXPLICITLY requests that action.
+- For greetings, questions, or conversation: respond in plain text, call NO tools.
+- Use run_browser_task ONLY if the user asks to search, order, book, or browse the web.
+- Use create_reminder ONLY if the user asks to set or schedule a reminder.
+- Use list_reminders ONLY if the user asks to see their reminders.
+- Never call more than one tool per turn unless strictly necessary.
+- Never repeat a tool call.
+- For reminders, use timezone ${DEFAULT_REMINDER_TIMEZONE} unless the user clearly asks for a different timezone. If no timezone is specified, you may omit the timezone field.
+- read_uploaded_file returns a text-only clone of the file. For images, prioritize the exact visible text and numbers from the image; any scene note is secondary and brief. Do not invent identities or scene details beyond what the extracted text supports.
+- When a user asks about an uploaded image, video, PDF, or document, use read_uploaded_file and rely on its contentText field as the file content you can reason over. If the user asks to extract text from an image, you only have access to the contentText. If the user absolutely wants to re-extract text, use the extract_pdf_text tool.
+- When you need specific user data (such as credit card information), prefer request_user_input over asking for free-form prose.
+- When a document could matter, request a file upload field or inspect existing uploaded files before proceeding.${voiceNote}${forceNote}
+- The run_browser_task tool hands off the task to another agent, who does not have access to the information you do. It is your job to supply the browser agent with all the information needed to complete the task (For example, when buying something, ensure to either collect credit card information and address information - request_user_input - or retrieve it from memory - read_memory - when available)
+- Whenever you call request_user_input, ensure to use the speak tool to notify the user that they have information to fill out through the web UI Requested Info panel.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -364,13 +464,17 @@ When you want to speak a response aloud (for voice interactions), use the speak 
         }
 
         case "create_reminder": {
+          const attachmentFileIds = Array.isArray(args.attachmentFileIds)
+            ? args.attachmentFileIds.map((value) => String(value))
+            : undefined;
           result = this.database.createReminder({
             title: String(args.title ?? ""),
             instructions: String(args.instructions ?? ""),
             cron: String(args.cron ?? ""),
             cadence: (args.cadence as ReminderCadence) ?? "custom",
             scheduleLabel: String(args.scheduleLabel ?? ""),
-            timezone: String(args.timezone ?? "UTC"),
+            timezone: resolveReminderTimezone(args.timezone),
+            ...(attachmentFileIds !== undefined && { attachmentFileIds }),
           });
           break;
         }
@@ -397,6 +501,9 @@ When you want to speak a response aloud (for voice interactions), use the speak 
           }
           if (args.status === "active" || args.status === "paused" || args.status === "draft") {
             update.status = args.status;
+          }
+          if (Array.isArray(args.attachmentFileIds)) {
+            update.attachmentFileIds = args.attachmentFileIds.map((value) => String(value));
           }
 
           result = this.database.updateReminder(String(args.id ?? ""), update as ReminderUpdateInput);
@@ -437,6 +544,44 @@ When you want to speak a response aloud (for voice interactions), use the speak 
 
           browserTask = { browserSessionId: session.id, previewUrl: session.previewUrl };
           result = browserTask;
+          break;
+        }
+
+        case "list_uploaded_files": {
+          result = this.database.listUploadedFiles();
+          break;
+        }
+
+        case "read_uploaded_file": {
+          const fileId = String(args.id ?? "");
+          const file = this.database.getUploadedFile(fileId);
+          if (!file) {
+            result = { error: "Uploaded file not found" };
+            break;
+          }
+          const extracted = file.textStatus === "ready" ? file : await this.uploadedFileService.extractTextIfPossible(fileId);
+          result = {
+            id: extracted.id,
+            name: extracted.name,
+            originalName: extracted.originalName,
+            mimeType: extracted.mimeType,
+            sizeBytes: extracted.sizeBytes,
+            textStatus: extracted.textStatus,
+            promptId: extracted.promptId,
+            promptFieldName: extracted.promptFieldName,
+            reminderId: extracted.reminderId,
+            contentText: extracted.extractedText ?? "",
+          };
+          break;
+        }
+
+        case "extract_pdf_text": {
+          const fileId = String(args.id ?? "");
+          const file = this.database.getUploadedFile(fileId);
+          result = file ?? { error: "Uploaded file not found" };
+          if (file) {
+            result = await this.uploadedFileService.extractTextIfPossible(fileId);
+          }
           break;
         }
 
@@ -575,41 +720,27 @@ When you want to speak a response aloud (for voice interactions), use the speak 
     }
   }
 
-  private async collectTurnMock(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    const browserHints = ["browser", "search", "look up", "lookup", "find", "open", "visit", "order", "book", "buy"];
-    const normalized = request.message.toLowerCase();
-    const isBrowser = request.forceBrowser === true || browserHints.some((h) => normalized.includes(h));
+  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
+    if (request.forceBrowser) {
+      const { browserTask } = await this.executeTool(
+        {
+          id: "forced_browser_task",
+          type: "function",
+          function: {
+            name: "run_browser_task",
+            arguments: JSON.stringify({ task: request.message }),
+          },
+        },
+        request.profileId,
+      );
 
-    if (isBrowser) {
-      const session = this.database.beginBrowserTask(request.message, request.profileId);
-      const queuedEntry = this.database.createTranscriptEntry({
-        kind: "tool",
-        role: "system",
-        text: `Queued browser task: ${request.message}`,
-        toolName: "browser-use",
-        toolStatus: "started",
-        metadata: { browserSessionId: session.id },
-      });
-      this.transcriptBus.publish("tool", queuedEntry);
-
-      const taskRequest: { browserSessionId: string; task: string; profileId?: string } = {
-        browserSessionId: session.id,
-        task: request.message,
-      };
-      if (request.profileId) {
-        taskRequest.profileId = request.profileId;
+      if (browserTask) {
+        return { kind: "browser_task", ...browserTask };
       }
-      void this.browserUseService.runBrowserTask(taskRequest);
-
-      return { kind: "browser_task", browserSessionId: session.id, previewUrl: session.previewUrl };
     }
 
-    return { kind: "text", text: "Agent has not been built yet" };
-  }
-
-  async collectTurn(request: AgentTurnRequest): Promise<AgentTurnResult> {
-    if (this.config.imagine.mockMode) {
-      return this.collectTurnMock(request);
+    if (!this.config.imagine.apiKey.trim()) {
+      throw new Error("INFERENCE_CLOUD_API_KEY is not configured. Set it in backend/.env.");
     }
 
     const messages = this.buildMessages(request);
