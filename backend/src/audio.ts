@@ -582,7 +582,12 @@ export class AudioService {
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
-        stderrTail += chunk.toString();
+        const text = chunk.toString();
+        stderrTail += text;
+
+        if (text.includes("silence_start") || text.includes("silence_end")) {
+          process.stderr.write(`[ffmpeg:silence] ${text}`);
+        }
 
         if (!maxTimer && !stopped) {
           maxTimer = setTimeout(stop, maxDuration * 1000);
