@@ -58,15 +58,20 @@ body,
 
 body {
   margin: 0;
+  min-height: 100vh;
   font: 16px/1.55 var(--font-body);
   color: var(--color-ink);
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--color-accent) 8%, transparent), transparent 28%),
+    linear-gradient(180deg, var(--color-bg) 0%, color-mix(in srgb, var(--color-bg-strong) 82%, var(--color-bg)) 100%);
 }
 
 div.app-shell {
-  width: 100%;
-  min-height: 100vh;
+  width: min(100%, 120rem);
+  min-height: 100dvh;
+  margin: 0 auto;
   display: grid;
-  grid-template-columns: 16rem minmax(0, 1fr);
+  grid-template-columns: clamp(15rem, 18vw, 18rem) minmax(0, 1fr);
 }
 
 aside.sidebar,
@@ -77,11 +82,11 @@ main.workspace {
 aside.sidebar {
   border-radius: var(--radius-shell);
   border-right: 0px;
-  padding: 2rem;
+  padding: clamp(1.25rem, 2vw, 2rem);
   display: flex;
   flex-direction: column;
   gap: 1rem;
-  height: 100vh;
+  min-height: 100dvh;
   position: sticky;
   box-sizing: border-box;
   border-right: var(--border-width) solid var(--color-line);
@@ -90,7 +95,9 @@ aside.sidebar {
 
 main.workspace {
   border-radius: var(--radius-shell);
-  padding: 1.25rem;
+  min-width: 0;
+  min-height: 100dvh;
+  padding: clamp(1rem, 2vw, 2rem);
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -205,9 +212,32 @@ article.action-card {
   }
 
   aside.sidebar {
+    position: static;
+    top: auto;
     min-height: auto;
-    border-right: 1px solid var(--color-line);
-    border-bottom: 0;
+    border-right: 0;
+    border-bottom: var(--border-width) solid var(--color-line);
+    gap: 0.875rem;
+  }
+
+  nav.navigation {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  button.nav-link {
+    margin-top: 0;
+    flex: 1 1 10rem;
+  }
+
+  button.toggle {
+    margin-top: 0;
+    align-self: flex-start;
+  }
+
+  main.workspace {
+    min-height: auto;
   }
 }
 

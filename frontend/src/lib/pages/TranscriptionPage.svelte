@@ -4,7 +4,7 @@
   import type { ToolStatus, TranscriptEntry, TranscriptKind, TranscriptRole } from '../types';
   import VoiceInput from '../components/VoiceInput.svelte';
 
-  type StreamState = 'connecting' | 'live' | 'offline' | 'error';
+  type StreamState = 'connecting' | 'live' | 'offline';
   type FilterMode = 'all' | 'message' | 'tool';
 
   let entries: TranscriptEntry[] = [];
@@ -169,8 +169,12 @@
     };
 
     source.onerror = () => {
-      streamState = 'error';
-      streamError = 'The live transcription stream disconnected. Reconnect to resume.';
+      if (eventSource !== source) {
+        return;
+      }
+
+      streamState = source.readyState === EventSource.CLOSED ? 'offline' : 'connecting';
+      streamError = '';
     };
 
     source.onmessage = (event) => processMessage('message', event);
@@ -350,15 +354,36 @@
     --tx-r-sm: 8px;
     --tx-ease: cubic-bezier(0.16, 1, 0.3, 1);
     display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(17rem, 22rem);
-    gap: 1.25rem;
-    align-items: start;
+    grid-template-columns: minmax(0, 1.6fr) minmax(18rem, 25rem);
+    gap: clamp(1rem, 1.8vw, 1.75rem);
+    align-items: stretch;
+    width: min(100%, 110rem);
+    margin: 0 auto;
+    min-block-size: clamp(38rem, calc(100dvh - 11rem), 72rem);
   }
 
-  section.panel {
+  section.page-grid.tx-console > * {
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .panel {
     display: flex;
     flex-direction: column;
     gap: 0.875rem;
+  }
+
+  section.panel-feed {
+    min-height: 0;
+  }
+
+  aside.panel-sidebar {
+    min-height: 0;
+    position: sticky;
+    top: clamp(1rem, 2vw, 1.5rem);
+    max-block-size: calc(100dvh - clamp(2rem, 4vw, 3rem));
+    overflow: auto;
+    padding-right: 0.1rem;
   }
 
   /* Feed chrome */
@@ -495,8 +520,9 @@
   div.feed {
     position: relative;
     isolation: isolate;
-    min-height: 32rem;
-    max-height: min(62vh, 720px);
+    min-height: 0;
+    flex: 1 1 auto;
+    block-size: 100%;
     overflow: auto;
     scroll-behavior: smooth;
     border-radius: var(--tx-r);
@@ -787,12 +813,6 @@
     background: color-mix(in srgb, var(--color-warning) 10%, transparent);
   }
 
-  span.state-error {
-    color: var(--color-danger);
-    border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-line));
-    background: color-mix(in srgb, var(--color-danger) 10%, transparent);
-  }
-
   span.state-offline {
     color: var(--color-ink-soft);
   }
@@ -827,10 +847,6 @@
   span.live-connecting {
     background: var(--color-warning);
     animation: tx-connect-pulse 1.1s var(--tx-ease) infinite;
-  }
-
-  span.live-error {
-    background: var(--color-danger);
   }
 
   span.live-offline {
@@ -968,10 +984,35 @@
   @media (max-width: 1080px) {
     section.page-grid.tx-console {
       grid-template-columns: 1fr;
+      width: 100%;
+      min-block-size: auto;
+    }
+
+    section.panel-feed {
+      min-block-size: min(44rem, calc(100dvh - 18rem));
+    }
+
+    aside.panel-sidebar {
+      position: static;
+      max-block-size: none;
+      overflow: visible;
+      padding-right: 0;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+    }
+
+    section.connection-card,
+    section.metrics {
+      grid-column: 1 / -1;
     }
   }
 
   @media (max-width: 720px) {
+    section.page-grid.tx-console {
+      gap: 1rem;
+    }
+
     header.feed-toolbar {
       flex-direction: column;
       align-items: stretch;
@@ -1023,9 +1064,12 @@
       text-align: center;
     }
 
+    aside.panel-sidebar {
+      display: flex;
+    }
+
     div.feed {
-      max-height: none;
-      min-height: 22rem;
+      min-height: clamp(20rem, 48dvh, 30rem);
     }
   }
 </style>
