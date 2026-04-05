@@ -1029,6 +1029,36 @@ export class GazabotApp {
     });
     this.transcriptBus.publish("tool", responseEntry);
 
+    const hitlRequest = this.database.findPendingHitlByPromptId(promptId);
+    if (hitlRequest) {
+      this.database.resolveHitlRequest(hitlRequest.id);
+
+      const resumeEntry = this.database.createTranscriptEntry({
+        kind: "tool",
+        role: "system",
+        text: "Resuming browser task with your information.",
+        toolName: "browser-use-hitl",
+        toolStatus: "started",
+        metadata: {
+          promptId: completed.id,
+          hitlRequestId: hitlRequest.id,
+          needKind: hitlRequest.needKind,
+          browserSessionId: hitlRequest.browserSessionId,
+        },
+      });
+      const robotResume = this.database.createTranscriptEntry({
+        kind: "message",
+        role: "robot",
+        text: "Resuming the browser task with the information you provided.",
+      });
+      this.transcriptBus.publish("tool", resumeEntry);
+      this.transcriptBus.publish("transcript", robotResume);
+
+      void this.browserUseService.resumeHitlRequest(hitlRequest).catch((error) => {
+        console.error("[browser-use] Failed to resume HITL request:", error);
+      });
+    }
+
     return { prompt: completed, memoryEntry };
   }
 

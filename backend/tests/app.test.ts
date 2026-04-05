@@ -328,6 +328,88 @@ describe("Gazabot Bun backend", () => {
     }
   });
 
+  test("defaults agent-created reminders to Los Angeles when timezone is omitted", async () => {
+    let completionRound = 0;
+    const restore = withFetchStub(async (url) => {
+      if (url.includes("/chat/completions")) {
+        completionRound += 1;
+        if (completionRound === 1) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_1",
+                      type: "function",
+                      function: {
+                        name: "create_reminder",
+                        arguments: JSON.stringify({
+                          title: "Morning medication",
+                          instructions: "Prompt for the morning pills.",
+                          cadence: "daily",
+                          cron: "0 9 * * *",
+                          scheduleLabel: "Every day at 09:00",
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+
+        return jsonResponse({
+          choices: [
+            {
+              message: { role: "assistant", content: "Reminder saved.", tool_calls: undefined },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+
+      return new Response(`unexpected fetch: ${url}`, { status: 501 });
+    });
+
+    try {
+      const { app, database } = createTestApp();
+
+      try {
+        const response = await app.fetch(
+          new Request("http://localhost/api/agent/turn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: "Set a daily medication reminder for 9am.",
+              source: "guardian",
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const payload = (await response.json()) as Record<string, unknown>;
+        expect(payload.route).toBe("conversation");
+        expect(payload.reply).toBe("Reminder saved.");
+
+        const remindersResponse = await app.fetch(new Request("http://localhost/api/reminders"));
+        expect(remindersResponse.status).toBe(200);
+        const remindersPayload = (await remindersResponse.json()) as { reminders: Array<Record<string, unknown>> };
+        expect(remindersPayload.reminders).toHaveLength(1);
+        expect(remindersPayload.reminders[0]?.timezone).toBe("America/Los_Angeles");
+      } finally {
+        app.close();
+        database.close();
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("reuses deterministic rerun workspaces for repeat merchant orders", async () => {
     const sessionBodies: Array<Record<string, unknown>> = [];
     let workspaceCreates = 0;

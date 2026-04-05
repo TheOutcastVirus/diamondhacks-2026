@@ -179,6 +179,101 @@ async function resolveRecordingCommandWithSilence(
   return withSilenceFilter(await resolveRecordingCommand(outputPath), silenceDb, silenceDuration);
 }
 
+export function recordingArgsForPlatform(os: NodeJS.Platform, outputPath: string): AudioCommand {
+  switch (os) {
+    case "darwin":
+      return {
+        cmd: "ffmpeg",
+        args: ["-hide_banner", "-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-y", outputPath],
+      };
+    case "linux":
+      // Linux (ALSA); works with PulseAudio/PipeWire via the ALSA plugin on most deployments.
+      return {
+        cmd: "ffmpeg",
+        args: ["-hide_banner", "-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-y", outputPath],
+      };
+    case "win32":
+      return openAlRecordingArgs("", outputPath);
+    default:
+      throw unsupportedPlatformError("recording", os);
+  }
+}
+
+export function playbackArgsForPlatform(os: NodeJS.Platform, audioPath: string): AudioCommand {
+  switch (os) {
+    case "darwin":
+      return { cmd: "afplay", args: [audioPath] };
+    case "linux":
+    case "win32":
+      return {
+        cmd: "ffplay",
+        args: ["-nodisp", "-autoexit", "-loglevel", "quiet", audioPath],
+      };
+    default:
+      throw unsupportedPlatformError("playback", os);
+  }
+}
+
+function runCommandCapture(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
+      const combined = `${stdout ?? ""}\n${stderr ?? ""}`;
+      if (error) {
+        const code = typeof error.code === "number" ? error.code : undefined;
+        const text = combined.trim();
+        if (code === 1 || code === 234) {
+          resolve(text);
+          return;
+        }
+
+        reject(new Error(text || error.message));
+        return;
+      }
+
+      resolve(combined.trim());
+    });
+  });
+}
+
+export function parseOpenAlCaptureDevices(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\[[^\]]+\]\s{2,}(.+?)\s*$/)?.[1] ?? "")
+    .filter((line) => line.length > 0);
+}
+
+export function parseDshowAudioDevices(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\[[^\]]+\]\s+"(.+)"\s+\(audio\)$/)?.[1] ?? "")
+    .filter((line) => line.length > 0);
+}
+
+async function probeWindowsRecordingCommand(outputPath: string): Promise<AudioCommand> {
+  const openAlOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "openal", "-i", "dummy"]);
+  const openAlDevices = parseOpenAlCaptureDevices(openAlOutput);
+  if (openAlDevices.length > 0) {
+    return openAlRecordingArgs(openAlDevices[0] ?? "", outputPath);
+  }
+
+  const dshowOutput = await runCommandCapture("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+  const dshowDevices = parseDshowAudioDevices(dshowOutput);
+  if (dshowDevices.length > 0) {
+    return dshowRecordingArgs(dshowDevices[0] ?? "", outputPath);
+  }
+
+  throw new Error("No Windows audio capture device was found via ffmpeg (checked OpenAL and DirectShow).");
+}
+
+async function resolveRecordingCommand(outputPath: string): Promise<AudioCommand> {
+  const os = platform();
+  if (os === "win32") {
+    return probeWindowsRecordingCommand(outputPath);
+  }
+
+  return recordingArgsForPlatform(os, outputPath);
+}
+
 export class AudioService {
   private proc: ReturnType<typeof spawn> | null = null;
   private recordingPath: string | null = null;
