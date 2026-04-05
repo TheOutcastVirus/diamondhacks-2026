@@ -1136,20 +1136,37 @@ export class GazabotApp {
     let sttFinishedAt = recordingStartedAt;
     try {
       this.setInteractionPhase("conversation", "user_listening");
-      const session = await this.sttService.createRealtimeSession();
-      await this.audioService.recordPcmWithSileroVad(
-        (chunk) => session.sendAudio(chunk),
-        { silenceDuration: 1.0, speechThreshold: 0.5, maxDuration: 10 },
-      );
-      recordingStoppedAt = Date.now();
-      console.log(
-        `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
-      );
-      transcript = await session.finalize();
-      sttFinishedAt = Date.now();
-      console.log(
-        `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
-      );
+      if (process.platform === "win32") {
+        const audioBuffer = await this.audioService.recordUntilSilence({
+          silenceDb: -30,
+          silenceDuration: 1,
+          maxDuration: 10,
+        });
+        recordingStoppedAt = Date.now();
+        console.log(
+          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
+        );
+        transcript = await this.sttService.transcribe(audioBuffer);
+        sttFinishedAt = Date.now();
+        console.log(
+          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
+        );
+      } else {
+        const session = await this.sttService.createRealtimeSession();
+        await this.audioService.recordPcmUntilSilence(
+          (chunk) => session.sendAudio(chunk),
+          { silenceDb: -30, silenceDuration: 1.2, maxDuration: 10 },
+        );
+        recordingStoppedAt = Date.now();
+        console.log(
+          `[conversation] Recording stopped +${((recordingStoppedAt - recordingStartedAt) / 1000).toFixed(1)}s`,
+        );
+        transcript = await session.finalize();
+        sttFinishedAt = Date.now();
+        console.log(
+          `[conversation] STT done          +${((sttFinishedAt - recordingStoppedAt) / 1000).toFixed(1)}s`,
+        );
+      }
     } catch (err) {
       console.error("[conversation] Recording failed:", err);
       this.resetConversationTimer();
