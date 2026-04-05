@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config";
 import type {
+  AgentModel,
   AgentTurnRequest,
   PromptField,
   ReminderCadence,
@@ -33,6 +34,15 @@ type ChatCompletionResponse = {
     message: ChatMessage;
     finish_reason: string;
   }>;
+};
+
+type GeminiPart =
+  | { text: string }
+  | { functionCall: { name: string; args?: Record<string, unknown> } };
+
+type GeminiContent = {
+  role: "user" | "model";
+  parts: GeminiPart[];
 };
 
 export type AgentTurnResult =
@@ -366,6 +376,10 @@ export class AgentHarness {
     private readonly transcriptBus: TranscriptEventBus,
   ) {}
 
+  private resolveRequestedModel(request: AgentTurnRequest): AgentModel {
+    return request.model ?? "imagine";
+  }
+
   private async callImagine(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
     const response = await fetch(`${this.config.imagine.endpoint}/chat/completions`, {
       method: "POST",
@@ -388,6 +402,198 @@ export class AgentHarness {
     }
 
     return response.json() as Promise<ChatCompletionResponse>;
+  }
+
+  private buildGeminiContents(messages: ChatMessage[]): GeminiContent[] {
+    const contents: GeminiContent[] = [];
+    const toolNamesById = new Map<string, string>();
+
+    for (const message of messages) {
+      if (message.role === "system") {
+        continue;
+      }
+
+      if (message.role === "tool") {
+        const toolName = message.tool_call_id ? toolNamesById.get(message.tool_call_id) : undefined;
+        if (!toolName) {
+          continue;
+        }
+
+        let responsePayload: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(message.content ?? "{}") as unknown;
+          responsePayload =
+            typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : { result: parsed };
+        } catch {
+          responsePayload = { result: message.content ?? "" };
+        }
+
+        contents.push({
+          role: "user",
+          parts: [{ text: `Tool result from ${toolName}: ${JSON.stringify(responsePayload)}` }],
+        });
+        continue;
+      }
+
+      const role: GeminiContent["role"] = message.role === "assistant" ? "model" : "user";
+      const parts: GeminiPart[] = [];
+
+      if (typeof message.content === "string" && message.content.trim()) {
+        parts.push({ text: message.content });
+      }
+
+      if (message.tool_calls?.length) {
+        for (const toolCall of message.tool_calls) {
+          toolNamesById.set(toolCall.id, toolCall.function.name);
+
+          let args: Record<string, unknown> = {};
+          try {
+            const parsed = JSON.parse(toolCall.function.arguments) as unknown;
+            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+              args = parsed as Record<string, unknown>;
+            }
+          } catch {
+            args = {};
+          }
+
+          parts.push({
+            text: `Tool call requested: ${toolCall.function.name}(${JSON.stringify(args)})`,
+          });
+        }
+      }
+
+      if (parts.length === 0) {
+        continue;
+      }
+
+      contents.push({ role, parts });
+    }
+
+    return contents;
+  }
+
+  private normalizeGeminiResponse(payload: unknown): ChatCompletionResponse {
+    const record = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {};
+    const candidates = Array.isArray(record.candidates) ? record.candidates : [];
+    const candidate =
+      candidates.length > 0 && typeof candidates[0] === "object" && candidates[0] !== null
+        ? (candidates[0] as Record<string, unknown>)
+        : null;
+
+    if (!candidate) {
+      return { choices: [] };
+    }
+
+    const content =
+      typeof candidate.content === "object" && candidate.content !== null
+        ? (candidate.content as Record<string, unknown>)
+        : {};
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+
+    const textParts: string[] = [];
+    const toolCalls: ToolCall[] = [];
+
+    for (const [index, partValue] of parts.entries()) {
+      const part = typeof partValue === "object" && partValue !== null ? (partValue as Record<string, unknown>) : {};
+
+      if (typeof part.text === "string" && part.text.trim()) {
+        textParts.push(part.text);
+      }
+
+      if (typeof part.functionCall === "object" && part.functionCall !== null) {
+        const functionCall = part.functionCall as Record<string, unknown>;
+        const name = typeof functionCall.name === "string" ? functionCall.name : "";
+        const args =
+          typeof functionCall.args === "object" && functionCall.args !== null && !Array.isArray(functionCall.args)
+            ? (functionCall.args as Record<string, unknown>)
+            : {};
+
+        if (name) {
+          toolCalls.push({
+            id: `gemini-tool-${Date.now()}-${index}`,
+            type: "function",
+            function: {
+              name,
+              arguments: JSON.stringify(args),
+            },
+          });
+        }
+      }
+    }
+
+    return {
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: textParts.join("\n").trim() || null,
+            ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          },
+          finish_reason: toolCalls.length > 0 ? "tool_calls" : String(candidate.finishReason ?? "stop").toLowerCase(),
+        },
+      ],
+    };
+  }
+
+  private async callGemini(messages: ChatMessage[]): Promise<ChatCompletionResponse> {
+    try {
+      const apiKey = this.config.googleAi.apiKey?.trim();
+      if (!apiKey) {
+        throw new Error("GOOGLE_AI_API_KEY is not configured. Set it in backend/.env.");
+      }
+
+      const systemMessage = messages.find((message) => message.role === "system")?.content ?? "";
+      const contents = this.buildGeminiContents(messages);
+
+      const response = await fetch(
+        `${this.config.googleAi.baseUrl}/models/${encodeURIComponent(this.config.googleAi.agentModel)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemMessage }] },
+            contents,
+            tools: [
+              {
+                functionDeclarations: TOOL_DEFINITIONS.map((definition) => definition.function),
+              },
+            ],
+            toolConfig: {
+              functionCallingConfig: {
+                mode: "AUTO",
+              },
+            },
+            generationConfig: {
+              maxOutputTokens: this.config.imagine.maxTokens,
+            },
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Gemini API error ${response.status} for model "${this.config.googleAi.agentModel}": ${body}`);
+      }
+
+      return this.normalizeGeminiResponse(await response.json());
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Gemini request failed: ${String(error)}`);
+    }
+  }
+
+  private async callModel(messages: ChatMessage[], model: AgentModel): Promise<ChatCompletionResponse> {
+    if (model === "gemini-fast") {
+      return this.callGemini(messages);
+    }
+
+    return this.callImagine(messages);
   }
 
   private buildMessages(request: AgentTurnRequest): ChatMessage[] {
@@ -485,7 +691,11 @@ Files and forms:
 - Whenever you call request_user_input, use the speak tool so the user knows to check the Requested Info panel in the web UI.
 
 Ending:
-- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.`;
+- Call end_conversation when the user clearly signals they are done (e.g. "no", "stop", "goodbye", "that's all", or by declining a follow-up offer). After calling it, say a brief farewell in your next reply.
+
+
+Important:
+You are currently talking in a voice conversation. Keep your responses short. Any non-tool call output will be spoken.`;
 
     const messages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
 
@@ -869,15 +1079,19 @@ Ending:
       };
     }
 
-    if (!this.config.imagine.apiKey.trim()) {
+    const selectedModel = this.resolveRequestedModel(request);
+    if (selectedModel === "imagine" && !this.config.imagine.apiKey.trim()) {
       throw new Error("INFERENCE_CLOUD_API_KEY is not configured. Set it in backend/.env.");
+    }
+    if (selectedModel === "gemini-fast" && !this.config.googleAi.apiKey?.trim()) {
+      throw new Error("GOOGLE_AI_API_KEY is not configured. Set it in backend/.env.");
     }
 
     const messages = this.buildMessages(request);
     let browserTask: { browserSessionId: string; previewUrl: string | null } | undefined;
 
     for (let iteration = 0; iteration < 10; iteration++) {
-      const response = await this.callImagine(pruneMessages(messages));
+      const response = await this.callModel(pruneMessages(messages), selectedModel);
       const choice = response.choices[0];
       if (!choice) break;
 
@@ -919,7 +1133,7 @@ Ending:
         }
         // Let the model produce a farewell text before we signal end_conversation
         if (endConversation) {
-          const farewell = await this.callImagine(pruneMessages(messages));
+          const farewell = await this.callModel(pruneMessages(messages), selectedModel);
           const farewellText = (farewell.choices[0]?.message.content ?? "").replace(/<\|eom_id\|>.*$/s, "").trim();
           return { kind: "end_conversation", text: farewellText };
         }
