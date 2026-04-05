@@ -38,17 +38,18 @@ export class SttService {
    */
   async createRealtimeSession(): Promise<RealtimeSession> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const transcriber = this.client.realtime.transcriber({
+    const transcriber = (this.client.streaming as any).transcriber({
       sampleRate: 16000,
       encoding: "pcm_s16le",
       apiKey: this.config.assemblyAi.apiKey,
-    } as any);
+    });
 
     const finalParts: string[] = [];
 
-    transcriber.on("transcript", (t) => {
-      if (t.message_type === "FinalTranscript" && t.text?.trim()) {
-        finalParts.push(t.text.trim());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    transcriber.on("turn", (turn: any) => {
+      if (turn.transcript?.trim()) {
+        finalParts.push(turn.transcript.trim());
       }
     });
 
