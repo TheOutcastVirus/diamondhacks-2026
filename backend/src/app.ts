@@ -1096,7 +1096,7 @@ export class GazabotApp {
       this.setInteractionPhase("conversation", "user_listening");
       if (process.platform === "win32") {
         const audioBuffer = await this.audioService.recordUntilSilence({
-          silenceDb: -20,
+          silenceDb: -30,
           silenceDuration: 1,
           maxDuration: 10,
         });
@@ -1113,7 +1113,7 @@ export class GazabotApp {
         const session = await this.sttService.createRealtimeSession();
         await this.audioService.recordPcmUntilSilence(
           (chunk) => session.sendAudio(chunk),
-          { silenceDb: -20, silenceDuration: 1, maxDuration: 10 },
+          { silenceDb: -35, silenceDuration: 1.2, maxDuration: 10 },
         );
         recordingStoppedAt = Date.now();
         console.log(
