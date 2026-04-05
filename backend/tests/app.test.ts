@@ -7,7 +7,7 @@ import { parseDshowAudioDevices, parseOpenAlCaptureDevices, playbackArgsForPlatf
 import { detectCrisis } from "../src/crisis";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
-import { GazabotDatabase } from "../src/db";
+import { SodiumDatabase } from "../src/db";
 
 const cleanupPaths: string[] = [];
 
@@ -54,11 +54,11 @@ async function removePathWithRetries(path: string): Promise<void> {
 }
 
 function createTestApp(overrides: Record<string, string> = {}) {
-  const directory = mkdtempSync(join(tmpdir(), "gazabot-backend-"));
+  const directory = mkdtempSync(join(tmpdir(), "sodium-backend-"));
   cleanupPaths.push(directory);
 
   const config = loadConfig({
-    APP_NAME: "Gazabot Backend Test",
+    APP_NAME: "Sodium Backend Test",
     DATABASE_PATH: join(directory, "test.sqlite"),
     UPLOADS_DIR: join(directory, "uploads"),
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
@@ -71,7 +71,7 @@ function createTestApp(overrides: Record<string, string> = {}) {
     REMINDER_POLL_INTERVAL_MS: "25",
     ...overrides,
   });
-  const database = new GazabotDatabase(config.databasePath);
+  const database = new SodiumDatabase(config.databasePath);
   const app = createApp(config, database);
 
   return { app, database };
@@ -86,7 +86,7 @@ afterEach(async () => {
   }
 });
 
-describe("Gazabot Bun backend", () => {
+describe("Sodium Bun backend", () => {
   test("detects crisis phrases conservatively", () => {
     expect(detectCrisis("I'm hurt").triggered).toBe(true);
     expect(detectCrisis("I'm in trouble and need my family").triggered).toBe(true);
@@ -1023,7 +1023,7 @@ describe("Gazabot Bun backend", () => {
       try {
         const result = await privateApp.processVoiceAudio(Buffer.from("voice-audio"));
         expect(result.replyText).toBe("Goodbye for now.");
-        expect(capturedSystemPrompt).toContain("You are Gazabot");
+        expect(capturedSystemPrompt).toContain("You are Sodium");
         expect(capturedSystemPrompt).toContain("Turn type: voice.");
         expect(capturedSystemPrompt).toContain("Current date and time:");
       } finally {
@@ -1183,7 +1183,7 @@ describe("Gazabot Bun backend", () => {
         expect(memories.length).toBeGreaterThan(0);
         expect(memories[0]?.title).toStartWith("past_conversation_");
         expect(String(memories[0]?.content ?? "")).toContain("User: That's all, goodbye.");
-        expect(String(memories[0]?.content ?? "")).toContain("Gazabot: Goodbye for now.");
+        expect(String(memories[0]?.content ?? "")).toContain("Sodium: Goodbye for now.");
       } finally {
         app.close();
         database.close();
@@ -2714,8 +2714,8 @@ trailer <<>>
 
   test("invalid Browser Use model falls back to bu-max", () => {
     const config = loadConfig({
-      APP_NAME: "Gazabot Backend Test",
-      DATABASE_PATH: join(tmpdir(), "gazabot-invalid-model.sqlite"),
+      APP_NAME: "Sodium Backend Test",
+      DATABASE_PATH: join(tmpdir(), "sodium-invalid-model.sqlite"),
       INFERENCE_CLOUD_API_KEY: "test-inference-key",
       BROWSER_USE_API_KEY: "test-browser-key",
       BROWSER_USE_MODEL: "not-a-real-browser-use-model",
@@ -2726,8 +2726,8 @@ trailer <<>>
 
   test("legacy Browser Use model aliases to bu-max", () => {
     const config = loadConfig({
-      APP_NAME: "Gazabot Backend Test",
-      DATABASE_PATH: join(tmpdir(), "gazabot-legacy-model.sqlite"),
+      APP_NAME: "Sodium Backend Test",
+      DATABASE_PATH: join(tmpdir(), "sodium-legacy-model.sqlite"),
       INFERENCE_CLOUD_API_KEY: "test-inference-key",
       BROWSER_USE_API_KEY: "test-browser-key",
       BROWSER_USE_MODEL: "gemini-3.1-flash",
@@ -2738,8 +2738,8 @@ trailer <<>>
 
   test("bu-medium aliases to bu-max", () => {
     const config = loadConfig({
-      APP_NAME: "Gazabot Backend Test",
-      DATABASE_PATH: join(tmpdir(), "gazabot-bu-medium-model.sqlite"),
+      APP_NAME: "Sodium Backend Test",
+      DATABASE_PATH: join(tmpdir(), "sodium-bu-medium-model.sqlite"),
       INFERENCE_CLOUD_API_KEY: "test-inference-key",
       BROWSER_USE_API_KEY: "test-browser-key",
       BROWSER_USE_MODEL: "bu-medium",

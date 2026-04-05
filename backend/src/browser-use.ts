@@ -1,7 +1,7 @@
 import type { AppConfig } from "./config";
 import type { BrowserStatus, HitlNeed, HitlNeedKind, HitlRequest, PromptField } from "./contracts";
 import type { BrowserTaskTemplate } from "./db";
-import { GazabotDatabase } from "./db";
+import { SodiumDatabase } from "./db";
 import { TranscriptEventBus } from "./transcript-bus";
 import {
   buildCvsTask,
@@ -159,7 +159,7 @@ function formatBrowserFailureForUser(message: string): string {
  * Stored in `browser_task_templates.workspace_id` when Browser Use rejects creating a workspace.
  * Never send this value to the Cloud API as `workspaceId`.
  */
-const BROWSER_WORKSPACE_SKIPPED_MARKER = "gazabot:workspace_skipped";
+const BROWSER_WORKSPACE_SKIPPED_MARKER = "sodium:workspace_skipped";
 
 function effectiveBrowserWorkspaceId(stored: string | null | undefined): string | undefined {
   if (!stored || stored === BROWSER_WORKSPACE_SKIPPED_MARKER) {
@@ -419,7 +419,7 @@ export class BrowserUseService {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
     private readonly transcriptBus: TranscriptEventBus,
   ) {}
 
@@ -529,7 +529,7 @@ export class BrowserUseService {
       const summary = extractSummary(completedSession.output);
       const failed = ["failed", "stopped"].includes(normalizeCloudStatus(completedSession.status));
 
-      const resumedUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const resumedUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: hitlRequest.browserSessionId,
         status: failed ? "blocked" : "idle",
         summary,
@@ -726,7 +726,7 @@ export class BrowserUseService {
         return;
       }
 
-      const initialUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const initialUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
         status: toBrowserStatus(initialSession.status),
         summary: "Browser Use is working on the task.",
@@ -905,7 +905,7 @@ export class BrowserUseService {
           memoryLabel: promptTitle,
         });
 
-        const hitlRequestCreateInput: Parameters<GazabotDatabase["createHitlRequest"]>[0] = {
+        const hitlRequestCreateInput: Parameters<SodiumDatabase["createHitlRequest"]>[0] = {
           browserSessionId: input.browserSessionId,
           remoteSessionId: currentSession.id,
           promptId: prompt.id,
@@ -956,7 +956,7 @@ export class BrowserUseService {
           : summary;
       const cacheStatus = this.describeCacheOutcome(preparedTask, finalSession);
 
-      const finalUpdate: Parameters<GazabotDatabase["updateBrowserSession"]>[0] = {
+      const finalUpdate: Parameters<SodiumDatabase["updateBrowserSession"]>[0] = {
         browserSessionId: input.browserSessionId,
         status: failed ? "blocked" : "idle",
         summary: cacheStatus ? `${resolvedSummary} ${cacheStatus}` : resolvedSummary,

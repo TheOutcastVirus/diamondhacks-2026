@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config";
-import type { GazabotDatabase } from "./db";
+import type { SodiumDatabase } from "./db";
 import type { Reminder } from "./contracts";
 
 type ReminderFirePayload = {
@@ -32,7 +32,7 @@ export class ReminderScheduler {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: GazabotDatabase,
+    private readonly database: SodiumDatabase,
     private readonly executeReminder: ReminderCallback,
   ) {}
 
