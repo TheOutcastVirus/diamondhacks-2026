@@ -34,6 +34,15 @@ export type AppConfig = {
     chunkDelayMs: number;
     conversationTimeoutSeconds: number;
   };
+  crisis: {
+    enabled: boolean;
+    callCooldownSeconds: number;
+  };
+  bland: {
+    apiKey?: string;
+    pathwayId?: string;
+    baseUrl: string;
+  };
   imagine: {
     apiKey: string;
     endpoint: string;
@@ -196,6 +205,18 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
     maxHistoryEntries: parseInteger(source.INFERENCE_CLOUD_MAX_HISTORY, 20),
   };
 
+  const bland: AppConfig["bland"] = {
+    baseUrl: source.BLAND_BASE_URL?.trim() || "https://api.bland.ai",
+  };
+  const blandApiKey = source.BLAND_API_KEY?.trim();
+  const blandPathwayId = source.BLAND_PATHWAY_ID?.trim();
+  if (blandApiKey) {
+    bland.apiKey = blandApiKey;
+  }
+  if (blandPathwayId) {
+    bland.pathwayId = blandPathwayId;
+  }
+
   const tts: AppConfig["tts"] = {};
   const ttsEndpoint = source.TTS_ENDPOINT?.trim();
   if (ttsEndpoint) {
@@ -229,6 +250,11 @@ export function loadConfig(source: EnvSource = process.env): AppConfig {
       chunkDelayMs: parseInteger(source.AGENT_CHUNK_DELAY_MS, 140),
       conversationTimeoutSeconds: parseInteger(source.CONVERSATION_TIMEOUT_SECONDS, 10),
     },
+    crisis: {
+      enabled: parseBoolean(source.CRISIS_ESCALATION_ENABLED, true),
+      callCooldownSeconds: parseInteger(source.CRISIS_CALL_COOLDOWN_SECONDS, 300),
+    },
+    bland,
     imagine,
     tts,
     elevenLabs: {

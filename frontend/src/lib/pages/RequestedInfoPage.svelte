@@ -33,6 +33,26 @@
         }).format(parsed);
   }
 
+  function isPhoneField(field: PromptField) {
+    return field.name === 'phone_number' || /phone/i.test(field.label);
+  }
+
+  function getInputType(field: PromptField) {
+    if (field.type === 'password') {
+      return 'password';
+    }
+    if (field.type === 'date') {
+      return 'date';
+    }
+    if (field.type === 'int' || field.type === 'float') {
+      return 'number';
+    }
+    if (isPhoneField(field)) {
+      return 'tel';
+    }
+    return 'text';
+  }
+
   function getDefaultValue(field: PromptField): string | number | boolean | UploadedFileReference[] {
     if (field.type === 'file') {
       return [];
@@ -456,6 +476,15 @@
               <p class="panel-copy">{prompt.description}</p>
             {/if}
 
+            {#if prompt.memoryKey === 'family_contact_primary'}
+              <section class="contact-callout">
+                <p class="panel-label">Crisis Call Setup</p>
+                <p class="panel-copy">
+                  Enter the family contact phone number in E.164 format, like <code>+14155551234</code>. This is the number the backend passes to Bland for emergency family calls.
+                </p>
+              </section>
+            {/if}
+
             <form class="dynamic-form" on:submit|preventDefault={() => submitPrompt(prompt)}>
               {#each prompt.fields as field}
                 <label class={`field ${field.type === 'text' || field.type === 'file' ? 'field-span' : ''}`}>
@@ -526,8 +555,11 @@
                   {:else}
                     <input
                       class="field-input"
-                      type={field.type === 'password' ? 'password' : field.type === 'date' ? 'date' : field.type === 'int' || field.type === 'float' ? 'number' : 'text'}
+                      type={getInputType(field)}
                       step={field.type === 'float' ? 'any' : undefined}
+                      inputmode={isPhoneField(field) ? 'tel' : undefined}
+                      autocomplete={isPhoneField(field) ? 'tel' : undefined}
+                      pattern={isPhoneField(field) ? '^\\+[1-9]\\d{7,14}$' : undefined}
                       placeholder={field.placeholder ?? ''}
                       value={String(formValues[prompt.id]?.[field.name] ?? '')}
                       on:input={(event) => setFieldValue(prompt.id, field.name, event.currentTarget.value)}
@@ -1039,6 +1071,18 @@
     background:
       linear-gradient(180deg, color-mix(in srgb, var(--color-bg-strong) 55%, transparent), transparent 30%),
       var(--color-panel-muted);
+  }
+
+  section.contact-callout {
+    border: 1px solid rgba(196, 123, 74, 0.28);
+    background: linear-gradient(180deg, rgba(255, 246, 238, 0.95), rgba(255, 240, 225, 0.92));
+    border-radius: 1rem;
+    padding: 0.95rem 1rem;
+  }
+
+  section.contact-callout code {
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
   }
 
   article.history-card {
