@@ -15,6 +15,9 @@ import type {
   TranscriptKind,
   TranscriptRole,
   ToolStatus,
+  UploadedFile,
+  UploadedFileReference,
+  UploadedFileTextStatus,
   UserMemoryEntry,
   UserPrompt,
 } from "./contracts";
@@ -32,6 +35,7 @@ type ReminderRow = {
   owner: string;
   timezone: string;
   created_at: string;
+  attachments_json: string | null;
 };
 
 type TranscriptRow = {
@@ -201,6 +205,42 @@ function parseMetadata(value: string | null): Record<string, unknown> | undefine
   return parseJsonObject(value);
 }
 
+function parseUploadedFileReferences(value: string | null | undefined): UploadedFileReference[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.flatMap((item) => {
+      if (typeof item !== "object" || item === null) {
+        return [];
+      }
+
+      const record = item as Record<string, unknown>;
+      const id = typeof record.id === "string" ? record.id : "";
+      const name = typeof record.name === "string" ? record.name : "";
+      const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
+      const sizeBytes =
+        typeof record.sizeBytes === "number" && Number.isFinite(record.sizeBytes) ? record.sizeBytes : 0;
+      const textStatus =
+        record.textStatus === "ready" || record.textStatus === "failed" ? record.textStatus : "none";
+
+      if (!id || !name || !mimeType) {
+        return [];
+      }
+
+      return [{ id, name, mimeType, sizeBytes, textStatus }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 function serializeReminder(row: ReminderRow): Reminder {
   return {
     id: row.id,
@@ -213,6 +253,7 @@ function serializeReminder(row: ReminderRow): Reminder {
     status: row.status,
     owner: row.owner,
     timezone: row.timezone,
+    attachments: parseUploadedFileReferences(row.attachments_json),
   };
 }
 
@@ -498,6 +539,7 @@ export class GazabotDatabase {
     this.ensureColumn("user_memory", "data_json", "TEXT");
     this.ensureColumn("user_prompts", "memory_key", "TEXT");
     this.ensureColumn("user_prompts", "memory_label", "TEXT");
+    this.ensureColumn("reminders", "attachments_json", "TEXT");
   }
 
   private ensureColumn(tableName: string, columnName: string, definition: string): void {
@@ -522,6 +564,7 @@ export class GazabotDatabase {
   }
 
   createReminder(input: ReminderCreateInput): Reminder {
+    const attachments = this.resolveUploadedFileReferences(input.attachmentFileIds);
     const row: ReminderRow = {
       id: prefixedId("r"),
       title: input.title.trim(),
@@ -538,14 +581,15 @@ export class GazabotDatabase {
       owner: "Gazabot agent",
       timezone: input.timezone.trim(),
       created_at: nowIso(),
+      attachments_json: JSON.stringify(attachments),
     };
 
     this.database
       .query(
         `
           INSERT INTO reminders (
-            id, title, instructions, cadence, cron, schedule_label, next_run, status, owner, timezone, created_at
-          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            id, title, instructions, cadence, cron, schedule_label, next_run, status, owner, timezone, created_at, attachments_json
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         `,
       )
       .run(
@@ -560,9 +604,11 @@ export class GazabotDatabase {
         row.owner,
         row.timezone,
         row.created_at,
+        row.attachments_json,
       );
 
     const reminder = serializeReminder(row);
+    this.linkUploadedFilesToReminder(reminder.id, attachments.map((attachment) => attachment.id));
     this.notifyReminderListeners();
     return reminder;
   }
@@ -645,6 +691,10 @@ export class GazabotDatabase {
     const scheduleLabel = input.scheduleLabel === undefined ? existing.schedule_label : input.scheduleLabel.trim();
     const timezone = input.timezone === undefined ? existing.timezone : input.timezone.trim();
     const status = input.status ?? existing.status;
+    const attachments =
+      input.attachmentFileIds === undefined
+        ? parseUploadedFileReferences((existing as ReminderRow & { attachments_json?: string | null }).attachments_json ?? null)
+        : this.resolveUploadedFileReferences(input.attachmentFileIds);
 
     const row: ReminderRow = {
       ...existing,
@@ -656,6 +706,7 @@ export class GazabotDatabase {
       next_run: nextRunForReminder({ cron, timezone, status }),
       status,
       timezone,
+      attachments_json: JSON.stringify(attachments),
     };
 
     this.database
@@ -669,7 +720,8 @@ export class GazabotDatabase {
               schedule_label = ?6,
               next_run = ?7,
               status = ?8,
-              timezone = ?9
+              timezone = ?9,
+              attachments_json = ?10
           WHERE id = ?1
         `,
       )
@@ -683,9 +735,13 @@ export class GazabotDatabase {
         row.next_run,
         row.status,
         row.timezone,
+        row.attachments_json,
       );
 
     const reminder = serializeReminder(row);
+    if (input.attachmentFileIds !== undefined) {
+      this.linkUploadedFilesToReminder(reminder.id, attachments.map((attachment) => attachment.id));
+    }
     this.notifyReminderListeners();
     return reminder;
   }
@@ -1201,6 +1257,122 @@ export class GazabotDatabase {
       },
     );
     return { prompt: updated, memoryEntry };
+  }
+
+  listUploadedFiles(): UploadedFile[] {
+    const rows = this.database
+      .query("SELECT * FROM uploaded_files ORDER BY created_at DESC, name ASC")
+      .all() as UploadedFileRow[];
+    return rows.map(serializeUploadedFile);
+  }
+
+  getUploadedFile(id: string): UploadedFile | null {
+    const row = this.database.query("SELECT * FROM uploaded_files WHERE id = ?1").get(id) as UploadedFileRow | null;
+    return row ? serializeUploadedFile(row) : null;
+  }
+
+  getUploadedFileStoragePath(id: string): string | null {
+    const row = this.database
+      .query("SELECT storage_path FROM uploaded_files WHERE id = ?1")
+      .get(id) as { storage_path: string } | null;
+    return row?.storage_path ?? null;
+  }
+
+  createUploadedFile(input: {
+    name: string;
+    originalName: string;
+    storagePath: string;
+    mimeType: string;
+    sizeBytes: number;
+    promptId?: string;
+    promptFieldName?: string;
+    reminderId?: string;
+  }): UploadedFile {
+    const row: UploadedFileRow = {
+      id: prefixedId("file"),
+      name: input.name.trim(),
+      original_name: input.originalName.trim(),
+      storage_path: input.storagePath,
+      mime_type: input.mimeType.trim(),
+      size_bytes: input.sizeBytes,
+      text_status: "none",
+      extracted_text: null,
+      reminder_id: input.reminderId ?? null,
+      prompt_id: input.promptId ?? null,
+      prompt_field_name: input.promptFieldName ?? null,
+      created_at: nowIso(),
+    };
+
+    this.database
+      .query(
+        `INSERT INTO uploaded_files (
+          id, name, original_name, storage_path, mime_type, size_bytes, text_status, extracted_text,
+          reminder_id, prompt_id, prompt_field_name, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+      )
+      .run(
+        row.id,
+        row.name,
+        row.original_name,
+        row.storage_path,
+        row.mime_type,
+        row.size_bytes,
+        row.text_status,
+        row.extracted_text,
+        row.reminder_id,
+        row.prompt_id,
+        row.prompt_field_name,
+        row.created_at,
+      );
+
+    return serializeUploadedFile(row);
+  }
+
+  replaceUploadedFileStorage(id: string, storagePath: string): UploadedFile {
+    this.database.query("UPDATE uploaded_files SET storage_path = ?2 WHERE id = ?1").run(id, storagePath);
+    const updated = this.getUploadedFile(id);
+    if (!updated) {
+      throw new Error(`Uploaded file not found: ${id}`);
+    }
+    return updated;
+  }
+
+  updateUploadedFileExtraction(id: string, input: { textStatus: UploadedFileTextStatus; extractedText?: string }): UploadedFile {
+    this.database
+      .query("UPDATE uploaded_files SET text_status = ?2, extracted_text = ?3 WHERE id = ?1")
+      .run(id, input.textStatus, input.extractedText ?? null);
+    const updated = this.getUploadedFile(id);
+    if (!updated) {
+      throw new Error(`Uploaded file not found: ${id}`);
+    }
+    return updated;
+  }
+
+  private resolveUploadedFileReferences(fileIds: string[] | undefined): UploadedFileReference[] {
+    if (!fileIds || fileIds.length === 0) {
+      return [];
+    }
+
+    return fileIds.map((id) => {
+      const file = this.getUploadedFile(id);
+      if (!file) {
+        throw new Error(`Uploaded file not found: ${id}`);
+      }
+      return {
+        id: file.id,
+        name: file.name,
+        mimeType: file.mimeType,
+        sizeBytes: file.sizeBytes,
+        textStatus: file.textStatus,
+      };
+    });
+  }
+
+  private linkUploadedFilesToReminder(reminderId: string, fileIds: string[]): void {
+    this.database.query("UPDATE uploaded_files SET reminder_id = NULL WHERE reminder_id = ?1").run(reminderId);
+    for (const fileId of fileIds) {
+      this.database.query("UPDATE uploaded_files SET reminder_id = ?2 WHERE id = ?1").run(fileId, reminderId);
+    }
   }
 
   private notifyReminderListeners(): void {

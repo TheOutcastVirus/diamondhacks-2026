@@ -275,6 +275,10 @@
     reminders = reminders.map((reminder) => (reminder.id === updated.id ? updated : reminder));
   }
 
+  function buildReminderEndpoint(reminderId: string) {
+    return `/api/reminders/${encodeURIComponent(reminderId)}`;
+  }
+
   function setRowBusy(reminderId: string, value: boolean) {
     rowBusy = { ...rowBusy, [reminderId]: value };
   }
@@ -387,7 +391,7 @@
     setRowBusy(reminderId, true);
 
     try {
-      const updated = await patch<unknown>(`reminders/${encodeURIComponent(reminderId)}`, {
+      const updated = await patch<unknown>(buildReminderEndpoint(reminderId), {
         title: editState.title.trim(),
         instructions: editState.instructions.trim(),
         cadence: editState.cadence,
@@ -412,7 +416,7 @@
 
     try {
       const nextStatus: ReminderStatus = reminder.status === 'paused' ? 'active' : 'paused';
-      const updated = await patch<unknown>(`reminders/${encodeURIComponent(reminder.id)}`, {
+      const updated = await patch<unknown>(buildReminderEndpoint(reminder.id), {
         status: nextStatus,
       });
       updateReminderInList(normalizeReminder(updated, 0));
@@ -438,7 +442,7 @@
     setRowBusy(reminder.id, true);
 
     try {
-      await del(`/api/reminders/${encodeURIComponent(reminder.id)}`);
+      await del(buildReminderEndpoint(reminder.id));
       reminders = reminders.filter((item) => item.id !== reminder.id);
       if (editingId === reminder.id) {
         cancelEditing();

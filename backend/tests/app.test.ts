@@ -58,6 +58,7 @@ function createTestApp(overrides: Record<string, string> = {}) {
   const config = loadConfig({
     APP_NAME: "Gazabot Backend Test",
     DATABASE_PATH: join(directory, "test.sqlite"),
+    UPLOADS_DIR: join(directory, "uploads"),
     INFERENCE_CLOUD_API_KEY: "test-inference-key",
     BROWSER_USE_API_KEY: "test-browser-key",
     AGENT_CHUNK_DELAY_MS: "5",
@@ -510,6 +511,135 @@ describe("Gazabot Bun backend", () => {
         uses_walker: true,
       });
       expect(profilePayload.entry.schema).toHaveLength(2);
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("uploads documents, extracts PDF text, and links files to reminders", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      const form = new FormData();
+      form.append(
+        "file",
+        new File(
+          [
+            `%PDF-1.4
+1 0 obj
+<< /Length 53 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Hello Prescription) Tj
+ET
+endstream
+endobj
+trailer <<>>
+%%EOF`,
+          ],
+          "prescription.pdf",
+          { type: "application/pdf" },
+        ),
+      );
+
+      const uploadResponse = await app.fetch(
+        new Request("http://localhost/api/files", {
+          method: "POST",
+          body: form,
+        }),
+      );
+
+      expect(uploadResponse.status).toBe(200);
+      const uploadPayload = (await uploadResponse.json()) as { file: Record<string, unknown> };
+      expect(uploadPayload.file.name).toBe("prescription.pdf");
+      expect(uploadPayload.file.textStatus).toBe("ready");
+      expect(String(uploadPayload.file.extractedText)).toContain("Hello");
+
+      const fileId = String(uploadPayload.file.id);
+
+      const reminderResponse = await app.fetch(
+        new Request("http://localhost/api/reminders", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Mail prescription",
+            instructions: "Mail the attached prescription to the pharmacy.",
+            cadence: "daily",
+            cron: "0 10 * * *",
+            scheduleLabel: "Every day at 10:00",
+            timezone: "America/Los_Angeles",
+            attachmentFileIds: [fileId],
+          }),
+        }),
+      );
+
+      expect(reminderResponse.status).toBe(200);
+      const reminderPayload = (await reminderResponse.json()) as Record<string, unknown>;
+      expect(Array.isArray(reminderPayload.attachments)).toBe(true);
+      expect((reminderPayload.attachments as Array<Record<string, unknown>>)[0]?.name).toBe("prescription.pdf");
+
+      const textResponse = await app.fetch(new Request(`http://localhost/api/files/${fileId}/text`));
+      expect(textResponse.status).toBe(200);
+      const textPayload = (await textResponse.json()) as Record<string, unknown>;
+      expect(textPayload.textStatus).toBe("ready");
+      expect(String(textPayload.text)).toContain("Hello");
+    } finally {
+      app.close();
+      database.close();
+    }
+  });
+
+  test("accepts file fields in prompts and stores uploaded file references in structured memory", async () => {
+    const { app, database } = createTestApp();
+
+    try {
+      const prompt = database.createPrompt({
+        title: "Prescription upload",
+        description: "Attach the prescription that should be mailed.",
+        memoryKey: "prescription_packet",
+        fields: [
+          { name: "prescription_files", label: "Prescription", type: "file", required: true, accept: ".pdf" },
+          { name: "delivery_address", label: "Delivery address", type: "text", required: true },
+        ],
+      });
+
+      const form = new FormData();
+      form.append("promptId", prompt.id);
+      form.append("fieldName", "prescription_files");
+      form.append("file", new File(["doctor notes"], "rx.txt", { type: "text/plain" }));
+
+      const uploadResponse = await app.fetch(
+        new Request("http://localhost/api/files", {
+          method: "POST",
+          body: form,
+        }),
+      );
+
+      expect(uploadResponse.status).toBe(200);
+      const uploadPayload = (await uploadResponse.json()) as { file: Record<string, unknown> };
+
+      const respondResponse = await app.fetch(
+        new Request(`http://localhost/api/prompts/${prompt.id}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            response: {
+              prescription_files: [uploadPayload.file],
+              delivery_address: "123 Main St\nSpringfield, CA 90210",
+            },
+          }),
+        }),
+      );
+
+      expect(respondResponse.status).toBe(200);
+      const respondPayload = (await respondResponse.json()) as { memoryEntry: Record<string, unknown> };
+      const data = respondPayload.memoryEntry.data as Record<string, unknown>;
+      expect(Array.isArray(data.prescription_files)).toBe(true);
+      expect((data.prescription_files as Array<Record<string, unknown>>)[0]?.name).toBe("rx.txt");
+      expect((data.prescription_files as Array<Record<string, unknown>>)[0]?.textStatus).toBe("ready");
     } finally {
       app.close();
       database.close();
