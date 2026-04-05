@@ -37,26 +37,12 @@ export class SttService {
    * then call `finalize` once recording stops to get the full transcript.
    */
   async createRealtimeSession(): Promise<RealtimeSession> {
-    // AssemblyAI's realtime WebSocket requires a short-lived token rather than
-    // the raw API key on the connection URL.
-    const tokenRes = await fetch("https://api.assemblyai.com/v2/realtime/token", {
-      method: "POST",
-      headers: {
-        Authorization: this.config.assemblyAi.apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ expires_in: 60 }),
-    });
-    if (!tokenRes.ok) {
-      throw new Error(`Failed to get AssemblyAI realtime token: ${tokenRes.status}`);
-    }
-    const { token } = (await tokenRes.json()) as { token: string };
-
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const transcriber = this.client.realtime.transcriber({
       sampleRate: 16000,
       encoding: "pcm_s16le",
-      token,
-    });
+      apiKey: this.config.assemblyAi.apiKey,
+    } as any);
 
     const finalParts: string[] = [];
 
