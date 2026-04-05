@@ -3,15 +3,15 @@ import { loadConfig } from "./config";
 
 const config = loadConfig();
 
-if (!config.imagine.apiKey.trim()) {
-  console.warn("[startup] INFERENCE_CLOUD_API_KEY is not set; /api/agent/* will error until configured.");
+if (!config.cerebras.apiKey.trim()) {
+  console.warn("[startup] CEREBRAS_API_KEY is not set; /api/agent/* will error until configured.");
 }
 if (!config.browserUse.apiKey?.trim()) {
   console.warn("[startup] BROWSER_USE_API_KEY is not set; browser automation will error until configured.");
 }
 
 console.log(
-  `[startup] Imagine API → ${config.imagine.endpoint} (model=${config.imagine.model})`,
+  `[startup] Cerebras API → ${config.cerebras.endpoint} (model=${config.cerebras.model})`,
 );
 console.log(
   `[startup] Browser Use → ${config.browserUse.baseUrl} (model=${config.browserUse.model}); when a task runs, watch for [browser-use] lines below`,
