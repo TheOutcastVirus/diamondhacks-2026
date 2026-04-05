@@ -1355,4 +1355,29 @@
       width: 100%;
     }
   }
+
+  @media (max-width: 480px) {
+    button.action,
+    button.ghost {
+      min-height: 3rem;
+      font-size: 1rem;
+    }
+
+    button.mini-action {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    button.chip {
+      min-height: 2.75rem;
+      font-size: 1rem;
+    }
+
+    input.field-input,
+    textarea.field-input,
+    select.field-input {
+      font-size: 1rem;
+      min-height: 3rem;
+    }
+  }
 </style>
